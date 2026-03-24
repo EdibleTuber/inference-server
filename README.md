@@ -1,0 +1,441 @@
+# Inference Server
+
+A native llama.cpp inference server with an OpenAI-compatible API, API-driven model switching, and FIFO request queuing. Runs on Ubuntu Server with an NVIDIA GPU.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Ubuntu Server (Headless)                       │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Model Manager (Python/FastAPI)          LAN_IP:8080     │   │
+│  │  user: _llama-mgr                                        │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │ OpenAI-compatible API                              │  │   │
+│  │  │ ├─ POST /v1/chat/completions (proxy + model swap)  │  │   │
+│  │  │ ├─ GET  /v1/models (list available GGUFs)          │  │   │
+│  │  │ ├─ GET  /status (state, model, GPU, queue info)    │  │   │
+│  │  │ └─ GET  /health (simple 200 OK)                    │  │   │
+│  │  └────────────────────┬───────────────────────────────┘  │   │
+│  │                       │                                  │   │
+│  │  FIFO Request Queue (max 20, configurable)               │   │
+│  └───────────────────────┼──────────────────────────────────┘   │
+│                          │ localhost:8081                        │
+│  ┌───────────────────────┴──────────────────────────────────┐   │
+│  │  llama-server (systemd)              127.0.0.1:8081      │   │
+│  │  user: _llama  ·  NVIDIA P40  ·  --n-gpu-layers auto    │   │
+│  └───────────────────────┬──────────────────────────────────┘   │
+│                          │                                      │
+│  ┌───────────────────────┴──────────────────────────────────┐   │
+│  │  /opt/llama/models/    (GGUF storage)                    │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why this design?
+
+**Two-layer architecture.** Clients talk only to the model manager on port 8080. The model manager talks to llama-server on localhost:8081. llama-server is never directly exposed to the network. This separation means:
+
+- The manager can restart llama-server for model swaps without dropping client connections — it holds the client's HTTP connection open while the swap completes, then proxies the response.
+- Privilege separation: llama-server only needs to read model files and access the GPU. The manager only needs to restart llama-server and update one config file. Neither service needs broad system access.
+
+**llama.cpp instead of Ollama.** Running llama-server natively (not in Docker) gives direct GPU access, no container overhead, and access to any GGUF on HuggingFace without waiting for Ollama to support it. The tradeoff is more setup — this repo contains the setup scripts and config templates to make it repeatable.
+
+**FIFO queue instead of parallel inference.** The Tesla P40 has 24GB VRAM. Running one request at a time maximizes throughput per request (the GPU is fully dedicated to each). Parallel inference would split VRAM across requests and slow down each individual one. The queue ensures requests are processed in order, even during model swaps.
+
+**Dedicated system users.** `_llama` runs llama-server with read-only access to model files. `_llama-mgr` runs the manager with write access to one config file and a narrow sudoers entry to restart llama-server. Neither user has a shell or home directory. If either service were compromised, the blast radius is minimal.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Ubuntu Server (tested on 22.04+)
+- NVIDIA GPU with CUDA drivers installed
+- Python 3.10+
+- llama.cpp compiled with CUDA support (see [llama.cpp build docs](https://github.com/ggerganov/llama.cpp))
+
+### Setup
+
+**1. Run the system setup script** (creates users, directories, sudoers entry, installs systemd units):
+
+```bash
+sudo bash scripts/setup.sh
+```
+
+This script creates:
+- System users `_llama` and `_llama-mgr` (no shell, no home directory)
+- `/opt/llama/bin/`, `/opt/llama/models/`, `/opt/llama/manager/`
+- `/etc/llama/` (config files), `/var/log/llama/` (log files)
+- A narrow sudoers entry so `_llama-mgr` can restart `llama-server.service`
+- Systemd unit files and enables both services
+
+**2. Install the llama-server binary:**
+
+```bash
+sudo cp /path/to/llama-server /opt/llama/bin/llama-server
+sudo chmod +x /opt/llama/bin/llama-server
+```
+
+**3. Deploy the model manager:**
+
+```bash
+sudo cp -r manager/ /opt/llama/manager/
+cd /opt/llama/manager
+sudo python3 -m venv venv
+sudo venv/bin/pip install -r requirements.txt
+```
+
+**4. Edit the config files:**
+
+```bash
+# Set your LAN IP in the manager config
+sudo nano /etc/llama/manager.env
+
+# Set initial model path if you already have a model downloaded
+sudo nano /etc/llama/llama-server.env
+```
+
+**5. Download a model:**
+
+```bash
+sudo bash scripts/download-model.sh \
+  https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  qwen2.5-7b-instruct-q4_k_m
+```
+
+**6. Start the services:**
+
+```bash
+sudo systemctl start llama-server
+sudo systemctl start llama-manager
+```
+
+**7. Verify everything is up:**
+
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/status
+curl http://localhost:8080/v1/models
+```
+
+---
+
+## Usage Examples
+
+### Basic chat completion
+
+```bash
+curl http://YOUR_LAN_IP:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-7b-instruct-q4_k_m",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+### Streaming response
+
+```bash
+curl http://YOUR_LAN_IP:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-7b-instruct-q4_k_m",
+    "messages": [{"role": "user", "content": "Write a haiku about GPUs."}],
+    "stream": true
+  }'
+```
+
+### Switch to a different model
+
+Just change the `model` field. The manager detects the change and hot-swaps llama-server automatically. The client connection stays open while the swap completes (30–60+ seconds). Set your HTTP timeout to at least 120 seconds.
+
+```bash
+curl http://YOUR_LAN_IP:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3-8b-instruct-q5_k_m",
+    "messages": [{"role": "user", "content": "What is 2+2?"}]
+  }'
+```
+
+### Check server status before sending a request
+
+Useful if you want to avoid waiting through a model swap, or to check queue depth before submitting work.
+
+```bash
+curl http://YOUR_LAN_IP:8080/status
+```
+
+```json
+{
+  "state": "ready",
+  "current_model": "qwen2.5-7b-instruct-q4_k_m",
+  "loading_model": null,
+  "error_message": null,
+  "queue_depth": 0,
+  "queue_limit": 20,
+  "uptime_seconds": 3421,
+  "gpu": {
+    "name": "Tesla P40",
+    "vram_total_mb": 24576,
+    "vram_used_mb": 18200
+  }
+}
+```
+
+### Using with OpenAI Python client
+
+The API is OpenAI-compatible, so existing clients work without modification:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://YOUR_LAN_IP:8080/v1",
+    api_key="not-needed",  # no auth on internal network
+)
+
+response = client.chat.completions.create(
+    model="qwen2.5-7b-instruct-q4_k_m",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+---
+
+## Model Management
+
+Models are GGUF files stored in `/opt/llama/models/`. The filename (without `.gguf`) is the model name used in API requests.
+
+### Download a model
+
+```bash
+sudo bash scripts/download-model.sh \
+  https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q5_K_M.gguf \
+  llama-3-8b-instruct-q5_k_m
+```
+
+### List available models
+
+```bash
+curl http://YOUR_LAN_IP:8080/v1/models
+```
+
+New models are available immediately after download — no service restart needed. The manager scans the directory on every request to `/v1/models`.
+
+### Manual download
+
+```bash
+sudo -u _llama wget -O /opt/llama/models/my-model-q4.gguf \
+  "https://huggingface.co/.../model.gguf"
+```
+
+Or download as any user in the `llama` group (the directory is group-writable).
+
+### Model naming convention
+
+Use descriptive names that encode the model family, size, and quantization level. Examples:
+
+- `qwen2.5-7b-instruct-q4_k_m` — Qwen 2.5, 7B parameters, instruction-tuned, Q4_K_M quantization
+- `llama-3-8b-instruct-q5_k_m` — Llama 3, 8B, instruction-tuned, Q5_K_M quantization
+- `deepseek-r1-14b-q6_k` — DeepSeek R1, 14B, Q6_K quantization
+
+The manager uses exact filename matching — the model name in a request must exactly match the filename without `.gguf`.
+
+---
+
+## Configuration Reference
+
+### `/etc/llama/llama-server.env`
+
+Configuration for the llama-server inference backend. **The manager updates `MODEL_PATH` automatically** during model swaps — do not edit this file while the services are running.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_PATH` | _(empty)_ | Absolute path to the currently loaded GGUF file. Leave empty on first boot; the manager sets it on the first request. |
+| `N_GPU_LAYERS` | `-1` | Number of model layers to offload to GPU. `-1` = auto (fill all available VRAM). Set to a specific number to limit GPU usage. |
+| `CTX_SIZE` | `4096` | Context window size in tokens. Larger values use more VRAM. 4096 is safe for large models on the 24GB P40. |
+| `HOST` | `127.0.0.1` | Bind address for llama-server. Always localhost — never expose directly. |
+| `PORT` | `8081` | Port for llama-server. The manager connects here. |
+
+### `/etc/llama/manager.env`
+
+Configuration for the model manager proxy service.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Bind address for the manager. Set to your LAN IP to restrict access, or `0.0.0.0` for all interfaces. |
+| `PORT` | `8080` | Port the manager listens on. Clients connect here. |
+| `LLAMA_SERVER_HOST` | `127.0.0.1` | Address where llama-server is running. Always localhost. |
+| `LLAMA_SERVER_PORT` | `8081` | Port where llama-server listens. Must match llama-server.env. |
+| `MODELS_DIR` | `/opt/llama/models` | Directory containing GGUF model files. |
+| `LLAMA_SERVER_ENV` | `/etc/llama/llama-server.env` | Path to llama-server's env file. The manager writes `MODEL_PATH` here during swaps. |
+| `QUEUE_LIMIT` | `20` | Maximum requests to hold in the FIFO queue. Requests beyond this get a 503 response. |
+| `SWAP_TIMEOUT` | `120` | Seconds to wait for llama-server health after a model swap. Exceeding this puts the manager in `error` state. |
+| `LOG_FILE` | `/var/log/llama/manager.log` | Log file path for the model manager. |
+
+---
+
+## API Endpoints
+
+All endpoints are on `LAN_IP:8080`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | Chat completions. Reads the `model` field, swaps if needed, queues if busy. Supports streaming (`"stream": true`). |
+| `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
+| `GET` | `/status` | Server state, current model, queue depth, GPU VRAM usage, uptime. |
+| `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
+
+### Server states
+
+The `state` field in `/status` tells you what the manager is doing:
+
+| State | Meaning |
+|---|---|
+| `loading` | llama-server is starting up on boot. No model available yet. |
+| `ready` | Accepting and processing requests normally. |
+| `swapping` | Actively changing models. Requests are queuing. |
+| `error` | llama-server failed to start or health poll timed out. Send a new request with a valid model name to trigger a fresh swap attempt. |
+
+### Client timeout guidance
+
+Model swaps take 30–60+ seconds depending on model size (the GPU must load a new model file into VRAM). During a swap, the manager holds your HTTP connection open. **Set your HTTP client timeout to at least 120 seconds** to avoid timing out while waiting for a swap.
+
+If you prefer not to wait, poll `/status` before sending requests and only proceed when `state` is `"ready"`.
+
+---
+
+## Service Management
+
+### Start / stop / restart
+
+```bash
+# Start both services
+sudo systemctl start llama-server llama-manager
+
+# Stop both services
+sudo systemctl stop llama-manager llama-server
+
+# Restart just the manager (e.g., after config change)
+sudo systemctl restart llama-manager
+
+# Restart llama-server (loads fresh model from env file)
+sudo systemctl restart llama-server
+```
+
+### Check service status
+
+```bash
+sudo systemctl status llama-server
+sudo systemctl status llama-manager
+```
+
+### View logs
+
+```bash
+# Live log from systemd journal
+sudo journalctl -u llama-server -f
+sudo journalctl -u llama-manager -f
+
+# File-based logs (also written for persistence across reboots)
+sudo tail -f /var/log/llama/manager.log
+sudo tail -f /var/log/llama/llama-server.log
+```
+
+### Enable on boot
+
+Both services are enabled during setup. To check or change:
+
+```bash
+sudo systemctl enable llama-server llama-manager
+sudo systemctl disable llama-server llama-manager
+```
+
+### Boot sequence
+
+1. System boots, NVIDIA drivers load
+2. `llama-server.service` starts with the model configured in `/etc/llama/llama-server.env`
+3. `llama-manager.service` starts (`After=llama-server.service`), connects to llama-server, begins accepting requests
+
+If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server fails to start. The manager starts in `error` state and waits. The first API request with a valid model name triggers a swap, which loads the model and transitions to `ready`.
+
+---
+
+## File System Layout
+
+```
+/opt/llama/
+  ├── bin/
+  │   └── llama-server              # compiled llama.cpp binary (CUDA)
+  ├── models/                       # GGUF storage
+  │   ├── qwen2.5-7b-instruct-q4_k_m.gguf
+  │   └── ...
+  └── manager/                      # model manager Python app
+      ├── venv/                     # isolated virtualenv
+      ├── app.py                    # main FastAPI application
+      ├── config.py                 # configuration loading
+      ├── queue.py                  # FIFO request queue
+      ├── swap.py                   # model swap orchestration
+      ├── gpu.py                    # GPU info via nvidia-smi
+      └── requirements.txt
+
+/etc/llama/
+  ├── llama-server.env              # runtime config for llama-server (manager writes MODEL_PATH here)
+  └── manager.env                   # runtime config for model manager
+
+/var/log/llama/
+  ├── llama-server.log              # inference server stdout/stderr
+  └── manager.log                   # model manager application log
+
+/etc/systemd/system/
+  ├── llama-server.service
+  └── llama-manager.service
+```
+
+### This repository
+
+```
+inference_server/
+├── manager/                        # model manager source (deployed to /opt/llama/manager/)
+│   ├── app.py                      # FastAPI app, endpoints, proxy, queue, swap logic
+│   ├── config.py                   # configuration loading from env vars
+│   ├── queue.py                    # FIFO request queue
+│   ├── swap.py                     # model swap orchestration
+│   ├── gpu.py                      # GPU info via nvidia-smi
+│   ├── requirements.txt            # Python dependencies
+│   └── README.md                   # manager component documentation
+├── systemd/                        # systemd unit files (copied to /etc/systemd/system/)
+│   ├── llama-server.service
+│   └── llama-manager.service
+├── config/                         # template config files (copied to /etc/llama/)
+│   ├── llama-server.env
+│   ├── manager.env
+│   └── llama-logrotate
+├── scripts/
+│   ├── setup.sh                    # system setup: users, dirs, permissions, sudoers, systemd
+│   └── download-model.sh           # GGUF download helper
+└── tests/                          # model manager tests
+    ├── conftest.py
+    ├── test_config.py
+    ├── test_queue.py
+    ├── test_swap.py
+    ├── test_endpoints.py
+    └── test_gpu.py
+```
+
+---
+
+## Security Notes
+
+- **No authentication.** This is intentional for an internal network. Use Tailscale for remote access (encrypted, authenticated at the network layer).
+- **llama-server is localhost-only.** It is never exposed to the network. Only the manager can reach it.
+- **Dedicated system users.** `_llama` and `_llama-mgr` have no shell, no home directory, and minimal permissions. If a service were compromised, access is tightly scoped.
+- **Narrow sudoers.** `_llama-mgr` can only run `systemctl restart llama-server.service`. Nothing else.
+- **No TLS.** Acceptable on a trusted LAN or Tailscale tunnel. Do not expose port 8080 directly to the internet.

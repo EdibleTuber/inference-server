@@ -40,9 +40,13 @@ def test_config_defaults(monkeypatch):
 
     assert config.host == "0.0.0.0"
     assert config.port == 8080
+    assert config.llama_server_host == "127.0.0.1"
     assert config.llama_server_port == 8081
+    assert config.models_dir == "/opt/llama/models"
+    assert config.llama_server_env == "/etc/llama/llama-server.env"
     assert config.queue_limit == 20
     assert config.swap_timeout == 120
+    assert config.log_file == "/var/log/llama/manager.log"
 
 
 def test_config_llama_server_url(monkeypatch):

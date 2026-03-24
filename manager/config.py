@@ -11,6 +11,19 @@ import os
 from dataclasses import dataclass
 
 
+def _int_env(key: str, default: int) -> int:
+    """Read an integer from an env var with a clear error on bad values."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Configuration error: {key}={raw!r} is not a valid integer"
+        ) from None
+
+
 @dataclass
 class ManagerConfig:
     """Typed configuration for the model manager service.
@@ -46,12 +59,12 @@ class ManagerConfig:
         """Load configuration from environment variables with sensible defaults."""
         return cls(
             host=os.getenv("HOST", "0.0.0.0"),
-            port=int(os.getenv("PORT", "8080")),
+            port=_int_env("PORT", 8080),
             llama_server_host=os.getenv("LLAMA_SERVER_HOST", "127.0.0.1"),
-            llama_server_port=int(os.getenv("LLAMA_SERVER_PORT", "8081")),
+            llama_server_port=_int_env("LLAMA_SERVER_PORT", 8081),
             models_dir=os.getenv("MODELS_DIR", "/opt/llama/models"),
             llama_server_env=os.getenv("LLAMA_SERVER_ENV", "/etc/llama/llama-server.env"),
-            queue_limit=int(os.getenv("QUEUE_LIMIT", "20")),
-            swap_timeout=int(os.getenv("SWAP_TIMEOUT", "120")),
+            queue_limit=_int_env("QUEUE_LIMIT", 20),
+            swap_timeout=_int_env("SWAP_TIMEOUT", 120),
             log_file=os.getenv("LOG_FILE", "/var/log/llama/manager.log"),
         )

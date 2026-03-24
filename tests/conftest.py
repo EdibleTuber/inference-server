@@ -35,6 +35,6 @@ def test_config(tmp_models_dir, tmp_env_file):
         models_dir=tmp_models_dir,
         llama_server_env=tmp_env_file,
         queue_limit=20,
-        swap_timeout=5,
+        swap_timeout=5,  # Intentionally short for tests to avoid long test execution times
         log_file="/dev/null",
     )

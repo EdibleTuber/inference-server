@@ -1,0 +1,11 @@
+# config/llama-logrotate
+# Log rotation for inference server logs.
+/var/log/llama/*.log /var/log/llama/*.err {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 root llama
+}

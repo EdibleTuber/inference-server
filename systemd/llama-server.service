@@ -1,0 +1,54 @@
+# systemd/llama-server.service
+#
+# Systemd unit for the llama.cpp inference backend.
+#
+# Runs llama-server as the _llama user, bound to localhost only.
+# The model manager proxy is the only thing that talks to this service.
+#
+# Configuration is in /etc/llama/llama-server.env. The model manager
+# updates MODEL_PATH in that file when swapping models, then restarts
+# this service via sudo systemctl restart.
+#
+# Install: sudo cp systemd/llama-server.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable llama-server
+
+[Unit]
+Description=llama.cpp Inference Server
+Documentation=https://github.com/ggerganov/llama.cpp
+
+# Wait for NVIDIA drivers before starting.
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged user — no shell, no home directory.
+User=_llama
+Group=_llama
+
+# Load runtime configuration
+EnvironmentFile=/etc/llama/llama-server.env
+
+# Start llama-server with config from env file.
+# --host/--port: localhost only (manager handles external access)
+# --model: GGUF file path (updated by manager during swaps)
+# --n-gpu-layers: GPU offload (-1 = auto/all)
+# --ctx-size: context window in tokens
+ExecStart=/opt/llama/bin/llama-server \
+    --host ${HOST} \
+    --port ${PORT} \
+    --model ${MODEL_PATH} \
+    --n-gpu-layers ${N_GPU_LAYERS} \
+    --ctx-size ${CTX_SIZE}
+
+# Auto-restart on crash with delay to prevent loops.
+Restart=on-failure
+RestartSec=5
+
+# Persistent file logs (also in journal via journalctl -u llama-server)
+StandardOutput=append:/var/log/llama/llama-server.log
+StandardError=append:/var/log/llama/llama-server.err
+
+[Install]
+WantedBy=multi-user.target

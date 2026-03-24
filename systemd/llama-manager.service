@@ -1,0 +1,50 @@
+# systemd/llama-manager.service
+#
+# Systemd unit for the model manager proxy.
+#
+# Runs the FastAPI model manager as _llama-mgr, bound to the LAN IP.
+# Single entry point for all inference requests.
+#
+# Install: sudo cp systemd/llama-manager.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable llama-manager
+
+[Unit]
+Description=llama.cpp Model Manager Proxy
+Documentation=file:///opt/llama/manager/README.md
+
+# Start after llama-server, but don't hard-depend on it.
+# Wants= means "try to start it, but start anyway if it fails"
+After=llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+
+# Separate user from _llama for privilege separation.
+User=_llama-mgr
+Group=_llama-mgr
+
+# Load manager configuration
+EnvironmentFile=/etc/llama/manager.env
+
+# WorkingDirectory is /opt/llama so Python can import the 'manager' package.
+# The package lives at /opt/llama/manager/ (with __init__.py).
+WorkingDirectory=/opt/llama
+
+# Run FastAPI via uvicorn.
+# --factory tells uvicorn to call create_app() to get the ASGI app.
+ExecStart=/opt/llama/manager/venv/bin/python -m uvicorn \
+    manager.app:create_app \
+    --factory \
+    --host ${HOST} \
+    --port ${PORT} \
+    --log-level info
+
+Restart=on-failure
+RestartSec=5
+
+# Stderr goes to file (uvicorn access logs)
+StandardError=append:/var/log/llama/manager.err
+
+[Install]
+WantedBy=multi-user.target

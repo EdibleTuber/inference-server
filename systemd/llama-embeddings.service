@@ -1,0 +1,40 @@
+# systemd/llama-embeddings.service
+#
+# Systemd unit for the llama.cpp embedding server.
+#
+# Runs a CPU-only llama.cpp instance dedicated to text embeddings.
+# Uses nomic-embed-text (~275MB), always loaded, no model swapping.
+# The model manager proxies /v1/embeddings requests to this service.
+#
+# Install: sudo cp systemd/llama-embeddings.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable llama-embeddings
+
+[Unit]
+Description=llama.cpp Embedding Server (CPU-only, nomic-embed-text)
+Documentation=https://github.com/ggerganov/llama.cpp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Same user as llama-server — read-only access to models.
+User=_llama
+Group=_llama
+
+ExecStart=/opt/llama/bin/llama-server \
+    --model /opt/llama/models/nomic-embed-text-v1.5.Q8_0.gguf \
+    --host 127.0.0.1 \
+    --port 8082 \
+    --embedding \
+    --ctx-size 2048 \
+    --threads 4
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=append:/var/log/llama/embeddings.log
+StandardError=append:/var/log/llama/embeddings.err
+
+[Install]
+WantedBy=multi-user.target

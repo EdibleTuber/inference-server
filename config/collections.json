@@ -1,0 +1,12 @@
+[
+  {
+    "id": "skills",
+    "source_dir": "/home/edible/.pi/skills",
+    "doc_type": "skill"
+  },
+  {
+    "id": "notes",
+    "source_dir": "/home/edible/vault",
+    "doc_type": "markdown"
+  }
+]

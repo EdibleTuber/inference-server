@@ -312,6 +312,88 @@ If you prefer not to wait, poll `/status` before sending requests and only proce
 
 ---
 
+## Collection-Based Document Retrieval
+
+The manager includes a vector search system for retrieving documents (skills, notes, etc.)
+by semantic similarity. Documents are embedded using a dedicated CPU-only llama.cpp instance
+running nomic-embed-text.
+
+### Setup
+
+1. **Download the embedding model:**
+
+```bash
+./scripts/download-model.sh nomic-ai/nomic-embed-text-v1.5-GGUF nomic-embed-text-v1.5.Q8_0.gguf
+```
+
+2. **Install the embeddings service:**
+
+```bash
+sudo cp systemd/llama-embeddings.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now llama-embeddings
+```
+
+3. **Configure collections** in `/etc/llama/collections.json`:
+
+```json
+[
+  { "id": "skills", "source_dir": "/home/edible/.pi/skills", "doc_type": "skill" },
+  { "id": "notes", "source_dir": "/home/edible/vault", "doc_type": "markdown" }
+]
+```
+
+4. **Add env vars** to `/etc/llama/manager.env`:
+
+```bash
+EMBEDDINGS_HOST=127.0.0.1
+EMBEDDINGS_PORT=8082
+COLLECTIONS_CONFIG=/etc/llama/collections.json
+SKILLS_DB_PATH=/opt/llama/data/skills.db
+```
+
+5. **Restart the manager** — indexing runs automatically on startup.
+
+### API
+
+**Search documents (two-step retrieval):**
+
+```bash
+# Step 1: Search for relevant skills
+curl -s http://LAN_IP:11434/collections/skills/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "network reconnaissance", "limit": 3}' | jq
+
+# Step 2: Get full document content
+curl -s http://LAN_IP:11434/collections/skills/docs/Security/Recon/Workflows/PassiveRecon | jq
+
+# List collections
+curl -s http://LAN_IP:11434/collections | jq
+```
+
+**Generate embeddings directly:**
+
+```bash
+curl -s http://LAN_IP:11434/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model": "nomic-embed-text", "input": "hello world"}' | jq
+```
+
+### Architecture
+
+```
+Manager (:11434)
+├── /v1/chat/completions → llama-server (:8081, GPU)
+├── /v1/embeddings       → llama-embeddings (:8082, CPU)
+├── /collections/*/search → SQLite-vec (in-process)
+└── /collections/*/docs/* → SQLite-vec (in-process)
+```
+
+Documents are indexed on startup with SHA-256 hash-based change detection.
+Only new or modified files are re-embedded.
+
+---
+
 ## Service Management
 
 ### Start / stop / restart

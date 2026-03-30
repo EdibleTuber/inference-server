@@ -6,10 +6,14 @@ Provides HTTP endpoints to proxy inference requests to llama-server,
 with automatic model swapping and a FIFO queue for serial GPU access.
 
 Endpoints:
-    GET  /health                  - Always 200, liveness check
-    GET  /status                  - Server state, model, GPU, queue info
-    GET  /v1/models               - List available GGUFs in OpenAI format
-    POST /v1/chat/completions     - Proxy to llama-server (with model swap)
+    GET  /health                              - Always 200, liveness check
+    GET  /status                              - Server state, model, GPU, queue info
+    GET  /v1/models                           - List available GGUFs in OpenAI format
+    POST /v1/chat/completions                 - Proxy to llama-server (with model swap)
+    POST /v1/embeddings                       - Proxy to embeddings server
+    GET  /collections                         - List registered collections
+    POST /collections/{collection_id}/search  - Semantic search within a collection
+    GET  /collections/{collection_id}/docs/{doc_id:path} - Get full document by ID
 """
 import asyncio
 import logging
@@ -22,9 +26,12 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from manager.config import ManagerConfig
+from manager.embeddings import EmbeddingsClient
 from manager.gpu import get_gpu_info
 from manager.queue import RequestQueue
 from manager.swap import ModelSwapper
+from manager.vectordb import VectorDB
+from manager.collections import index_all_collections, get_children
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,10 @@ class ServerState:
         self.swapper = ModelSwapper(config)
         self.swap_lock = asyncio.Lock()
         self.queue_event = asyncio.Event()
+
+        # Collection retrieval
+        self.db: VectorDB | None = None
+        self.embeddings_client: EmbeddingsClient | None = None
 
     # ------------------------------------------------------------------
     # Model path helpers
@@ -270,7 +281,25 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             name="queue_consumer",
         )
 
+        # Initialize collection retrieval if configured.
+        if config.skills_db_path:
+            try:
+                server.db = VectorDB(config.skills_db_path)
+                server.db.init_schema()
+                server.embeddings_client = EmbeddingsClient(config.embeddings_url)
+                await index_all_collections(
+                    config.collections_config, server.db, server.embeddings_client,
+                )
+                logger.info("Collection indexing complete")
+            except Exception:
+                logger.exception("Collection indexing failed — endpoints will return 503")
+
         yield
+
+        if server.embeddings_client:
+            await server.embeddings_client.close()
+        if server.db:
+            server.db.close()
 
         consumer_task.cancel()
         try:
@@ -388,6 +417,118 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             )
 
         return item["response"]
+
+    # ------------------------------------------------------------------
+    # POST /v1/embeddings
+    # ------------------------------------------------------------------
+
+    @app.post("/v1/embeddings")
+    async def embeddings_proxy(request: Request):
+        """Proxy embeddings requests to the dedicated embeddings server."""
+        if not config.embeddings_url:
+            return JSONResponse(
+                {"error": "Embeddings server not configured"}, status_code=503
+            )
+        try:
+            body = await request.body()
+        except Exception:
+            return JSONResponse({"error": "Failed to read request body"}, status_code=400)
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{config.embeddings_url}/v1/embeddings",
+                content=body,
+                headers={"content-type": request.headers.get("content-type", "application/json")},
+                timeout=60,
+            )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+
+    # ------------------------------------------------------------------
+    # GET /collections
+    # ------------------------------------------------------------------
+
+    @app.get("/collections")
+    async def list_collections_endpoint():
+        """List all registered document collections."""
+        if server.db is None:
+            return JSONResponse(
+                {"error": "Collection retrieval not configured"}, status_code=503
+            )
+        collections = server.db.list_collections()
+        return {"collections": collections}
+
+    # ------------------------------------------------------------------
+    # POST /collections/{collection_id}/search
+    # ------------------------------------------------------------------
+
+    @app.post("/collections/{collection_id}/search")
+    async def search_collection(collection_id: str, request: Request):
+        """Semantic search within a collection."""
+        if server.db is None or server.embeddings_client is None:
+            return JSONResponse(
+                {"error": "Collection retrieval not configured"}, status_code=503
+            )
+
+        # Verify collection exists
+        all_collections = server.db.list_collections()
+        if not any(c["id"] == collection_id for c in all_collections):
+            return JSONResponse(
+                {"error": f"Collection not found: {collection_id}"}, status_code=404
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+        query = body.get("query", "")
+        if not query:
+            return JSONResponse({"error": "query field is required"}, status_code=400)
+
+        limit = body.get("limit", 5)
+        tags = body.get("tags")
+
+        try:
+            query_embedding = await server.embeddings_client.embed_text(query)
+        except Exception as exc:
+            logger.exception("Failed to embed query: %s", exc)
+            return JSONResponse(
+                {"error": "Failed to generate query embedding"}, status_code=503
+            )
+
+        results = server.db.search(collection_id, query_embedding, limit=limit, tags=tags)
+
+        # For SKILL documents, attach children (workflows)
+        for result in results:
+            doc_id = result["id"]
+            if doc_id.endswith("/SKILL"):
+                result["children"] = get_children(server.db, collection_id, doc_id)
+
+        return {"results": results}
+
+    # ------------------------------------------------------------------
+    # GET /collections/{collection_id}/docs/{doc_id:path}
+    # ------------------------------------------------------------------
+
+    @app.get("/collections/{collection_id}/docs/{doc_id:path}")
+    async def get_document(collection_id: str, doc_id: str):
+        """Get full document content by collection and document ID."""
+        if server.db is None:
+            return JSONResponse(
+                {"error": "Collection retrieval not configured"}, status_code=503
+            )
+
+        doc = server.db.get_document(collection_id, doc_id)
+        if doc is None:
+            return JSONResponse(
+                {"error": f"Document not found: {doc_id}"}, status_code=404
+            )
+
+        return doc
 
     return app
 

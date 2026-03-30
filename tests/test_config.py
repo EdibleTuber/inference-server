@@ -59,9 +59,12 @@ def test_config_llama_server_url(monkeypatch):
     assert config.llama_server_url == "http://127.0.0.1:8081"
 
 
-def test_config_embeddings_defaults():
+def test_config_embeddings_defaults(monkeypatch):
     """New embedding/collection config fields have sensible defaults."""
-    from manager.config import ManagerConfig
+    monkeypatch.delenv("EMBEDDINGS_HOST", raising=False)
+    monkeypatch.delenv("EMBEDDINGS_PORT", raising=False)
+    monkeypatch.delenv("COLLECTIONS_CONFIG", raising=False)
+    monkeypatch.delenv("SKILLS_DB_PATH", raising=False)
     config = ManagerConfig.from_env()
     assert config.embeddings_host == "127.0.0.1"
     assert config.embeddings_port == 8082
@@ -75,7 +78,6 @@ def test_config_embeddings_from_env(monkeypatch):
     monkeypatch.setenv("EMBEDDINGS_PORT", "9090")
     monkeypatch.setenv("COLLECTIONS_CONFIG", "/tmp/cols.json")
     monkeypatch.setenv("SKILLS_DB_PATH", "/tmp/skills.db")
-    from manager.config import ManagerConfig
     config = ManagerConfig.from_env()
     assert config.embeddings_host == "10.0.0.5"
     assert config.embeddings_port == 9090
@@ -83,8 +85,9 @@ def test_config_embeddings_from_env(monkeypatch):
     assert config.skills_db_path == "/tmp/skills.db"
 
 
-def test_config_embeddings_url():
+def test_config_embeddings_url(monkeypatch):
     """embeddings_url property builds correct URL."""
-    from manager.config import ManagerConfig
+    monkeypatch.delenv("EMBEDDINGS_HOST", raising=False)
+    monkeypatch.delenv("EMBEDDINGS_PORT", raising=False)
     config = ManagerConfig.from_env()
     assert config.embeddings_url == "http://127.0.0.1:8082"

@@ -38,6 +38,10 @@ class ManagerConfig:
         queue_limit: Max number of requests to hold in the FIFO queue.
         swap_timeout: Seconds to wait for llama-server health after a model swap.
         log_file: Path to the manager's log file.
+        embeddings_host: Address where the embeddings server is running.
+        embeddings_port: Port where the embeddings server listens.
+        collections_config: Path to the collections configuration JSON file.
+        skills_db_path: Path to the skills SQLite database file.
     """
     host: str
     port: int
@@ -48,11 +52,20 @@ class ManagerConfig:
     queue_limit: int
     swap_timeout: int
     log_file: str
+    embeddings_host: str
+    embeddings_port: int
+    collections_config: str
+    skills_db_path: str
 
     @property
     def llama_server_url(self) -> str:
         """Full URL for connecting to llama-server."""
         return f"http://{self.llama_server_host}:{self.llama_server_port}"
+
+    @property
+    def embeddings_url(self) -> str:
+        """Full URL for connecting to the embeddings server."""
+        return f"http://{self.embeddings_host}:{self.embeddings_port}"
 
     @classmethod
     def from_env(cls) -> "ManagerConfig":
@@ -67,4 +80,8 @@ class ManagerConfig:
             queue_limit=_int_env("QUEUE_LIMIT", 20),
             swap_timeout=_int_env("SWAP_TIMEOUT", 120),
             log_file=os.getenv("LOG_FILE", "/var/log/llama/manager.log"),
+            embeddings_host=os.getenv("EMBEDDINGS_HOST", "127.0.0.1"),
+            embeddings_port=_int_env("EMBEDDINGS_PORT", 8082),
+            collections_config=os.getenv("COLLECTIONS_CONFIG", "/etc/llama/collections.json"),
+            skills_db_path=os.getenv("SKILLS_DB_PATH", "/opt/llama/data/skills.db"),
         )

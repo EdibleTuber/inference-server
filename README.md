@@ -11,7 +11,7 @@ A native llama.cpp inference server with an OpenAI-compatible API, API-driven mo
 │                   Ubuntu Server (Headless)                       │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Model Manager (Python/FastAPI)          LAN_IP:8080     │   │
+│  │  Model Manager (Python/FastAPI)         LAN_IP:11434    │   │
 │  │  user: _llama-mgr                                        │   │
 │  │  ┌────────────────────────────────────────────────────┐  │   │
 │  │  │ OpenAI-compatible API                              │  │   │
@@ -37,7 +37,7 @@ A native llama.cpp inference server with an OpenAI-compatible API, API-driven mo
 
 ### Why this design?
 
-**Two-layer architecture.** Clients talk only to the model manager on port 8080. The model manager talks to llama-server on localhost:8081. llama-server is never directly exposed to the network. This separation means:
+**Two-layer architecture.** Clients talk only to the model manager on port 11434. The model manager talks to llama-server on localhost:8081. llama-server is never directly exposed to the network. This separation means:
 
 - The manager can restart llama-server for model swaps without dropping client connections — it holds the client's HTTP connection open while the swap completes, then proxies the response.
 - Privilege separation: llama-server only needs to read model files and access the GPU. The manager only needs to restart llama-server and update one config file. Neither service needs broad system access.
@@ -118,9 +118,9 @@ sudo systemctl start llama-manager
 **7. Verify everything is up:**
 
 ```bash
-curl http://localhost:8080/health
-curl http://localhost:8080/status
-curl http://localhost:8080/v1/models
+curl http://localhost:11434/health
+curl http://localhost:11434/status
+curl http://localhost:11434/v1/models
 ```
 
 ---
@@ -130,7 +130,7 @@ curl http://localhost:8080/v1/models
 ### Basic chat completion
 
 ```bash
-curl http://YOUR_LAN_IP:8080/v1/chat/completions \
+curl http://YOUR_LAN_IP:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-7b-instruct-q4_k_m",
@@ -141,7 +141,7 @@ curl http://YOUR_LAN_IP:8080/v1/chat/completions \
 ### Streaming response
 
 ```bash
-curl http://YOUR_LAN_IP:8080/v1/chat/completions \
+curl http://YOUR_LAN_IP:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-7b-instruct-q4_k_m",
@@ -155,7 +155,7 @@ curl http://YOUR_LAN_IP:8080/v1/chat/completions \
 Just change the `model` field. The manager detects the change and hot-swaps llama-server automatically. The client connection stays open while the swap completes (30–60+ seconds). Set your HTTP timeout to at least 120 seconds.
 
 ```bash
-curl http://YOUR_LAN_IP:8080/v1/chat/completions \
+curl http://YOUR_LAN_IP:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama-3-8b-instruct-q5_k_m",
@@ -168,7 +168,7 @@ curl http://YOUR_LAN_IP:8080/v1/chat/completions \
 Useful if you want to avoid waiting through a model swap, or to check queue depth before submitting work.
 
 ```bash
-curl http://YOUR_LAN_IP:8080/status
+curl http://YOUR_LAN_IP:11434/status
 ```
 
 ```json
@@ -196,7 +196,7 @@ The API is OpenAI-compatible, so existing clients work without modification:
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://YOUR_LAN_IP:8080/v1",
+    base_url="http://YOUR_LAN_IP:11434/v1",
     api_key="not-needed",  # no auth on internal network
 )
 
@@ -224,7 +224,7 @@ sudo bash scripts/download-model.sh \
 ### List available models
 
 ```bash
-curl http://YOUR_LAN_IP:8080/v1/models
+curl http://YOUR_LAN_IP:11434/v1/models
 ```
 
 New models are available immediately after download — no service restart needed. The manager scans the directory on every request to `/v1/models`.
@@ -279,19 +279,27 @@ Configuration for the model manager proxy service.
 | `QUEUE_LIMIT` | `20` | Maximum requests to hold in the FIFO queue. Requests beyond this get a 503 response. |
 | `SWAP_TIMEOUT` | `120` | Seconds to wait for llama-server health after a model swap. Exceeding this puts the manager in `error` state. |
 | `LOG_FILE` | `/var/log/llama/manager.log` | Log file path for the model manager. |
+| `EMBEDDINGS_HOST` | `127.0.0.1` | Address where llama-embeddings is running. Always localhost. |
+| `EMBEDDINGS_PORT` | `8082` | Port where llama-embeddings listens. |
+| `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
+| `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
 
 ---
 
 ## API Endpoints
 
-All endpoints are on `LAN_IP:8080`.
+All endpoints are on `LAN_IP:11434`.
 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions. Reads the `model` field, swaps if needed, queues if busy. Supports streaming (`"stream": true`). |
+| `POST` | `/v1/embeddings` | Proxy to llama-embeddings instance. OpenAI-compatible. |
 | `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
 | `GET` | `/status` | Server state, current model, queue depth, GPU VRAM usage, uptime. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
+| `GET` | `/collections` | Lists registered document collections with document counts. |
+| `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |
+| `GET` | `/collections/{id}/docs/{doc_id}` | Full document content by ID. |
 
 ### Server states
 
@@ -458,7 +466,10 @@ If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server f
   │   └── llama-server              # compiled llama.cpp binary (CUDA)
   ├── models/                       # GGUF storage
   │   ├── qwen2.5-7b-instruct-q4_k_m.gguf
+  │   ├── nomic-embed-text-v1.5.Q8_0.gguf
   │   └── ...
+  ├── data/
+  │   └── skills.db                 # SQLite-vec database for collections
   └── manager/                      # model manager Python app
       ├── venv/                     # isolated virtualenv
       ├── app.py                    # main FastAPI application
@@ -466,19 +477,26 @@ If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server f
       ├── queue.py                  # FIFO request queue
       ├── swap.py                   # model swap orchestration
       ├── gpu.py                    # GPU info via nvidia-smi
+      ├── embeddings.py             # embeddings client for llama-embeddings
+      ├── vectordb.py               # SQLite-vec vector database wrapper
+      ├── collections.py            # collection indexing pipeline
       └── requirements.txt
 
 /etc/llama/
   ├── llama-server.env              # runtime config for llama-server (manager writes MODEL_PATH here)
-  └── manager.env                   # runtime config for model manager
+  ├── manager.env                   # runtime config for model manager
+  └── collections.json              # collection definitions for document retrieval
 
 /var/log/llama/
   ├── llama-server.log              # inference server stdout/stderr
-  └── manager.log                   # model manager application log
+  ├── manager.log                   # model manager application log
+  ├── embeddings.log                # embedding server stdout
+  └── embeddings.err                # embedding server stderr
 
 /etc/systemd/system/
   ├── llama-server.service
-  └── llama-manager.service
+  ├── llama-manager.service
+  └── llama-embeddings.service
 ```
 
 ### This repository
@@ -491,14 +509,19 @@ inference_server/
 │   ├── queue.py                    # FIFO request queue
 │   ├── swap.py                     # model swap orchestration
 │   ├── gpu.py                      # GPU info via nvidia-smi
+│   ├── embeddings.py               # async client for llama-embeddings instance
+│   ├── vectordb.py                 # SQLite-vec vector database wrapper
+│   ├── collections.py              # collection indexing pipeline
 │   ├── requirements.txt            # Python dependencies
 │   └── README.md                   # manager component documentation
 ├── systemd/                        # systemd unit files (copied to /etc/systemd/system/)
 │   ├── llama-server.service
-│   └── llama-manager.service
+│   ├── llama-manager.service
+│   └── llama-embeddings.service    # CPU-only embedding server
 ├── config/                         # template config files (copied to /etc/llama/)
 │   ├── llama-server.env
 │   ├── manager.env
+│   ├── collections.json            # collection definitions
 │   └── llama-logrotate
 ├── scripts/
 │   ├── setup.sh                    # system setup: users, dirs, permissions, sudoers, systemd
@@ -509,7 +532,11 @@ inference_server/
     ├── test_queue.py
     ├── test_swap.py
     ├── test_endpoints.py
-    └── test_gpu.py
+    ├── test_gpu.py
+    ├── test_embeddings.py
+    ├── test_vectordb.py
+    ├── test_collections.py
+    └── test_collection_endpoints.py
 ```
 
 ---
@@ -520,4 +547,5 @@ inference_server/
 - **llama-server is localhost-only.** It is never exposed to the network. Only the manager can reach it.
 - **Dedicated system users.** `_llama` and `_llama-mgr` have no shell, no home directory, and minimal permissions. If a service were compromised, access is tightly scoped.
 - **Narrow sudoers.** `_llama-mgr` can only run `systemctl restart llama-server.service`. Nothing else.
-- **No TLS.** Acceptable on a trusted LAN or Tailscale tunnel. Do not expose port 8080 directly to the internet.
+- **llama-embeddings is localhost-only.** The embedding server on port 8082 is never exposed to the network.
+- **No TLS.** Acceptable on a trusted LAN or Tailscale tunnel. Do not expose port 11434 directly to the internet.

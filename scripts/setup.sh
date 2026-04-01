@@ -60,7 +60,7 @@ fi
 # -- 3. Directories --
 echo "[3/8] Creating directories..."
 
-mkdir -p /opt/llama/bin /opt/llama/models /opt/llama/manager
+mkdir -p /opt/llama/bin /opt/llama/models /opt/llama/manager /opt/llama/data
 mkdir -p /etc/llama
 mkdir -p /var/log/llama
 
@@ -76,6 +76,10 @@ chown -R _llama-mgr:_llama-mgr /opt/llama/manager
 chmod 755 /opt/llama/manager
 echo "  /opt/llama/manager → _llama-mgr 755"
 
+chown _llama-mgr:_llama-mgr /opt/llama/data
+chmod 755 /opt/llama/data
+echo "  /opt/llama/data → _llama-mgr 755"
+
 chown root:root /opt/llama/bin
 chmod 755 /opt/llama/bin
 
@@ -85,14 +89,28 @@ chmod 775 /var/log/llama
 # -- 5. Config files --
 echo "[5/8] Installing config files..."
 
-cp "$REPO_DIR/config/llama-server.env" /etc/llama/llama-server.env
-# Owned by _llama-mgr so the manager can update MODEL_PATH during swaps
-chown _llama-mgr:_llama-mgr /etc/llama/llama-server.env
-chmod 644 /etc/llama/llama-server.env
+# Helper: install config file without clobbering existing customizations.
+# If the target exists, back it up and warn. If not, copy fresh.
+install_config() {
+    local src="$1" dst="$2"
+    if [[ -f "$dst" ]]; then
+        local backup="${dst}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$dst" "$backup"
+        echo "  Backed up: $dst → $backup"
+        # Merge strategy: keep existing file, copy new template next to it
+        cp "$src" "${dst}.new"
+        echo "  New template: ${dst}.new (review and merge manually)"
+    else
+        cp "$src" "$dst"
+        echo "  Installed: $dst"
+    fi
+    chown _llama-mgr:_llama-mgr "$dst"
+    chmod 644 "$dst"
+}
 
-cp "$REPO_DIR/config/manager.env" /etc/llama/manager.env
-chown _llama-mgr:_llama-mgr /etc/llama/manager.env
-chmod 644 /etc/llama/manager.env
+install_config "$REPO_DIR/config/llama-server.env" /etc/llama/llama-server.env
+install_config "$REPO_DIR/config/manager.env" /etc/llama/manager.env
+install_config "$REPO_DIR/config/collections.json" /etc/llama/collections.json
 
 # -- 6. Sudoers --
 echo "[6/8] Installing sudoers entry..."
@@ -128,6 +146,7 @@ echo "[8/8] Installing systemd services..."
 
 cp "$REPO_DIR/systemd/llama-server.service" /etc/systemd/system/
 cp "$REPO_DIR/systemd/llama-manager.service" /etc/systemd/system/
+cp "$REPO_DIR/systemd/llama-embeddings.service" /etc/systemd/system/
 systemctl daemon-reload
 
 # Logrotate
@@ -138,7 +157,12 @@ echo "=== Setup Complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Place llama-server binary at /opt/llama/bin/llama-server"
-echo "  2. Download a GGUF model: ./scripts/download-model.sh <repo> <file>"
-echo "  3. Set HOST in /etc/llama/manager.env to your LAN IP"
-echo "  4. sudo systemctl enable --now llama-server llama-manager"
-echo "  5. Test: curl http://<LAN_IP>:8080/health"
+echo "  2. Download models:"
+echo "     ./scripts/download-model.sh <repo> <file>          # chat model"
+echo "     Download nomic-embed-text GGUF to /opt/llama/models/  # embedding model"
+echo "  3. Review config files in /etc/llama/:"
+echo "     - Set HOST in manager.env to your LAN IP"
+echo "     - Update source_dir paths in collections.json"
+echo "     - If *.new files exist, merge changes into existing configs"
+echo "  4. sudo systemctl enable --now llama-server llama-manager llama-embeddings"
+echo "  5. Test: curl http://<LAN_IP>:11434/health"

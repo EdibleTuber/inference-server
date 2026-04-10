@@ -402,7 +402,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             return JSONResponse(
                 {"error": {"message": "Server busy", "type": "server_error"}},
                 status_code=503,
-                headers={"Retry-After": "30"},
+                headers={"Retry-After": "5"},
             )
 
         # Signal the consumer and wait for the result.
@@ -413,7 +413,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             return JSONResponse(
                 {"error": {"message": item["error"], "type": "server_error"}},
                 status_code=503,
-                headers={"Retry-After": "30"},
+                headers={"Retry-After": "5"},
             )
 
         return item["response"]

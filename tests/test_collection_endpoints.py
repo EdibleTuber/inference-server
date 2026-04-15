@@ -196,3 +196,25 @@ def test_reindex_post_paths_must_be_strings(collection_client):
         json={"paths": [1, 2, 3]},
     )
     assert resp.status_code == 400
+
+
+def test_reindex_get_by_job_id_returns_status(collection_client):
+    """GET /reindex/{job_id} returns the job state."""
+    post = collection_client.post("/collections/skills/reindex", json={})
+    job_id = post.json()["job_id"]
+    resp = collection_client.get(f"/collections/skills/reindex/{job_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["job_id"] == job_id
+    assert body["status"] in ("queued", "running", "done", "error")
+
+
+def test_reindex_get_by_unknown_job_id_is_404(collection_client):
+    resp = collection_client.get("/collections/skills/reindex/not-a-real-job-id")
+    assert resp.status_code == 404
+
+
+def test_reindex_get_on_unknown_collection_is_404(collection_client):
+    """A job_id on an unknown collection returns 404 (collection check fires first)."""
+    resp = collection_client.get("/collections/nonexistent/reindex/some-job-id")
+    assert resp.status_code == 404

@@ -140,3 +140,104 @@ def test_get_children_for_skill(skills_dir):
     children = get_children(db, "skills", "Security/Recon/SKILL")
     assert len(children) == 1
     assert children[0]["id"] == "Security/Recon/Workflows/PassiveRecon"
+
+
+import pytest
+from unittest.mock import AsyncMock
+
+
+@pytest.mark.asyncio
+async def test_index_collection_with_paths_only_indexes_given_files(notes_dir, tmp_path):
+    """When `paths` is provided, only those files are upserted and stale-delete is skipped."""
+    from manager.collections import index_collection
+    from manager.vectordb import VectorDB
+
+    # Seed the notes_dir with two files
+    (Path(notes_dir) / "a.md").write_text("# A\n\nFirst note.")
+    (Path(notes_dir) / "b.md").write_text("# B\n\nSecond note.")
+
+    db_path = str(tmp_path / "idx.db")
+    db = VectorDB(db_path)
+    db.init_schema()
+    embeddings = AsyncMock()
+    embeddings.embed_text = AsyncMock(return_value=[0.0] * 768)
+
+    # First: full scan should index all files (notes_dir fixture pre-creates one file,
+    # plus a.md and b.md = 3 total).
+    stats = await index_collection(
+        collection_id="notes",
+        source_dir=notes_dir,
+        doc_type="markdown",
+        db=db,
+        embeddings=embeddings,
+    )
+    assert stats["new"] == 3
+    assert stats["removed"] == 0
+
+    # Delete one file on disk — but only ask the reindex to touch the OTHER file
+    (Path(notes_dir) / "a.md").unlink()
+
+    stats = await index_collection(
+        collection_id="notes",
+        source_dir=notes_dir,
+        doc_type="markdown",
+        db=db,
+        embeddings=embeddings,
+        paths=[str(Path(notes_dir) / "b.md")],
+    )
+    # Only b.md was considered. No stale-delete ran — a.md's row is still in the DB.
+    assert stats["unchanged"] + stats["updated"] == 1
+    assert stats["removed"] == 0
+    existing = db.get_hash(str(Path(notes_dir) / "a.md"))
+    assert existing is not None, "stale-delete should NOT run when paths is given"
+
+    db._conn.close()
+
+
+@pytest.mark.asyncio
+async def test_index_collection_paths_skips_files_outside_source_dir(notes_dir, tmp_path):
+    """Paths that aren't under source_dir are silently ignored (defensive)."""
+    from manager.collections import index_collection
+    from manager.vectordb import VectorDB
+
+    (Path(notes_dir) / "a.md").write_text("# A")
+    db = VectorDB(str(tmp_path / "idx.db"))
+    db.init_schema()
+    embeddings = AsyncMock()
+    embeddings.embed_text = AsyncMock(return_value=[0.0] * 768)
+
+    stats = await index_collection(
+        collection_id="notes",
+        source_dir=notes_dir,
+        doc_type="markdown",
+        db=db,
+        embeddings=embeddings,
+        paths=["/etc/passwd", str(Path(notes_dir) / "a.md")],
+    )
+    assert stats["new"] == 1  # only a.md counted; /etc/passwd rejected
+    db._conn.close()
+
+
+@pytest.mark.asyncio
+async def test_index_collection_paths_handles_missing_files(notes_dir, tmp_path):
+    """Paths that don't exist on disk are silently skipped."""
+    from manager.collections import index_collection
+    from manager.vectordb import VectorDB
+
+    db = VectorDB(str(tmp_path / "idx.db"))
+    db.init_schema()
+    embeddings = AsyncMock()
+    embeddings.embed_text = AsyncMock(return_value=[0.0] * 768)
+
+    stats = await index_collection(
+        collection_id="notes",
+        source_dir=notes_dir,
+        doc_type="markdown",
+        db=db,
+        embeddings=embeddings,
+        paths=[str(Path(notes_dir) / "ghost.md")],
+    )
+    assert stats["new"] == 0
+    assert stats["updated"] == 0
+    assert stats["unchanged"] == 0
+    db._conn.close()

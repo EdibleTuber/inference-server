@@ -159,13 +159,38 @@ async def index_collection(
     doc_type: str,
     db: VectorDB,
     embeddings: EmbeddingsClient,
+    paths: list[str] | None = None,
 ) -> dict:
-    """Index a single collection. Returns stats dict {new, updated, removed, unchanged}."""
+    """Index a collection. When `paths` is provided, only those absolute file paths
+    under source_dir are considered and stale-deletion is skipped. When `paths` is
+    None, behaviour is unchanged: full rglob scan + stale-deletion.
+
+    Returns stats dict {new, updated, removed, unchanged}.
+    """
     stats = {"new": 0, "updated": 0, "removed": 0, "unchanged": 0}
 
     db.upsert_collection(collection_id, source_dir, doc_type)
 
-    files = scan_collection(source_dir)
+    if paths is None:
+        files = scan_collection(source_dir)
+    else:
+        # Scoped mode: only process paths under source_dir that exist on disk.
+        source = Path(source_dir).resolve()
+        files = []
+        for p in paths:
+            full = Path(p).resolve()
+            if not full.exists():
+                continue
+            try:
+                full.relative_to(source)
+            except ValueError:
+                continue  # path outside source_dir
+            content = full.read_bytes()
+            files.append({
+                "file_path": str(full),
+                "file_hash": hashlib.sha256(content).hexdigest(),
+            })
+
     seen_paths = set()
 
     for file_info in files:
@@ -173,7 +198,6 @@ async def index_collection(
         file_hash = file_info["file_hash"]
         seen_paths.add(file_path)
 
-        # Check if already indexed with same hash
         existing_hash = db.get_hash(file_path)
         if existing_hash == file_hash:
             stats["unchanged"] += 1
@@ -181,7 +205,6 @@ async def index_collection(
 
         is_new = existing_hash is None
 
-        # Read and parse
         content = Path(file_path).read_text(encoding="utf-8")
         frontmatter, body = parse_frontmatter(content)
 
@@ -196,7 +219,6 @@ async def index_collection(
             if parts:
                 metadata["category"] = parts[0]
 
-        # Generate embedding from summary
         embedding = await embeddings.embed_text(summary)
 
         db.upsert_document(
@@ -216,8 +238,9 @@ async def index_collection(
         else:
             stats["updated"] += 1
 
-    # Remove stale documents
-    stats["removed"] = db.delete_stale(collection_id, seen_paths)
+    # Stale-deletion only runs on a full scan, never in scoped mode.
+    if paths is None:
+        stats["removed"] = db.delete_stale(collection_id, seen_paths)
 
     return stats
 

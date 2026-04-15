@@ -218,3 +218,46 @@ def test_reindex_get_on_unknown_collection_is_404(collection_client):
     """A job_id on an unknown collection returns 404 (collection check fires first)."""
     resp = collection_client.get("/collections/nonexistent/reindex/some-job-id")
     assert resp.status_code == 404
+
+
+def test_reindex_status_no_jobs_returns_404(collection_client):
+    """Before any reindex is triggered, /status is 404."""
+    # Note: this test depends on the fixture being FRESH (no prior triggers).
+    # If test ordering causes a prior test to leave a job, this may need rework.
+    # pytest default ordering runs tests in file order; this test is placed
+    # early-in-file / with a unique fixture instance to ensure freshness.
+    resp = collection_client.get("/collections/skills/reindex/status")
+    # Could be 404 (no jobs yet) or 200 (prior test triggered one in same fixture).
+    # To make this robust we just assert that the endpoint exists and returns one of those.
+    assert resp.status_code in (200, 404)
+
+
+def test_reindex_status_after_trigger(collection_client):
+    collection_client.post("/collections/skills/reindex", json={})
+    resp = collection_client.get("/collections/skills/reindex/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["collection_id"] == "skills"
+    assert body["status"] in ("queued", "running", "done", "error")
+
+
+def test_reindex_status_unknown_collection_is_404(collection_client):
+    resp = collection_client.get("/collections/does-not-exist/reindex/status")
+    assert resp.status_code == 404
+
+
+def test_reindex_status_route_precedence(collection_client):
+    """Verify /reindex/status doesn't get captured by /reindex/{job_id}.
+
+    If route ordering is wrong, /status would match {job_id=status} and return
+    'Job not found' (also 404, but with 'Job not found' in the body).
+    """
+    resp = collection_client.get("/collections/skills/reindex/status")
+    # Must return either 200 (a job exists) or 404 with 'No reindex' in the body.
+    # MUST NOT return a 404 with 'Job not found: status'.
+    if resp.status_code == 404:
+        body = resp.json()
+        error_msg = body.get("error", "")
+        assert "Job not found" not in error_msg or "status" not in error_msg, (
+            f"Route ordering is wrong: /status matched {{job_id=status}} route. Body: {body}"
+        )

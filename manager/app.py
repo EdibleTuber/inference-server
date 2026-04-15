@@ -585,6 +585,29 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         return JSONResponse(job.to_dict(), status_code=202)
 
     # ------------------------------------------------------------------
+    # GET /collections/{collection_id}/reindex/status
+    # ------------------------------------------------------------------
+
+    @app.get("/collections/{collection_id}/reindex/status")
+    async def get_reindex_status(collection_id: str):
+        """Return the current (or most recent) reindex job for a collection."""
+        if server.db is None:
+            return JSONResponse(
+                {"error": "Collection retrieval not configured"}, status_code=503
+            )
+        all_collections = server.db.list_collections()
+        if not any(c["id"] == collection_id for c in all_collections):
+            return JSONResponse(
+                {"error": f"Collection not found: {collection_id}"}, status_code=404
+            )
+        job = server.reindex_registry.get_current(collection_id)
+        if job is None:
+            return JSONResponse(
+                {"error": "No reindex job recorded for this collection"}, status_code=404,
+            )
+        return job.to_dict()
+
+    # ------------------------------------------------------------------
     # GET /collections/{collection_id}/reindex/{job_id}
     # ------------------------------------------------------------------
 

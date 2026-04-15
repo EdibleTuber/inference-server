@@ -149,3 +149,50 @@ def test_embeddings_proxy(collection_client):
             json={"model": "nomic-embed-text", "input": "hello"},
         )
         assert response.status_code == 200
+
+
+def test_reindex_post_rejects_unknown_collection(collection_client):
+    resp = collection_client.post("/collections/does-not-exist/reindex", json={})
+    assert resp.status_code == 404
+
+
+def test_reindex_post_returns_job_id(collection_client):
+    resp = collection_client.post("/collections/skills/reindex", json={})
+    assert resp.status_code == 202
+    body = resp.json()
+    assert "job_id" in body
+    assert body["status"] in ("queued", "running", "done")
+    assert body["collection_id"] == "skills"
+
+
+def test_reindex_post_accepts_paths(collection_client):
+    resp = collection_client.post(
+        "/collections/skills/reindex",
+        json={"paths": ["/tmp/a.md", "/tmp/b.md"]},
+    )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["paths"] == ["/tmp/a.md", "/tmp/b.md"]
+
+
+def test_reindex_post_missing_body_defaults_to_full_scan(collection_client):
+    resp = collection_client.post("/collections/skills/reindex")
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["paths"] is None
+
+
+def test_reindex_post_paths_must_be_list(collection_client):
+    resp = collection_client.post(
+        "/collections/skills/reindex",
+        json={"paths": "not a list"},
+    )
+    assert resp.status_code == 400
+
+
+def test_reindex_post_paths_must_be_strings(collection_client):
+    resp = collection_client.post(
+        "/collections/skills/reindex",
+        json={"paths": [1, 2, 3]},
+    )
+    assert resp.status_code == 400

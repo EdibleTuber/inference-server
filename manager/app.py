@@ -31,7 +31,7 @@ from manager.gpu import get_gpu_info
 from manager.queue import RequestQueue
 from manager.swap import ModelSwapper
 from manager.vectordb import VectorDB
-from manager.collections import index_all_collections, get_children
+from manager.collections import index_all_collections, index_collection, get_children
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,10 @@ class ServerState:
         # Collection retrieval
         self.db: VectorDB | None = None
         self.embeddings_client: EmbeddingsClient | None = None
+
+        # Reindex jobs
+        from manager.reindex_jobs import ReindexRegistry
+        self.reindex_registry = ReindexRegistry()
 
     # ------------------------------------------------------------------
     # Model path helpers
@@ -529,6 +533,56 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             )
 
         return doc
+
+    # ------------------------------------------------------------------
+    # POST /collections/{collection_id}/reindex
+    # ------------------------------------------------------------------
+
+    @app.post("/collections/{collection_id}/reindex")
+    async def trigger_reindex(collection_id: str, request: Request):
+        """Trigger an incremental reindex. Optional body {paths: [...]} limits scope."""
+        if server.db is None or server.embeddings_client is None:
+            return JSONResponse(
+                {"error": "Collection retrieval not configured"}, status_code=503
+            )
+
+        all_collections = server.db.list_collections()
+        entry = next((c for c in all_collections if c["id"] == collection_id), None)
+        if entry is None:
+            return JSONResponse(
+                {"error": f"Collection not found: {collection_id}"}, status_code=404
+            )
+
+        paths: list[str] | None = None
+        if request.headers.get("content-length", "0") != "0":
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+            raw_paths = body.get("paths")
+            if raw_paths is not None:
+                if not isinstance(raw_paths, list) or not all(isinstance(p, str) for p in raw_paths):
+                    return JSONResponse(
+                        {"error": "'paths' must be a list of strings"}, status_code=400,
+                    )
+                paths = list(raw_paths)
+
+        async def _indexer(job_paths):
+            return await index_collection(
+                collection_id=entry["id"],
+                source_dir=entry["source_dir"],
+                doc_type=entry["doc_type"],
+                db=server.db,
+                embeddings=server.embeddings_client,
+                paths=job_paths,
+            )
+
+        job = await server.reindex_registry.start(
+            collection_id=collection_id,
+            indexer=_indexer,
+            paths=paths,
+        )
+        return JSONResponse(job.to_dict(), status_code=202)
 
     return app
 

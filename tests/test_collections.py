@@ -3,6 +3,7 @@
 import pytest
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 
 @pytest.fixture
@@ -140,10 +141,6 @@ def test_get_children_for_skill(skills_dir):
     children = get_children(db, "skills", "Security/Recon/SKILL")
     assert len(children) == 1
     assert children[0]["id"] == "Security/Recon/Workflows/PassiveRecon"
-
-
-import pytest
-from unittest.mock import AsyncMock
 
 
 @pytest.mark.asyncio

@@ -119,7 +119,7 @@ def make_doc_id(file_path: str, source_dir: str) -> str:
 def scan_collection(source_dir: str) -> list[dict]:
     """Scan a directory for .md files. Returns list of {file_path, file_hash}."""
     results = []
-    source = Path(source_dir)
+    source = Path(source_dir).resolve()
     if not source.exists():
         logger.warning("Collection source_dir does not exist: %s", source_dir)
         return results
@@ -128,7 +128,7 @@ def scan_collection(source_dir: str) -> list[dict]:
         content = md_file.read_bytes()
         file_hash = hashlib.sha256(content).hexdigest()
         results.append({
-            "file_path": str(md_file),
+            "file_path": str(md_file.resolve()),
             "file_hash": file_hash,
         })
 
@@ -179,7 +179,7 @@ async def index_collection(
         files = []
         for p in paths:
             full = Path(p).resolve()
-            if not full.exists():
+            if not full.is_file():
                 continue
             try:
                 full.relative_to(source)

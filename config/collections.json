@@ -5,7 +5,7 @@
     "doc_type": "skill"
   },
   {
-    "id": "notes",
+    "id": "vault",
     "source_dir": "/home/edible/vault",
     "doc_type": "markdown"
   }

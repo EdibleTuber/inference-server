@@ -78,3 +78,62 @@ class ReindexRegistry:
             lock = asyncio.Lock()
             self._locks[collection_id] = lock
         return lock
+
+    async def start(
+        self,
+        collection_id: str,
+        indexer,            # callable: async (paths) -> stats dict
+        paths: Optional[list[str]] = None,
+    ) -> ReindexJob:
+        """Start a reindex job for a collection.
+
+        If a job is already running for this collection, return it and do
+        NOT kick off a new one. The caller polls via get() to observe
+        completion.
+
+        `indexer` must be an async callable accepting the `paths` argument
+        and returning a stats dict with keys new/updated/removed/unchanged.
+        """
+        lock = self._lock_for(collection_id)
+        async with lock:
+            existing_id = self._current.get(collection_id)
+            if existing_id is not None:
+                existing = self._jobs.get(existing_id)
+                if existing is not None and existing.status in ("queued", "running"):
+                    logger.info(
+                        "reindex already running for %s (job=%s), returning existing",
+                        collection_id, existing_id,
+                    )
+                    return existing
+
+            job_id = str(uuid.uuid4())
+            job = ReindexJob(
+                job_id=job_id,
+                collection_id=collection_id,
+                paths=list(paths) if paths is not None else None,
+            )
+            self._jobs[job_id] = job
+            self._current[collection_id] = job_id
+
+        # Spawn without holding the lock — the worker updates state via its own
+        # handle and swaps status atomically.
+        asyncio.create_task(self._run_job(job, indexer))
+        return job
+
+    async def _run_job(self, job: ReindexJob, indexer) -> None:
+        job.status = "running"
+        try:
+            stats = await indexer(job.paths)
+            if not isinstance(stats, dict):
+                raise TypeError(f"indexer returned non-dict: {type(stats).__name__}")
+            # Merge only the keys we track
+            for key in ("new", "updated", "removed", "unchanged"):
+                if key in stats:
+                    job.stats[key] = int(stats[key])
+            job.status = "done"
+        except Exception as exc:
+            logger.exception("reindex job %s failed", job.job_id)
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            job.finished_at = _utcnow()

@@ -28,6 +28,8 @@ ExecStart=/opt/llama/bin/llama-server \
     --port 8082 \
     --embedding \
     --ctx-size 2048 \
+    --batch-size 2048 \
+    --ubatch-size 2048 \
     --threads 4
 
 Restart=on-failure

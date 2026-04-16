@@ -300,6 +300,9 @@ All endpoints are on `LAN_IP:11434`.
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |
 | `GET` | `/collections/{id}/docs/{doc_id}` | Full document content by ID. |
+| `POST` | `/collections/{id}/reindex` | Trigger an incremental reindex. Optional body `{"paths": [...]}` limits scope to specific files; omitted or `null` runs a full scan with stale-deletion. Returns 202 with a job id. |
+| `GET` | `/collections/{id}/reindex/status` | Current or most recent reindex job for a collection. 404 if none has run. |
+| `GET` | `/collections/{id}/reindex/{job_id}` | State of a specific reindex job (status, stats, error, timestamps). |
 
 ### Server states
 
@@ -378,6 +381,27 @@ curl -s http://LAN_IP:11434/collections/skills/docs/Security/Recon/Workflows/Pas
 # List collections
 curl -s http://LAN_IP:11434/collections | jq
 ```
+
+**Trigger a reindex without restarting the server:**
+
+```bash
+# Full scan (rescans every file in source_dir; deletes rows for files no longer on disk)
+curl -s -X POST http://LAN_IP:11434/collections/vault/reindex \
+  -H "Content-Type: application/json" -d '{}' | jq
+
+# Scoped scan (only the listed paths; skips stale-deletion). Useful right after writing
+# specific files. Paths must be absolute and under the collection's source_dir.
+curl -s -X POST http://LAN_IP:11434/collections/vault/reindex \
+  -H "Content-Type: application/json" \
+  -d '{"paths": ["/path/to/source_dir/Some/Article.md"]}' | jq
+
+# Both POSTs return 202 with a job_id immediately. Poll status:
+curl -s http://LAN_IP:11434/collections/vault/reindex/status | jq
+curl -s http://LAN_IP:11434/collections/vault/reindex/<job_id> | jq
+```
+
+Concurrent POSTs to the same collection return the in-flight `job_id` rather than stacking duplicate scans. Jobs are in-memory only and wiped on server restart (which already triggers a full reindex).
+
 
 **Generate embeddings directly:**
 

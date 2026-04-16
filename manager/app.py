@@ -14,6 +14,9 @@ Endpoints:
     GET  /collections                         - List registered collections
     POST /collections/{collection_id}/search  - Semantic search within a collection
     GET  /collections/{collection_id}/docs/{doc_id:path} - Get full document by ID
+    POST /collections/{collection_id}/reindex               - Trigger an incremental reindex (optional body {paths: [...]} limits scope)
+    GET  /collections/{collection_id}/reindex/status        - Current or most recent reindex job for a collection
+    GET  /collections/{collection_id}/reindex/{job_id}      - Specific reindex job state
 """
 import asyncio
 import logging
@@ -554,7 +557,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             )
 
         paths: list[str] | None = None
-        if request.headers.get("content-length", "0") != "0":
+        body_bytes = await request.body()
+        if body_bytes:
             try:
                 body = await request.json()
             except Exception:

@@ -4,7 +4,7 @@
 
 **Goal:** Add a second inference backend (AMD Vega iGPU / Vulkan) to the inference server, extend `llama-manager` to route across two slots (`main` / `batch`), and expose an explicit `POST /swap` endpoint so PAL's Phase B client code can exercise the batch backend.
 
-**Architecture:** Phase 0 rebuilds `/opt/llama/bin/llama-server` with both CUDA and Vulkan backends and validates Vulkan-backed inference with Gemma 3 4B. Phase 1 deploys the new `llama-server-batch.service` alongside the existing unit. Phase 2 refactors the manager to hold two `SlotState` instances (routing, queues, swap locks per slot), adds `POST /swap`, updates `/status` to expose both slots. Phase 3 smoke-tests end-to-end against PAL.
+**Architecture:** Phase 0 rebuilds `/opt/llama/bin/llama-server` with both CUDA and Vulkan backends and validates Vulkan-backed inference with Gemma 4 E4B. Phase 1 deploys the new `llama-server-batch.service` alongside the existing unit. Phase 2 refactors the manager to hold two `SlotState` instances (routing, queues, swap locks per slot), adds `POST /swap`, updates `/status` to expose both slots. Phase 3 smoke-tests end-to-end against PAL.
 
 **Tech Stack:** Python 3.12, FastAPI, httpx, pytest, pytest-asyncio, systemd, llama.cpp, Vulkan SDK.
 
@@ -180,7 +180,7 @@ git commit -m "build: CUDA+Vulkan build script for llama-server"
 
 **Files:** none (manual validation, no code changes).
 
-- [ ] **Step 1: Download Gemma 3 4B IT Q4_K_M GGUF**
+- [ ] **Step 1: Download Gemma 4 E4B IT Q4_K_M GGUF**
 
 Pull from a reputable publisher (e.g. `bartowski/gemma-3-4b-it-GGUF` on HuggingFace). Place at a temp path first — final install happens in Task 4.
 
@@ -188,21 +188,21 @@ Pull from a reputable publisher (e.g. `bartowski/gemma-3-4b-it-GGUF` on HuggingF
 mkdir -p /tmp/phase-b-validation
 cd /tmp/phase-b-validation
 # Example; use huggingface-cli or wget with the actual URL from the publisher's model card.
-wget -O gemma-3-4b-it-q4_k_m.gguf \
+wget -O gemma-4-E4B-it-Q4_K_M.gguf \
     <publisher URL from model card>
 ```
 
 Note the sha256 for Task 4:
 
 ```bash
-sha256sum gemma-3-4b-it-q4_k_m.gguf
+sha256sum gemma-4-E4B-it-Q4_K_M.gguf
 ```
 
 - [ ] **Step 2: Run llama-server directly on Vulkan, on a scratch port**
 
 ```bash
 sudo -u _llama /opt/llama/bin/llama-server \
-    --model /tmp/phase-b-validation/gemma-3-4b-it-q4_k_m.gguf \
+    --model /tmp/phase-b-validation/gemma-4-E4B-it-Q4_K_M.gguf \
     --host 127.0.0.1 \
     --port 18083 \
     --device Vulkan0 \
@@ -228,7 +228,7 @@ Expected: 200 on both. `/v1/models` returns one entry with an ID derived from th
 curl -s http://127.0.0.1:18083/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{
-        "model": "gemma-3-4b-it-q4_k_m",
+        "model": "gemma-4-E4B-it-Q4_K_M",
         "messages": [{"role": "user", "content": "Categorize this text: \"I want to learn about the history of cryptography.\" Respond with exactly one word from this list: Security, Programming, Networking, History, Writing, Unfiled."}],
         "stream": false
     }' | python3 -m json.tool
@@ -239,7 +239,7 @@ Expected: coherent single-word response ("Security" or "History" are both reason
 Check the logs for timing. llama-server prints `eval time` (prompt processing) and `generation time` (token generation). Record:
 
 ```
-Vulkan perf baseline (Gemma 3 4B IT Q4_K_M):
+Vulkan perf baseline (Gemma 4 E4B IT Q4_K_M):
   prompt processing: _____ tok/s
   generation: _____ tok/s
 ```
@@ -264,23 +264,35 @@ If Vulkan device fails at runtime, or tok/s is uselessly low (< 5 tok/s generati
 
 ## Phase 1: Batch service deployment artifacts
 
-### Task 4: Install Gemma 3 4B GGUF in models dir
+### Task 4: Install Gemma 4 E4B GGUF in models dir
 
 **Files:** none (artifact placement).
 
-- [ ] **Step 1: Move the validated GGUF to the models dir**
+**Models dir on this server is `/mnt/secondary/llama-models/`** (the `MODELS_DIR` env var in `manager.env` on the host overrides the `/opt/llama/models` default). All references below use the actual deployed path.
+
+- [ ] **Step 1: Verify the GGUF is in place**
+
+If the file was downloaded directly to the final location during Task 3, confirm it's there and has the right ownership:
+
+```bash
+ls -la /mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf
+```
+
+If the file was downloaded to a temp location, move it:
 
 ```bash
 sudo install -o _llama -g _llama -m 0644 \
-    /tmp/phase-b-validation/gemma-3-4b-it-q4_k_m.gguf \
-    /opt/llama/models/gemma-3-4b-it-q4_k_m.gguf
+    <source path> \
+    /mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf
 ```
 
-- [ ] **Step 2: Verify sha256 matches what was recorded in Task 3 Step 1**
+- [ ] **Step 2: Record sha256**
 
 ```bash
-sha256sum /opt/llama/models/gemma-3-4b-it-q4_k_m.gguf
+sha256sum /mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf
 ```
+
+Paste the hash into the Appendix section of this plan for reproducibility.
 
 - [ ] **Step 3: Verify main-slot `/v1/models` sees it**
 
@@ -333,6 +345,11 @@ Group=_llama
 
 EnvironmentFile=/etc/llama/llama-server-batch.env
 
+# Writable shader cache dir (_llama has no $HOME).
+# Without this, llama-server logs "Failed to create /home/_llama for shader
+# cache" and disables the cache, forcing shader recompile on every restart.
+Environment=XDG_CACHE_HOME=/var/cache/llama
+
 # Vulkan device selection via --device flag.
 # No --n-gpu-layers: Vulkan backend manages layer placement.
 ExecStart=/opt/llama/bin/llama-server \
@@ -343,7 +360,7 @@ ExecStart=/opt/llama/bin/llama-server \
     --ctx-size ${CTX_SIZE}
 
 # Bound the iGPU's shared-RAM footprint so it cannot starve the host
-# under pressure. Gemma 3 4B Q4 + CTX 16k KV cache fits in ~3 GB;
+# under pressure. Gemma 4 E4B Q4 + CTX 16k KV cache fits in ~3 GB;
 # 6 GB gives headroom.
 MemoryMax=6G
 
@@ -368,7 +385,8 @@ Create `config/llama-server-batch.env`:
 # The model manager updates MODEL_PATH when swapping the batch slot.
 
 # Path to the GGUF model file for the batch slot.
-MODEL_PATH=/opt/llama/models/gemma-3-4b-it-q4_k_m.gguf
+# Models live at /mnt/secondary/llama-models on this host (MODELS_DIR override).
+MODEL_PATH=/mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf
 
 # Vulkan device selector. Vulkan0 is the first enumerated device
 # per `vulkaninfo --summary`. On agenthost this is the Radeon Vega iGPU.
@@ -386,6 +404,9 @@ PORT=8083
 - [ ] **Step 3: Install on host**
 
 ```bash
+# Create shader cache dir first (referenced by the unit's Environment= directive)
+sudo install -d -o _llama -g _llama -m 0755 /var/cache/llama
+
 sudo cp systemd/llama-server-batch.service /etc/systemd/system/
 sudo cp config/llama-server-batch.env /etc/llama/llama-server-batch.env
 sudo chmod 0644 /etc/llama/llama-server-batch.env
@@ -402,7 +423,7 @@ curl -s http://127.0.0.1:8083/health
 curl -s http://127.0.0.1:8083/v1/models | python3 -m json.tool
 ```
 
-Expected: service `active (running)`. `/health` returns 200. `/v1/models` returns one entry with the Gemma 3 4B model ID.
+Expected: service `active (running)`. `/health` returns 200. `/v1/models` returns one entry with the Gemma 4 E4B model ID.
 
 If `--device ${DEVICE}` doesn't work: re-check the flag name per Task 2 Step 7 output. Update `ExecStart` in the unit file, `daemon-reload`, restart.
 
@@ -497,7 +518,7 @@ def test_from_env_batch_defaults(monkeypatch):
     assert cfg.batch_server_env == "/etc/llama/llama-server-batch.env"
     assert cfg.batch_server_unit == "llama-server-batch.service"
     assert cfg.batch_queue_limit == 20
-    assert cfg.batch_model_default == "gemma-3-4b-it-q4_k_m"
+    assert cfg.batch_model_default == "gemma-4-E4B-it-Q4_K_M"
 
 
 def test_from_env_batch_overrides(monkeypatch):
@@ -531,7 +552,7 @@ def test_batch_server_url_property():
         batch_server_host="127.0.0.1", batch_server_port=8083,
         batch_server_env="/tmp/batch.env",
         batch_server_unit="llama-server-batch.service",
-        batch_queue_limit=20, batch_model_default="gemma-3-4b-it-q4_k_m",
+        batch_queue_limit=20, batch_model_default="gemma-4-E4B-it-Q4_K_M",
     )
     assert cfg.batch_server_url == "http://127.0.0.1:8083"
 ```
@@ -570,7 +591,7 @@ Update `from_env` to load them:
             batch_server_env=os.getenv("BATCH_SERVER_ENV", "/etc/llama/llama-server-batch.env"),
             batch_server_unit=os.getenv("BATCH_SERVER_UNIT", "llama-server-batch.service"),
             batch_queue_limit=_int_env("BATCH_QUEUE_LIMIT", 20),
-            batch_model_default=os.getenv("BATCH_MODEL_DEFAULT", "gemma-3-4b-it-q4_k_m"),
+            batch_model_default=os.getenv("BATCH_MODEL_DEFAULT", "gemma-4-E4B-it-Q4_K_M"),
 ```
 
 - [ ] **Step 5: Update `conftest.py` fixtures**
@@ -2055,7 +2076,7 @@ BATCH_SERVER_PORT=8083
 BATCH_SERVER_ENV=/etc/llama/llama-server-batch.env
 BATCH_SERVER_UNIT=llama-server-batch.service
 BATCH_QUEUE_LIMIT=20
-BATCH_MODEL_DEFAULT=gemma-3-4b-it-q4_k_m
+BATCH_MODEL_DEFAULT=gemma-4-E4B-it-Q4_K_M
 ```
 
 - [ ] **Step 2: Install on host**
@@ -2129,7 +2150,7 @@ Expected: both slots listed with their loaded models.
 
 - [ ] **Step 2: Swap batch explicitly**
 
-In PAL: `/model --target batch gemma-3-4b-it-q4_k_m`
+In PAL: `/model --target batch gemma-4-E4B-it-Q4_K_M`
 
 Expected: swap succeeds. `/status` or PAL's own `/model` confirms.
 
@@ -2181,11 +2202,27 @@ Update `/home/edible/Projects/PAL/docs/superpowers/runbooks/2026-04-19-phase-b-p
 
 ---
 
-## Appendix: Follow-up tasks identified during execution
+## Appendix: Observations recorded during execution
 
-Reserve this section for issues found during implementation that deserve their own follow-up task but shouldn't block Phase B completion. Examples of what might land here:
+### Phase 0 findings (2026-04-20)
 
-- llama-server's device-flag naming turned out different from the spec; spec update needed.
-- sha256 of Gemma 3 4B GGUF for reproducibility.
+- **Device flag syntax:** `--device <name>` (comma-separated list supported). `--list-devices` enumerates.
+- **Vulkan device mapping** (on agenthost, after adding user to `render` + `video` groups):
+  - `CUDA0` = Tesla P40 (for main slot)
+  - `Vulkan0` = AMD Radeon Graphics (RADV RENOIR) = Vega iGPU (for batch slot)
+  - `Vulkan1` = Tesla P40 via NVIDIA's Vulkan ICD (unused by Phase B)
+- **Model substitution:** spec called for Gemma 3 4B IT; bartowski URL 404'd. Substituted Gemma 4 E4B IT Q4_K_M from `unsloth/gemma-4-E4B-it-GGUF`. Same size class, newer family. Model ID when loaded: `gemma-4-E4B-it-Q4_K_M`.
+- **Models dir on this server:** `/mnt/secondary/llama-models/` (MODELS_DIR env override of the default `/opt/llama/models`).
+- **Shader cache:** `_llama` has no `$HOME`, so llama-server logs "Failed to create /home/_llama for shader cache — disabling." Fixed by `Environment=XDG_CACHE_HOME=/var/cache/llama` in the batch systemd unit + `sudo install -d -o _llama -g _llama /var/cache/llama`.
+- **Vulkan device discovery required adding the current user (and `_llama`) to the `render` group.** Without it, RADV silently enumerates zero devices because `/dev/dri/renderD*` is render-group-owned; NVIDIA's ICD still worked because it uses `/dev/nvidia*`.
+
+### PAL-side followups (after Phase B server ships)
+
+- PAL's `config.batch_model` default is `gemma-3-4b-it-q4_k_m`. Update to `gemma-4-E4B-it-Q4_K_M` in `pal/config.py` or override via `PAL_BATCH_MODEL` env var on the PAL host.
+
+### Reserved for future findings
+
+Additional follow-ups identified during Phase 1-3 go here:
+- sha256 of Gemma 4 E4B GGUF for reproducibility.
 - Observed Vulkan perf baseline numbers.
 - Actual `radeontop`-equivalent command that worked on agenthost.

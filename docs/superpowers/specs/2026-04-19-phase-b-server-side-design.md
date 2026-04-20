@@ -12,7 +12,7 @@ related:
 
 The inference server currently runs a single llama-server backend on a Tesla P40 (CUDA, port 8081) behind the `llama-manager` FastAPI proxy (port 11434). Chat traffic shares that backend with background jobs PAL fires on every turn (categorize, learning scan, LLM-based PDF TOC detection), which periodically disrupts chat latency and, in one observed case on 2026-04-17, caused `llama-server` to be SIGKILLed under contention.
 
-Phase B adds a second backend running on the host's AMD Cezanne Radeon Vega iGPU via llama.cpp's Vulkan backend, pinned to a small capable model (Gemma 3 4B IT starting point), and gives the manager a slot-aware routing layer so PAL's background callers land there. Chat continues to own the P40 undisturbed.
+Phase B adds a second backend running on the host's AMD Cezanne Radeon Vega iGPU via llama.cpp's Vulkan backend, pinned to a small capable model (Gemma 4 E4B IT starting point), and gives the manager a slot-aware routing layer so PAL's background callers land there. Chat continues to own the P40 undisturbed.
 
 The PAL-side integration is already shipped on main (behind `PAL_BATCH_ENABLED=false` by default) — it's a no-op until the batch endpoint exists. This spec covers the server-side work to provide that endpoint.
 
@@ -41,7 +41,7 @@ The manager replaces its flat single-backend state with two logical slots:
 | Slot    | Systemd unit                      | Port | Device flag           | Default model               | Swap trigger                 |
 |---------|------------------------------------|------|-----------------------|-----------------------------|------------------------------|
 | `main`  | `llama-server.service` (existing) | 8081 | `--n-gpu-layers -1`   | Gemma 4 26B-A4B Q4_K_M      | Implicit on unknown-model request + explicit `POST /swap` |
-| `batch` | `llama-server-batch.service` (new) | 8083 | `--device Vulkan0`    | Gemma 3 4B IT Q4_K_M        | Explicit `POST /swap` only   |
+| `batch` | `llama-server-batch.service` (new) | 8083 | `--device Vulkan0`    | Gemma 4 E4B IT Q4_K_M        | Explicit `POST /swap` only   |
 
 Both use `/opt/llama/bin/llama-server`, rebuilt in Phase 0 with CUDA + Vulkan enabled (see Build section).
 
@@ -100,7 +100,7 @@ sudo install -m 0755 build/bin/llama-server /opt/llama/bin/llama-server
 Validation before proceeding with the rest of the plan:
 - `/opt/llama/bin/llama-server --device list` (or `--list-devices`, depending on llama.cpp version) shows both CUDA0 and Vulkan0.
 - As the `_llama` user: `vulkaninfo --summary` lists the Vega iGPU as a Vulkan device.
-- One-off load test with Gemma 3 4B on Vulkan0 (direct `llama-server` invocation, not via systemd) successfully serves `/v1/chat/completions` on a scratch port and returns coherent output. Record tok/s for a realistic prompt as the Vulkan perf baseline.
+- One-off load test with Gemma 4 E4B on Vulkan0 (direct `llama-server` invocation, not via systemd) successfully serves `/v1/chat/completions` on a scratch port and returns coherent output. Record tok/s for a realistic prompt as the Vulkan perf baseline.
 
 ## Components
 
@@ -157,7 +157,7 @@ batch_server_port: int         # 8083
 batch_server_env: str          # "/etc/llama/llama-server-batch.env"
 batch_server_unit: str         # "llama-server-batch.service"
 batch_queue_limit: int         # 20
-batch_model_default: str       # "gemma-3-4b-it-q4_k_m" (informational; no enforcement)
+batch_model_default: str       # "gemma-4-E4B-it-Q4_K_M" (informational; no enforcement)
 ```
 
 All read from `manager.env` with sensible defaults.
@@ -167,7 +167,7 @@ All read from `manager.env` with sensible defaults.
 **`systemd/llama-server-batch.service`** — parallel to `llama-server.service` with three differences:
 - `EnvironmentFile=/etc/llama/llama-server-batch.env`
 - `ExecStart` uses `--device ${DEVICE}` instead of `--n-gpu-layers ${N_GPU_LAYERS}`
-- `MemoryMax=6G` (bounds iGPU shared-RAM footprint; Gemma 3 4B Q4 + CTX 16k KV cache fits comfortably in ~3 GB, 6G gives headroom without letting the iGPU starve the host).
+- `MemoryMax=6G` (bounds iGPU shared-RAM footprint; Gemma 4 E4B Q4 + CTX 16k KV cache fits comfortably in ~3 GB, 6G gives headroom without letting the iGPU starve the host).
 
 **`config/llama-server-batch.env`** — `HOST`, `PORT=8083`, `MODEL_PATH`, `CTX_SIZE=16384`, `DEVICE=Vulkan0`.
 
@@ -199,7 +199,7 @@ All read from `manager.env` with sensible defaults.
     "batch": {
       "host": "127.0.0.1",
       "port": 8083,
-      "loaded_model": "gemma-3-4b-it-q4_k_m",
+      "loaded_model": "gemma-4-E4B-it-Q4_K_M",
       "healthy": true,
       "last_swap_utc": "2026-04-19T14:00:00+00:00",
       "queue_depth": 0,
@@ -218,7 +218,7 @@ The top-level `state`, `current_model`, `loading_model`, `error_message`, `queue
 Request:
 
 ```json
-{"model": "gemma-3-4b-it-q4_k_m", "target": "batch"}
+{"model": "gemma-4-E4B-it-Q4_K_M", "target": "batch"}
 ```
 
 `target` optional, defaults to `"main"`.
@@ -226,7 +226,7 @@ Request:
 Response (200):
 
 ```json
-{"slot": "batch", "model": "gemma-3-4b-it-q4_k_m", "status": "ok"}
+{"slot": "batch", "model": "gemma-4-E4B-it-Q4_K_M", "status": "ok"}
 ```
 
 Error (400 invalid target, 404 model file missing, 503 swap failed):
@@ -249,8 +249,8 @@ Or `main_unavailable` for main. Status 503, `Retry-After: 5`.
 
 Phase 0 gates Phases 1+. Do not merge or deploy subsequent tasks until Phase 0 is green.
 
-0. **Build + validate binary** (Phase 0). Rebuild llama-server with CUDA+Vulkan. Validate device enumeration. Manual one-off Vulkan-backed inference against Gemma 3 4B. Record perf baseline.
-1. **Drop Gemma 3 4B GGUF** at `/opt/llama/models/gemma-3-4b-it-q4_k_m.gguf`. Verify sha256.
+0. **Build + validate binary** (Phase 0). Rebuild llama-server with CUDA+Vulkan. Validate device enumeration. Manual one-off Vulkan-backed inference against Gemma 4 E4B. Record perf baseline.
+1. **Drop Gemma 4 E4B GGUF** in the configured `MODELS_DIR` (on agenthost: `/mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf`). Verify sha256.
 2. **Install batch systemd unit and env file**. Start the service. Confirm `curl 127.0.0.1:8083/health` returns 200 and `/v1/models` reports the expected model.
 3. **Deploy manager changes** (`slots.py`, `routing.py`, updated `app.py`, `swap.py`, `config.py`, updated `manager.env`, extended sudoers). Restart manager. Confirm `GET /status` shows both slots healthy.
 4. **Smoke test from PAL**: `/model` shows both slots. `/model --target batch <name>` swaps batch. `PAL_BATCH_ENABLED=true` on PAL, run a compile, confirm categorizer fires on batch (no P40 activity for that call).
@@ -272,7 +272,7 @@ _llama-mgr ALL=(root) NOPASSWD: /bin/systemctl restart llama-server.service, /bi
 
 ### Model acquisition
 
-Gemma 3 4B IT Q4_K_M GGUF: pull from HuggingFace (e.g., `bartowski/gemma-3-4b-it-GGUF` or an equivalent reputable GGUF publisher — the exact source is a spec-execution detail, not a design constraint). Verify sha256 against the publisher's listing. Record the source URL and hash in the plan as the task is executed.
+Gemma 4 E4B IT Q4_K_M GGUF: pull from HuggingFace (e.g., `bartowski/gemma-3-4b-it-GGUF` or an equivalent reputable GGUF publisher — the exact source is a spec-execution detail, not a design constraint). Verify sha256 against the publisher's listing. Record the source URL and hash in the plan as the task is executed.
 
 ## Error Handling
 

@@ -28,7 +28,17 @@ def tmp_env_file(tmp_path):
 
 
 @pytest.fixture
-def test_config(tmp_models_dir, tmp_env_file):
+def tmp_batch_env_file(tmp_path):
+    """Create a temporary llama-server-batch env file for testing batch swaps."""
+    env_file = tmp_path / "llama-server-batch.env"
+    env_file.write_text(
+        "MODEL_PATH=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=8083\n"
+    )
+    return str(env_file)
+
+
+@pytest.fixture
+def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
     """Create a ManagerConfig pointing at temporary test paths."""
     from manager.config import ManagerConfig
     return ManagerConfig(
@@ -45,6 +55,12 @@ def test_config(tmp_models_dir, tmp_env_file):
         embeddings_port=8082,
         collections_config="/dev/null",
         skills_db_path="",
+        batch_server_host="127.0.0.1",
+        batch_server_port=8083,
+        batch_server_env=tmp_batch_env_file,
+        batch_server_unit="llama-server-batch.service",
+        batch_queue_limit=20,
+        batch_model_default="test-batch-model",
     )
 
 
@@ -91,6 +107,12 @@ def collection_config(test_config, tmp_path, collections_config):
         embeddings_port=8082,
         collections_config=collections_config,
         skills_db_path=str(tmp_path / "test.db"),
+        batch_server_host=test_config.batch_server_host,
+        batch_server_port=test_config.batch_server_port,
+        batch_server_env=test_config.batch_server_env,
+        batch_server_unit=test_config.batch_server_unit,
+        batch_queue_limit=test_config.batch_queue_limit,
+        batch_model_default=test_config.batch_model_default,
     )
 
 

@@ -91,3 +91,54 @@ def test_config_embeddings_url(monkeypatch):
     monkeypatch.delenv("EMBEDDINGS_PORT", raising=False)
     config = ManagerConfig.from_env()
     assert config.embeddings_url == "http://127.0.0.1:8082"
+
+
+def test_from_env_batch_defaults(monkeypatch):
+    """Batch-slot fields have sensible defaults when env vars are absent."""
+    for var in ("BATCH_SERVER_HOST", "BATCH_SERVER_PORT", "BATCH_SERVER_ENV",
+                "BATCH_SERVER_UNIT", "BATCH_QUEUE_LIMIT", "BATCH_MODEL_DEFAULT"):
+        monkeypatch.delenv(var, raising=False)
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert cfg.batch_server_host == "127.0.0.1"
+    assert cfg.batch_server_port == 8083
+    assert cfg.batch_server_env == "/etc/llama/llama-server-batch.env"
+    assert cfg.batch_server_unit == "llama-server-batch.service"
+    assert cfg.batch_queue_limit == 20
+    assert cfg.batch_model_default == "gemma-4-E4B-it-Q4_K_M"
+
+
+def test_from_env_batch_overrides(monkeypatch):
+    """Env vars override batch-slot defaults."""
+    monkeypatch.setenv("BATCH_SERVER_HOST", "127.0.0.2")
+    monkeypatch.setenv("BATCH_SERVER_PORT", "9999")
+    monkeypatch.setenv("BATCH_SERVER_ENV", "/tmp/custom.env")
+    monkeypatch.setenv("BATCH_SERVER_UNIT", "custom.service")
+    monkeypatch.setenv("BATCH_QUEUE_LIMIT", "7")
+    monkeypatch.setenv("BATCH_MODEL_DEFAULT", "my-model")
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert cfg.batch_server_host == "127.0.0.2"
+    assert cfg.batch_server_port == 9999
+    assert cfg.batch_server_env == "/tmp/custom.env"
+    assert cfg.batch_server_unit == "custom.service"
+    assert cfg.batch_queue_limit == 7
+    assert cfg.batch_model_default == "my-model"
+
+
+def test_batch_server_url_property():
+    """batch_server_url composes host and port."""
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig(
+        host="0.0.0.0", port=11434,
+        llama_server_host="127.0.0.1", llama_server_port=8081,
+        models_dir="/tmp", llama_server_env="/tmp/env",
+        queue_limit=50, swap_timeout=60, log_file="/dev/null",
+        embeddings_host="127.0.0.1", embeddings_port=8082,
+        collections_config="/dev/null", skills_db_path="",
+        batch_server_host="127.0.0.1", batch_server_port=8083,
+        batch_server_env="/tmp/batch.env",
+        batch_server_unit="llama-server-batch.service",
+        batch_queue_limit=20, batch_model_default="gemma-4-E4B-it-Q4_K_M",
+    )
+    assert cfg.batch_server_url == "http://127.0.0.1:8083"

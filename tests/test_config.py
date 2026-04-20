@@ -98,7 +98,6 @@ def test_from_env_batch_defaults(monkeypatch):
     for var in ("BATCH_SERVER_HOST", "BATCH_SERVER_PORT", "BATCH_SERVER_ENV",
                 "BATCH_SERVER_UNIT", "BATCH_QUEUE_LIMIT", "BATCH_MODEL_DEFAULT"):
         monkeypatch.delenv(var, raising=False)
-    from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
     assert cfg.batch_server_host == "127.0.0.1"
     assert cfg.batch_server_port == 8083
@@ -116,7 +115,6 @@ def test_from_env_batch_overrides(monkeypatch):
     monkeypatch.setenv("BATCH_SERVER_UNIT", "custom.service")
     monkeypatch.setenv("BATCH_QUEUE_LIMIT", "7")
     monkeypatch.setenv("BATCH_MODEL_DEFAULT", "my-model")
-    from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
     assert cfg.batch_server_host == "127.0.0.2"
     assert cfg.batch_server_port == 9999
@@ -128,7 +126,6 @@ def test_from_env_batch_overrides(monkeypatch):
 
 def test_batch_server_url_property():
     """batch_server_url composes host and port."""
-    from manager.config import ManagerConfig
     cfg = ManagerConfig(
         host="0.0.0.0", port=11434,
         llama_server_host="127.0.0.1", llama_server_port=8081,

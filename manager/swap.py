@@ -1,14 +1,9 @@
-# manager/swap.py
 """
-Model swap orchestration for the model manager.
+Model swap orchestration for one slot.
 
-Handles the three-step process of switching models:
-1. Update llama-server's env file with the new MODEL_PATH
-2. Restart llama-server via systemctl (requires sudoers entry)
-3. Poll llama-server's health endpoint until it's ready
-
-This is the reason _llama-mgr needs a sudoers entry — it's the only
-place that calls systemctl restart.
+A ModelSwapper instance is bound to a specific slot (main or batch) via
+its SlotState and operates on that slot's env file and systemd unit.
+The manager instantiates one swapper per slot at startup.
 """
 import asyncio
 import re
@@ -17,25 +12,21 @@ import logging
 import httpx
 
 from manager.config import ManagerConfig
+from manager.slots import SlotState
 
 logger = logging.getLogger(__name__)
 
 
 class ModelSwapper:
-    """Orchestrates model swaps: env file update, systemd restart, health poll."""
+    """Orchestrates swap for one slot: env rewrite, systemd restart, health poll."""
 
-    def __init__(self, config: ManagerConfig):
+    def __init__(self, config: ManagerConfig, slot: SlotState):
         self._config = config
+        self._slot = slot
 
     def update_env_file(self, model_path: str) -> None:
-        """Rewrite MODEL_PATH in the llama-server env file.
-
-        Preserves all other env vars. Uses regex replacement so it works
-        whether MODEL_PATH is empty or has an existing value.
-        """
-        env_path = self._config.llama_server_env
-
-        with open(env_path, "r") as f:
+        """Rewrite MODEL_PATH in the slot's env file."""
+        with open(self._slot.env_file, "r") as f:
             content = f.read()
 
         content = re.sub(
@@ -45,23 +36,20 @@ class ModelSwapper:
             flags=re.MULTILINE,
         )
 
-        with open(env_path, "w") as f:
+        with open(self._slot.env_file, "w") as f:
             f.write(content)
 
-        logger.info("Updated env file: MODEL_PATH=%s", model_path)
+        logger.info("slot=%s updated env file MODEL_PATH=%s", self._slot.name, model_path)
 
     async def restart_llama_server(self) -> None:
-        """Restart llama-server via systemctl.
-
-        Runs in a thread executor to avoid blocking the async event loop.
-        Requires sudoers entry for _llama-mgr.
-        """
-        logger.info("Restarting llama-server...")
+        """Restart the slot's systemd unit via sudo."""
+        unit = self._slot.systemd_unit
+        logger.info("slot=%s restarting %s", self._slot.name, unit)
 
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: subprocess.run(
-                ["sudo", "systemctl", "restart", "llama-server.service"],
+                ["sudo", "systemctl", "restart", unit],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -70,22 +58,18 @@ class ModelSwapper:
 
         if result.returncode != 0:
             raise RuntimeError(
-                f"Failed to restart llama-server: {result.stderr}"
+                f"Failed to restart {unit}: {result.stderr}"
             )
 
-        logger.info("llama-server restart command succeeded")
+        logger.info("slot=%s restart succeeded", self._slot.name)
 
     async def wait_for_health(self) -> bool:
-        """Poll llama-server's health endpoint until it responds.
-
-        Returns True if healthy within timeout, False if timed out.
-        Polls every 2 seconds.
-        """
-        url = f"{self._config.llama_server_url}/health"
+        """Poll the slot's /health until it responds or we time out."""
+        url = f"{self._slot.url}/health"
         timeout = self._config.swap_timeout
         poll_interval = 2
 
-        logger.info("Waiting for llama-server at %s (timeout: %ds)", url, timeout)
+        logger.info("slot=%s waiting for %s (timeout=%ds)", self._slot.name, url, timeout)
 
         elapsed = 0
         async with httpx.AsyncClient() as client:
@@ -93,7 +77,7 @@ class ModelSwapper:
                 try:
                     response = await client.get(url, timeout=5)
                     if response.status_code == 200:
-                        logger.info("llama-server healthy after %ds", elapsed)
+                        logger.info("slot=%s healthy after %ds", self._slot.name, elapsed)
                         return True
                 except (httpx.ConnectError, httpx.TimeoutException, ConnectionError):
                     pass
@@ -101,23 +85,19 @@ class ModelSwapper:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
-        logger.error("Health check timed out after %ds", timeout)
+        logger.error("slot=%s health timed out after %ds", self._slot.name, timeout)
         return False
 
     async def swap_to(self, model_path: str) -> bool:
-        """Execute the full model swap sequence.
-
-        Returns True if swap succeeded, False if health check timed out.
-        """
-        logger.info("Starting model swap to: %s", model_path)
-
+        """Full swap sequence. Returns True on success, False on health timeout."""
+        logger.info("slot=%s starting swap to %s", self._slot.name, model_path)
         self.update_env_file(model_path)
         await self.restart_llama_server()
         healthy = await self.wait_for_health()
 
         if healthy:
-            logger.info("Model swap complete: %s", model_path)
+            logger.info("slot=%s swap complete: %s", self._slot.name, model_path)
         else:
-            logger.error("Model swap failed — health timed out: %s", model_path)
+            logger.error("slot=%s swap failed (health timeout): %s", self._slot.name, model_path)
 
         return healthy

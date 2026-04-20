@@ -25,18 +25,44 @@ def test_health_endpoint(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_status_endpoint(client):
+def test_status_endpoint_has_slots(client):
     response = client.get("/status")
+    assert response.status_code == 200
     data = response.json()
-    assert data["state"] in ("loading", "error", "ready", "swapping")
-    assert "current_model" in data
-    assert "loading_model" in data
-    assert "error_message" in data
-    assert "queue_depth" in data
-    assert "queue_limit" in data
-    assert data["queue_limit"] == 20
+    assert "slots" in data
+    assert "main" in data["slots"]
+    assert "batch" in data["slots"]
+
+    for slot_name in ("main", "batch"):
+        slot = data["slots"][slot_name]
+        assert set(slot.keys()) == {
+            "host", "port", "loaded_model", "healthy",
+            "last_swap_utc", "queue_depth", "queue_limit",
+        }
+        assert isinstance(slot["healthy"], bool)
+        assert isinstance(slot["queue_depth"], int)
+        assert isinstance(slot["queue_limit"], int)
+
     assert "gpu" in data
     assert "uptime_seconds" in data
+
+
+def test_status_no_top_level_flat_fields(client):
+    """The old flat fields are removed; consumers must read from slots."""
+    data = client.get("/status").json()
+    assert "current_model" not in data
+    assert "loading_model" not in data
+    assert "error_message" not in data
+    assert "state" not in data
+    assert "queue_depth" not in data
+    assert "queue_limit" not in data
+
+
+def test_status_main_queue_limit_matches_config(client):
+    """Slots reflect the config's per-slot queue limits."""
+    data = client.get("/status").json()
+    assert data["slots"]["main"]["queue_limit"] == 20
+    assert data["slots"]["batch"]["queue_limit"] == 20
 
 
 def test_models_endpoint(client):
@@ -73,63 +99,53 @@ def test_chat_completions_unknown_model(client):
     assert response.status_code == 404
 
 
-def test_ensure_model_updates_state(test_config):
+@pytest.mark.asyncio
+async def test_ensure_model_on_slot_updates_loaded_model(test_config):
     from manager.app import ServerState
     server = ServerState(test_config)
-    server.swapper.swap_to = AsyncMock(return_value=True)
+    server.slots["main"].swapper.swap_to = AsyncMock(return_value=True)
 
-    async def run():
-        result = await server.ensure_model("test-model-q4")
-        assert result is True
-        assert server.state == "ready"
-        assert server.current_model == "test-model-q4"
-
-    asyncio.get_event_loop().run_until_complete(run())
+    ok = await server.ensure_model_on_slot("main", "test-model-q4")
+    assert ok is True
+    assert server.slots["main"].loaded_model == "test-model-q4"
+    assert server.slots["main"].healthy is True
 
 
-def test_ensure_model_error_state_on_failure(test_config):
+@pytest.mark.asyncio
+async def test_ensure_model_on_slot_error_on_failure(test_config):
     from manager.app import ServerState
     server = ServerState(test_config)
-    server.swapper.swap_to = AsyncMock(return_value=False)
+    server.slots["main"].swapper.swap_to = AsyncMock(return_value=False)
 
-    async def run():
-        result = await server.ensure_model("test-model-q4")
-        assert result is False
-        assert server.state == "error"
-        assert server.current_model is None
-        assert "timed out" in server.error_message
-
-    asyncio.get_event_loop().run_until_complete(run())
+    ok = await server.ensure_model_on_slot("main", "test-model-q4")
+    assert ok is False
+    assert server.slots["main"].healthy is False
 
 
-def test_ensure_model_drains_queue_on_failure(test_config):
+@pytest.mark.asyncio
+async def test_ensure_model_on_slot_drains_queue_on_failure(test_config):
     from manager.app import ServerState
     server = ServerState(test_config)
-    server.swapper.swap_to = AsyncMock(return_value=False)
+    server.slots["main"].swapper.swap_to = AsyncMock(return_value=False)
 
-    async def run():
-        event1 = asyncio.Event()
-        event2 = asyncio.Event()
-        item1 = {"body": {}, "event": event1, "response": None, "error": None}
-        item2 = {"body": {}, "event": event2, "response": None, "error": None}
-        await server.queue.enqueue(item1)
-        await server.queue.enqueue(item2)
-        await server.ensure_model("test-model-q4")
-        assert server.queue.depth == 0
-
-    asyncio.get_event_loop().run_until_complete(run())
+    event1 = asyncio.Event()
+    event2 = asyncio.Event()
+    item1 = {"body": {}, "event": event1, "response": None, "error": None}
+    item2 = {"body": {}, "event": event2, "response": None, "error": None}
+    await server.slots["main"].queue.enqueue(item1)
+    await server.slots["main"].queue.enqueue(item2)
+    await server.ensure_model_on_slot("main", "test-model-q4")
+    assert server.slots["main"].queue.depth == 0
 
 
-def test_ensure_model_skips_swap_if_already_loaded(test_config):
+@pytest.mark.asyncio
+async def test_ensure_model_on_slot_skips_swap_if_already_loaded(test_config):
     from manager.app import ServerState
     server = ServerState(test_config)
-    server.state = "ready"
-    server.current_model = "test-model-q4"
-    server.swapper.swap_to = AsyncMock(return_value=True)
+    server.slots["main"].healthy = True
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].swapper.swap_to = AsyncMock(return_value=True)
 
-    async def run():
-        result = await server.ensure_model("test-model-q4")
-        assert result is True
-        server.swapper.swap_to.assert_not_called()
-
-    asyncio.get_event_loop().run_until_complete(run())
+    result = await server.ensure_model_on_slot("main", "test-model-q4")
+    assert result is True
+    server.slots["main"].swapper.swap_to.assert_not_called()

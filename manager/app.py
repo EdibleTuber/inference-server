@@ -50,21 +50,38 @@ class ServerState:
 
     def __init__(self, config: ManagerConfig):
         self._config = config
-        self.state: str = "loading"           # loading | ready | swapping | error
-        self.current_model: str | None = None  # name (without .gguf)
-        self.loading_model: str | None = None  # name being swapped to
         self.error_message: str | None = None
 
-        self.queue = RequestQueue(max_size=config.queue_limit)
-        self.swapper = ModelSwapper(config)
-        self.swap_lock = asyncio.Lock()
-        self.queue_event = asyncio.Event()
+        # Build slots dict.
+        from manager.slots import SlotState
+        self.slots: dict[str, SlotState] = {
+            "main": SlotState(
+                name="main",
+                host=config.llama_server_host,
+                port=config.llama_server_port,
+                env_file=config.llama_server_env,
+                systemd_unit="llama-server.service",
+                queue=RequestQueue(max_size=config.queue_limit),
+            ),
+            "batch": SlotState(
+                name="batch",
+                host=config.batch_server_host,
+                port=config.batch_server_port,
+                env_file=config.batch_server_env,
+                systemd_unit=config.batch_server_unit,
+                queue=RequestQueue(max_size=config.batch_queue_limit),
+            ),
+        }
 
-        # Collection retrieval
+        # One swapper per slot. Attach dynamically to avoid circular import
+        # (SlotState does not reference ModelSwapper).
+        self.slots["main"].swapper = ModelSwapper(config, slot=self.slots["main"])
+        self.slots["batch"].swapper = ModelSwapper(config, slot=self.slots["batch"])
+
+        # Collection retrieval (unchanged).
         self.db: VectorDB | None = None
         self.embeddings_client: EmbeddingsClient | None = None
 
-        # Reindex jobs
         from manager.reindex_jobs import ReindexRegistry
         self.reindex_registry = ReindexRegistry()
 
@@ -73,17 +90,12 @@ class ServerState:
     # ------------------------------------------------------------------
 
     def model_path(self, model_name: str) -> str | None:
-        """Resolve a model name to its full GGUF path.
-
-        Accepts names with or without the .gguf suffix.
-        Returns None if the file does not exist in models_dir.
-        """
+        """Resolve a model name to its file path in MODELS_DIR."""
         name = model_name if model_name.endswith(".gguf") else f"{model_name}.gguf"
         path = Path(self._config.models_dir) / name
         return str(path) if path.exists() else None
 
     def list_models(self) -> list[str]:
-        """Return sorted list of model names (without .gguf) in models_dir."""
         models_dir = Path(self._config.models_dir)
         if not models_dir.exists():
             return []
@@ -93,57 +105,47 @@ class ServerState:
     # Model swap
     # ------------------------------------------------------------------
 
-    async def ensure_model(self, model_name: str) -> bool:
-        """Ensure *model_name* is loaded in llama-server.
+    async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
+        """Ensure model_name is loaded on the named slot.
 
-        Skips the swap if the requested model is already loaded.
-        On failure: transitions to error state, drains the queue,
-        notifies all waiting clients with an error, and returns False.
+        Holds the slot's swap_lock for the duration. On failure, drains
+        the slot's queue with an error.
         """
-        async with self.swap_lock:
-            # Fast path — already loaded.
-            if self.state == "ready" and self.current_model == model_name:
+        slot = self.slots[slot_name]
+        async with slot.swap_lock:
+            if slot.healthy and slot.loaded_model == model_name:
                 return True
 
             path = self.model_path(model_name)
             if path is None:
-                self.state = "error"
-                self.error_message = f"Model file not found: {model_name}"
-                self.current_model = None
-                self._drain_queue_with_error(self.error_message)
+                msg = f"Model file not found: {model_name}"
+                slot.mark_unhealthy()
+                self._drain_slot_queue_with_error(slot_name, msg)
                 return False
 
-            logger.info("Swapping to model: %s", model_name)
-            self.state = "swapping"
-            self.loading_model = model_name
-            self.error_message = None
-
-            success = await self.swapper.swap_to(path)
-
+            logger.info("slot=%s swapping to %s", slot_name, model_name)
+            success = await slot.swapper.swap_to(path)
             if success:
-                self.state = "ready"
-                self.current_model = model_name
-                self.loading_model = None
-                logger.info("Model ready: %s", model_name)
+                slot.mark_swapped(model_name)
                 return True
-            else:
-                msg = f"Model swap timed out: {model_name}"
-                self.state = "error"
-                self.current_model = None
-                self.loading_model = None
-                self.error_message = msg
-                logger.error(msg)
-                self._drain_queue_with_error(msg)
-                return False
 
-    def _drain_queue_with_error(self, message: str) -> None:
-        """Drain all queued items and signal them with an error."""
-        items = self.queue.drain()
+            msg = f"Model swap timed out on slot {slot_name}: {model_name}"
+            slot.mark_unhealthy()
+            self._drain_slot_queue_with_error(slot_name, msg)
+            return False
+
+    def _drain_slot_queue_with_error(self, slot_name: str, message: str) -> None:
+        """Drain the given slot's queue, signaling each item with an error."""
+        slot = self.slots[slot_name]
+        items = slot.queue.drain()
         for item in items:
             item["error"] = message
             item["event"].set()
         if items:
-            logger.warning("Drained %d queued requests with error: %s", len(items), message)
+            logger.warning(
+                "slot=%s drained %d queued requests with error: %s",
+                slot_name, len(items), message,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -177,68 +179,56 @@ def _setup_logging(config: ManagerConfig) -> None:
 # Background queue consumer
 # ---------------------------------------------------------------------------
 
-async def _queue_consumer(server: ServerState, config: ManagerConfig) -> None:
-    """Background task: process queued inference requests one at a time.
+async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_name: str) -> None:
+    """Background task: process one slot's queue serially.
 
-    Waits on queue_event, then drains and processes items serially.
-    Streaming responses yield chunks in real-time via an async generator.
+    Waits on the slot's queue_event, dispatches items one-by-one through
+    ensure_model_on_slot + proxy to the slot's backend URL.
     """
-    llama_url = f"{config.llama_server_url}/v1/chat/completions"
+    slot = server.slots[slot_name]
+    backend_url = f"{slot.url}/v1/chat/completions"
 
     while True:
-        # Wait until something is enqueued.
-        await server.queue_event.wait()
-        server.queue_event.clear()
+        await slot.queue_event.wait()
+        slot.queue_event.clear()
 
-        while not server.queue.empty():
-            item = await server.queue.dequeue()
+        while not slot.queue.empty():
+            item = await slot.queue.dequeue()
             body: dict = item["body"]
             event: asyncio.Event = item["event"]
             model_name: str = body.get("model", "")
 
-            # Ensure the right model is loaded.
-            ok = await server.ensure_model(model_name)
+            ok = await server.ensure_model_on_slot(slot_name, model_name)
             if not ok:
-                # ensure_model already set item["error"] and signalled if it
-                # drained. But if this specific item was dequeued before the
-                # drain, handle it here.
                 if item["error"] is None:
-                    item["error"] = server.error_message or "Model swap failed"
+                    item["error"] = f"Model swap failed on slot {slot_name}"
                     event.set()
                 continue
 
             is_streaming = body.get("stream", False)
-
             try:
                 if is_streaming:
-                    # Build the streaming response now; the generator will be
-                    # consumed by FastAPI when the response is sent.
-                    async def _stream_gen(request_body=body):
+                    async def _stream_gen(request_body=body, url=backend_url):
                         async with httpx.AsyncClient() as client:
                             async with client.stream(
-                                "POST",
-                                llama_url,
-                                json=request_body,
-                                timeout=None,
+                                "POST", url, json=request_body, timeout=None,
                             ) as resp:
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
-
                     item["response"] = StreamingResponse(
                         _stream_gen(),
                         media_type="text/event-stream",
                     )
                 else:
                     async with httpx.AsyncClient() as client:
-                        resp = await client.post(llama_url, json=body, timeout=120)
+                        resp = await client.post(backend_url, json=body, timeout=120)
                     item["response"] = Response(
                         content=resp.content,
                         status_code=resp.status_code,
                         media_type=resp.headers.get("content-type", "application/json"),
                     )
-
             except Exception as exc:
-                logger.exception("Error proxying request: %s", exc)
+                logger.exception("slot=%s proxy error: %s", slot_name, exc)
                 item["error"] = f"Proxy error: {exc}"
 
             event.set()
@@ -270,23 +260,26 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Check whether llama-server is already running.
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{config.llama_server_url}/health", timeout=3
-                )
-            if resp.status_code == 200:
-                logger.info("llama-server is already running")
-                server.state = "ready"
-        except Exception:
-            logger.info("llama-server not yet reachable at startup")
+        # Probe each slot to see if it's already running.
+        async with httpx.AsyncClient() as probe_client:
+            for name, slot in server.slots.items():
+                await slot.probe(probe_client)
+                if slot.healthy:
+                    logger.info(
+                        "slot=%s ready with model %s",
+                        name, slot.loaded_model,
+                    )
+                else:
+                    logger.info("slot=%s not reachable at startup", name)
 
-        # Start background queue consumer.
-        consumer_task = asyncio.create_task(
-            _queue_consumer(server, config),
-            name="queue_consumer",
-        )
+        # Start one background queue consumer per slot.
+        consumer_tasks = [
+            asyncio.create_task(
+                _queue_consumer(server, config, slot_name=name),
+                name=f"queue_consumer_{name}",
+            )
+            for name in server.slots
+        ]
 
         # Initialize collection retrieval if configured.
         if config.skills_db_path:
@@ -308,11 +301,13 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         if server.db:
             server.db.close()
 
-        consumer_task.cancel()
-        try:
-            await consumer_task
-        except asyncio.CancelledError:
-            pass
+        for task in consumer_tasks:
+            task.cancel()
+        for task in consumer_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     # ------------------------------------------------------------------
     # App
@@ -336,12 +331,10 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     async def status():
         gpu = get_gpu_info()
         return {
-            "state": server.state,
-            "current_model": server.current_model,
-            "loading_model": server.loading_model,
-            "error_message": server.error_message,
-            "queue_depth": server.queue.depth,
-            "queue_limit": server.queue.max_size,
+            "slots": {
+                name: slot.to_status_dict()
+                for name, slot in server.slots.items()
+            },
             "gpu": gpu,
             "uptime_seconds": int(time.time() - _start_time),
         }
@@ -399,12 +392,13 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=404,
             )
 
-        # Check queue capacity.
         event = asyncio.Event()
         item: dict = {"body": body, "event": event, "response": None, "error": None}
 
+        slot_name = "main"  # Task 12 replaces this with resolve_slot(...)
+        slot = server.slots[slot_name]
         try:
-            await server.queue.enqueue(item)
+            await slot.queue.enqueue(item)
         except RequestQueue.QueueFullError:
             return JSONResponse(
                 {"error": {"message": "Server busy", "type": "server_error"}},
@@ -412,8 +406,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 headers={"Retry-After": "5"},
             )
 
-        # Signal the consumer and wait for the result.
-        server.queue_event.set()
+        slot.queue_event.set()
         await event.wait()
 
         if item["error"]:
@@ -422,7 +415,6 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=503,
                 headers={"Retry-After": "5"},
             )
-
         return item["response"]
 
     # ------------------------------------------------------------------

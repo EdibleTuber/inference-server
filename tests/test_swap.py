@@ -12,8 +12,36 @@ from manager.swap import ModelSwapper
 
 
 @pytest.fixture
-def swapper(test_config):
-    return ModelSwapper(test_config)
+def batch_slot(tmp_path, tmp_batch_env_file):
+    from manager.slots import SlotState
+    from manager.queue import RequestQueue
+    return SlotState(
+        name="batch",
+        host="127.0.0.1",
+        port=8083,
+        env_file=tmp_batch_env_file,
+        systemd_unit="llama-server-batch.service",
+        queue=RequestQueue(max_size=20),
+    )
+
+
+@pytest.fixture
+def main_slot(tmp_env_file):
+    from manager.slots import SlotState
+    from manager.queue import RequestQueue
+    return SlotState(
+        name="main",
+        host="127.0.0.1",
+        port=8081,
+        env_file=tmp_env_file,
+        systemd_unit="llama-server.service",
+        queue=RequestQueue(max_size=50),
+    )
+
+
+@pytest.fixture
+def swapper(test_config, main_slot):
+    return ModelSwapper(test_config, slot=main_slot)
 
 
 def test_update_env_file(swapper, tmp_env_file):
@@ -144,3 +172,53 @@ async def test_swap_to_fails_on_health_timeout(swapper):
         result = await swapper.swap_to("/opt/llama/models/test.gguf")
 
     assert result is False
+
+
+def test_swapper_for_main_writes_main_env(test_config, main_slot):
+    from manager.swap import ModelSwapper
+    swapper = ModelSwapper(test_config, slot=main_slot)
+    swapper.update_env_file("/opt/llama/models/new.gguf")
+    content = Path(main_slot.env_file).read_text()
+    assert "MODEL_PATH=/opt/llama/models/new.gguf" in content
+
+
+def test_swapper_for_batch_writes_batch_env(test_config, batch_slot):
+    from manager.swap import ModelSwapper
+    swapper = ModelSwapper(test_config, slot=batch_slot)
+    swapper.update_env_file("/opt/llama/models/other.gguf")
+    content = Path(batch_slot.env_file).read_text()
+    assert "MODEL_PATH=/opt/llama/models/other.gguf" in content
+
+
+@pytest.mark.asyncio
+async def test_swapper_restart_targets_correct_unit(test_config, batch_slot):
+    from manager.swap import ModelSwapper
+    swapper = ModelSwapper(test_config, slot=batch_slot)
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+
+    async def fake_executor(executor, fn):
+        return fn()
+
+    with patch("subprocess.run", return_value=mock_result) as mock_run, \
+         patch.object(asyncio.get_event_loop(), "run_in_executor", side_effect=fake_executor):
+        await swapper.restart_llama_server()
+
+    mock_run.assert_called_once()
+    cmd = mock_run.call_args[0][0]
+    assert cmd == ["sudo", "systemctl", "restart", "llama-server-batch.service"]
+
+
+@pytest.mark.asyncio
+async def test_swapper_health_polls_slot_url(test_config, batch_slot):
+    """wait_for_health targets the slot's URL, not the hardcoded main URL."""
+    from manager.swap import ModelSwapper
+    swapper = ModelSwapper(test_config, slot=batch_slot)
+    mock_response = MagicMock(status_code=200)
+    with patch("httpx.AsyncClient") as MockClient:
+        instance = MockClient.return_value.__aenter__.return_value
+        instance.get = AsyncMock(return_value=mock_response)
+        ok = await swapper.wait_for_health()
+    assert ok is True
+    call_url = instance.get.call_args[0][0]
+    assert call_url == "http://127.0.0.1:8083/health"

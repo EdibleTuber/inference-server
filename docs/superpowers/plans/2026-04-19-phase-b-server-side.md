@@ -723,6 +723,23 @@ async def test_probe_success():
 
 
 @pytest.mark.asyncio
+async def test_probe_strips_gguf_suffix():
+    """llama-server returns the GGUF filename with suffix; probe strips .gguf
+    so loaded_model matches what the manager's /v1/models and PAL both use."""
+    slot = _make_slot()
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {
+        "data": [{"id": "gemma-4-E4B-it-Q4_K_M.gguf", "object": "model"}],
+    }
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)
+    assert slot.loaded_model == "gemma-4-E4B-it-Q4_K_M"
+    assert slot.healthy is True
+
+
+@pytest.mark.asyncio
 async def test_probe_empty_data_unhealthy():
     """Probe succeeds but /v1/models returns empty list -> not healthy, no model."""
     slot = _make_slot()
@@ -876,7 +893,13 @@ class SlotState:
             self.healthy = False
             return
 
-        self.loaded_model = entries[0].get("id")
+        raw_id = entries[0].get("id") or ""
+        # Normalize: llama-server sometimes returns the GGUF filename
+        # (with .gguf suffix); the manager's own /v1/models and PAL both
+        # use the stem. Keep loaded_model in the stem form.
+        if raw_id.endswith(".gguf"):
+            raw_id = raw_id[: -len(".gguf")]
+        self.loaded_model = raw_id or None
         self.healthy = bool(self.loaded_model)
 
     async def reconcile_on_error(self, client) -> None:
@@ -2215,6 +2238,7 @@ Update `/home/edible/Projects/PAL/docs/superpowers/runbooks/2026-04-19-phase-b-p
 - **Models dir on this server:** `/mnt/secondary/llama-models/` (MODELS_DIR env override of the default `/opt/llama/models`).
 - **Shader cache:** `_llama` has no `$HOME`, so llama-server logs "Failed to create /home/_llama for shader cache — disabling." Fixed by `Environment=XDG_CACHE_HOME=/var/cache/llama` in the batch systemd unit + `sudo install -d -o _llama -g _llama /var/cache/llama`.
 - **Gemma 4 E4B GGUF sha256:** `dff0ffba4c90b4082d70214d53ce9504a28d4d8d998276dcb3b8881a656c742a` (at `/mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf`).
+- **Backend `/v1/models` returns the GGUF filename with `.gguf` suffix** (observed: `gemma-4-E4B-it-Q4_K_M.gguf`). The manager's own `/v1/models` already strips this (uses `Path.stem`), and PAL sends the stem. `SlotState.probe` therefore strips `.gguf` from the backend response before storing `loaded_model`, so routing comparisons match.
 - **Vulkan device discovery required adding the current user (and `_llama`) to the `render` group.** Without it, RADV silently enumerates zero devices because `/dev/dri/renderD*` is render-group-owned; NVIDIA's ICD still worked because it uses `/dev/nvidia*`.
 
 ### PAL-side followups (after Phase B server ships)

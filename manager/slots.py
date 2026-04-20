@@ -51,7 +51,10 @@ class SlotState:
 
         Never raises. On any failure (connection, timeout, non-200,
         unexpected JSON shape), sets healthy=False and leaves loaded_model
-        as whatever it was (the caller may want to null it via mark_unhealthy).
+        as whatever it was — the last-known loaded model is still useful
+        for status reporting until a successful probe or swap updates it.
+        The empty-data branch is the exception: it nulls loaded_model
+        because the backend actively told us nothing is loaded.
         """
         try:
             resp = await client.get(f"{self.url}/v1/models", timeout=3)

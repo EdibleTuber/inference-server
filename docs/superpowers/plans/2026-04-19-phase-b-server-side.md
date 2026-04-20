@@ -2214,6 +2214,7 @@ Update `/home/edible/Projects/PAL/docs/superpowers/runbooks/2026-04-19-phase-b-p
 - **Model substitution:** spec called for Gemma 3 4B IT; bartowski URL 404'd. Substituted Gemma 4 E4B IT Q4_K_M from `unsloth/gemma-4-E4B-it-GGUF`. Same size class, newer family. Model ID when loaded: `gemma-4-E4B-it-Q4_K_M`.
 - **Models dir on this server:** `/mnt/secondary/llama-models/` (MODELS_DIR env override of the default `/opt/llama/models`).
 - **Shader cache:** `_llama` has no `$HOME`, so llama-server logs "Failed to create /home/_llama for shader cache — disabling." Fixed by `Environment=XDG_CACHE_HOME=/var/cache/llama` in the batch systemd unit + `sudo install -d -o _llama -g _llama /var/cache/llama`.
+- **Gemma 4 E4B GGUF sha256:** `dff0ffba4c90b4082d70214d53ce9504a28d4d8d998276dcb3b8881a656c742a` (at `/mnt/secondary/llama-models/gemma-4-E4B-it-Q4_K_M.gguf`).
 - **Vulkan device discovery required adding the current user (and `_llama`) to the `render` group.** Without it, RADV silently enumerates zero devices because `/dev/dri/renderD*` is render-group-owned; NVIDIA's ICD still worked because it uses `/dev/nvidia*`.
 
 ### PAL-side followups (after Phase B server ships)

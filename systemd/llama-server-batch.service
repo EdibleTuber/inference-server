@@ -1,0 +1,64 @@
+# systemd/llama-server-batch.service
+#
+# Systemd unit for the Vulkan/iGPU batch inference backend.
+#
+# Parallel to llama-server.service but uses the AMD Vega iGPU via the
+# Vulkan backend rather than the Tesla P40 via CUDA. Used for latency-
+# tolerant background workloads routed via the llama-manager's batch slot.
+#
+# Prerequisites (host):
+#   - /opt/llama/bin/llama-server built with GGML_VULKAN=ON
+#   - _llama user in 'video' and 'render' groups (for /dev/dri access)
+#   - Shader cache dir owned by _llama:
+#       sudo install -d -o _llama -g _llama -m 0755 /var/cache/llama
+#
+# Install:
+#   sudo cp systemd/llama-server-batch.service /etc/systemd/system/
+#   sudo cp config/llama-server-batch.env /etc/llama/llama-server-batch.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now llama-server-batch
+
+[Unit]
+Description=llama.cpp Batch Inference Server (Vulkan iGPU)
+Documentation=https://github.com/ggerganov/llama.cpp
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Reuses the same unprivileged user as the main llama-server.
+# _llama must be in 'video' and 'render' groups for /dev/dri access.
+User=_llama
+Group=_llama
+
+EnvironmentFile=/etc/llama/llama-server-batch.env
+
+# Writable shader cache dir (_llama has no $HOME).
+# Without this, llama-server logs "Failed to create /home/_llama for shader
+# cache" and disables the cache, forcing shader recompile on every restart.
+Environment=XDG_CACHE_HOME=/var/cache/llama
+
+# Vulkan device selection via --device flag.
+# No --n-gpu-layers: Vulkan backend manages layer placement.
+ExecStart=/opt/llama/bin/llama-server \
+    --host ${HOST} \
+    --port ${PORT} \
+    --model ${MODEL_PATH} \
+    --device ${DEVICE} \
+    --ctx-size ${CTX_SIZE}
+
+# Bound the iGPU's shared-RAM footprint so it cannot starve the host
+# under pressure. Gemma 4 E4B Q4 + CTX 16k KV cache fits in ~3 GB;
+# 6 GB gives headroom.
+MemoryMax=6G
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=append:/var/log/llama/llama-server-batch.log
+StandardError=append:/var/log/llama/llama-server-batch.err
+
+[Install]
+WantedBy=multi-user.target

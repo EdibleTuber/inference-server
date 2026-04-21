@@ -149,3 +149,101 @@ async def test_ensure_model_on_slot_skips_swap_if_already_loaded(test_config):
     result = await server.ensure_model_on_slot("main", "test-model-q4")
     assert result is True
     server.slots["main"].swapper.swap_to.assert_not_called()
+
+
+def test_chat_completions_routes_batch_model(client):
+    """When the batch slot has model X loaded, a request for X enqueues on batch, not main."""
+    app = client.app
+    server = app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = "test-model-q8"
+    server.slots["batch"].healthy = True
+
+    enqueued_on = []
+    original_enqueue_main = server.slots["main"].queue.enqueue
+    original_enqueue_batch = server.slots["batch"].queue.enqueue
+
+    async def wrap_main(item):
+        enqueued_on.append("main")
+        from fastapi.responses import Response
+        item["response"] = Response(content=b'{"id":"m"}', media_type="application/json")
+        item["event"].set()
+
+    async def wrap_batch(item):
+        enqueued_on.append("batch")
+        from fastapi.responses import Response
+        item["response"] = Response(content=b'{"id":"b"}', media_type="application/json")
+        item["event"].set()
+
+    server.slots["main"].queue.enqueue = wrap_main
+    server.slots["batch"].queue.enqueue = wrap_batch
+
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "test-model-q8",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    finally:
+        server.slots["main"].queue.enqueue = original_enqueue_main
+        server.slots["batch"].queue.enqueue = original_enqueue_batch
+
+    assert enqueued_on == ["batch"]
+
+
+def test_chat_completions_routes_main_for_unknown(client):
+    """Model loaded on main routes to main (implicit main-swap path preserved)."""
+    app = client.app
+    server = app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = "test-model-q8"
+    server.slots["batch"].healthy = True
+
+    enqueued_on = []
+    original_enqueue_main = server.slots["main"].queue.enqueue
+    original_enqueue_batch = server.slots["batch"].queue.enqueue
+
+    async def wrap_main(item):
+        enqueued_on.append("main")
+        from fastapi.responses import Response
+        item["response"] = Response(content=b'{}', media_type="application/json")
+        item["event"].set()
+
+    async def wrap_batch(item):
+        enqueued_on.append("batch")
+        from fastapi.responses import Response
+        item["response"] = Response(content=b'{}', media_type="application/json")
+        item["event"].set()
+
+    server.slots["main"].queue.enqueue = wrap_main
+    server.slots["batch"].queue.enqueue = wrap_batch
+
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "test-model-q4",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    finally:
+        server.slots["main"].queue.enqueue = original_enqueue_main
+        server.slots["batch"].queue.enqueue = original_enqueue_batch
+
+    assert enqueued_on == ["main"]
+
+
+def test_chat_completions_503_on_batch_unhealthy(client):
+    """Request for a model loaded on batch returns 503 if batch unhealthy."""
+    app = client.app
+    server = app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = "test-model-q8"
+    server.slots["batch"].healthy = False  # unhealthy
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "test-model-q8",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 503
+    body = r.json()
+    assert body["error"]["type"] == "batch_unavailable"

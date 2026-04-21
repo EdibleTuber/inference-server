@@ -37,6 +37,7 @@ from manager.slots import SlotState
 from manager.swap import ModelSwapper
 from manager.vectordb import VectorDB
 from manager.collections import index_all_collections, index_collection, get_children
+from manager.routing import resolve_slot
 
 logger = logging.getLogger(__name__)
 
@@ -395,8 +396,21 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         event = asyncio.Event()
         item: dict = {"body": body, "event": event, "response": None, "error": None}
 
-        slot_name = "main"  # Task 12 replaces this with resolve_slot(...)
+        slot_name = resolve_slot(model_name, server.slots)
         slot = server.slots[slot_name]
+
+        if not slot.healthy and slot.loaded_model == model_name:
+            # Model IS loaded on this slot but the slot is unhealthy.
+            # 503 with a typed error the PAL client recognizes.
+            return JSONResponse(
+                {"error": {
+                    "type": f"{slot_name}_unavailable",
+                    "message": f"{slot_name} slot not ready",
+                }},
+                status_code=503,
+                headers={"Retry-After": "5"},
+            )
+
         try:
             await slot.queue.enqueue(item)
         except RequestQueue.QueueFullError:

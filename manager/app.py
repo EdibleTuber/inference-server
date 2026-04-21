@@ -32,6 +32,8 @@ from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
 from manager.gpu import get_gpu_info
 from manager.queue import RequestQueue
+from manager.reindex_jobs import ReindexRegistry
+from manager.slots import SlotState
 from manager.swap import ModelSwapper
 from manager.vectordb import VectorDB
 from manager.collections import index_all_collections, index_collection, get_children
@@ -50,17 +52,15 @@ class ServerState:
 
     def __init__(self, config: ManagerConfig):
         self._config = config
-        self.error_message: str | None = None
 
         # Build slots dict.
-        from manager.slots import SlotState
         self.slots: dict[str, SlotState] = {
             "main": SlotState(
                 name="main",
                 host=config.llama_server_host,
                 port=config.llama_server_port,
                 env_file=config.llama_server_env,
-                systemd_unit="llama-server.service",
+                systemd_unit=config.llama_server_unit,
                 queue=RequestQueue(max_size=config.queue_limit),
             ),
             "batch": SlotState(
@@ -82,7 +82,6 @@ class ServerState:
         self.db: VectorDB | None = None
         self.embeddings_client: EmbeddingsClient | None = None
 
-        from manager.reindex_jobs import ReindexRegistry
         self.reindex_registry = ReindexRegistry()
 
     # ------------------------------------------------------------------
@@ -314,6 +313,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     # ------------------------------------------------------------------
 
     app = FastAPI(title="llama-mgr", lifespan=lifespan)
+    app.state.server = server
 
     # ------------------------------------------------------------------
     # GET /health

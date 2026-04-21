@@ -35,6 +35,7 @@ class ManagerConfig:
         llama_server_port: Port where llama-server listens.
         models_dir: Path to directory containing GGUF model files.
         llama_server_env: Path to llama-server's env file (updated during model swaps).
+        llama_server_unit: systemd unit name for the main llama-server.
         queue_limit: Max number of requests to hold in the FIFO queue.
         swap_timeout: Seconds to wait for llama-server health after a model swap.
         log_file: Path to the manager's log file.
@@ -55,6 +56,7 @@ class ManagerConfig:
     llama_server_port: int
     models_dir: str
     llama_server_env: str
+    llama_server_unit: str
     queue_limit: int
     swap_timeout: int
     log_file: str
@@ -94,6 +96,7 @@ class ManagerConfig:
             llama_server_port=_int_env("LLAMA_SERVER_PORT", 8081),
             models_dir=os.getenv("MODELS_DIR", "/opt/llama/models"),
             llama_server_env=os.getenv("LLAMA_SERVER_ENV", "/etc/llama/llama-server.env"),
+            llama_server_unit=os.getenv("LLAMA_SERVER_UNIT", "llama-server.service"),
             queue_limit=_int_env("QUEUE_LIMIT", 20),
             swap_timeout=_int_env("SWAP_TIMEOUT", 120),
             log_file=os.getenv("LOG_FILE", "/var/log/llama/manager.log"),

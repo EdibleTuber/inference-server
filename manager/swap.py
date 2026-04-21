@@ -46,7 +46,7 @@ class ModelSwapper:
         unit = self._slot.systemd_unit
         logger.info("slot=%s restarting %s", self._slot.name, unit)
 
-        result = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: subprocess.run(
                 ["sudo", "systemctl", "restart", unit],

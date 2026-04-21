@@ -93,6 +93,13 @@ def test_config_embeddings_url(monkeypatch):
     assert config.embeddings_url == "http://127.0.0.1:8082"
 
 
+def test_from_env_llama_server_unit_default(monkeypatch):
+    monkeypatch.delenv("LLAMA_SERVER_UNIT", raising=False)
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert cfg.llama_server_unit == "llama-server.service"
+
+
 def test_from_env_batch_defaults(monkeypatch):
     """Batch-slot fields have sensible defaults when env vars are absent."""
     for var in ("BATCH_SERVER_HOST", "BATCH_SERVER_PORT", "BATCH_SERVER_ENV",
@@ -130,6 +137,7 @@ def test_batch_server_url_property():
         host="0.0.0.0", port=11434,
         llama_server_host="127.0.0.1", llama_server_port=8081,
         models_dir="/tmp", llama_server_env="/tmp/env",
+        llama_server_unit="llama-server.service",
         queue_limit=50, swap_timeout=60, log_file="/dev/null",
         embeddings_host="127.0.0.1", embeddings_port=8082,
         collections_config="/dev/null", skills_db_path="",

@@ -618,6 +618,57 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         return job.to_dict()
 
     # ------------------------------------------------------------------
+    # POST /swap
+    # ------------------------------------------------------------------
+
+    @app.post("/swap")
+    async def swap_slot(request: Request):
+        """Admin endpoint: swap a slot to a different model.
+
+        Body: {"model": str, "target": "main"|"batch" (optional, default main)}.
+        No auth; LAN-only is the trust boundary.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"error": {"type": "invalid_body", "message": "Invalid JSON"}},
+                status_code=400,
+            )
+
+        model_name = body.get("model")
+        if not model_name:
+            return JSONResponse(
+                {"error": {"type": "missing_model", "message": "'model' is required"}},
+                status_code=400,
+            )
+
+        target = body.get("target", "main")
+        if target not in ("main", "batch"):
+            return JSONResponse(
+                {"error": {"type": "invalid_target",
+                           "message": "'target' must be 'main' or 'batch'"}},
+                status_code=400,
+            )
+
+        if server.model_path(model_name) is None:
+            return JSONResponse(
+                {"error": {"type": "model_not_found",
+                           "message": f"Model file not found: {model_name}"}},
+                status_code=404,
+            )
+
+        ok = await server.ensure_model_on_slot(target, model_name)
+        if not ok:
+            return JSONResponse(
+                {"error": {"type": "swap_failed",
+                           "message": f"swap to {model_name} on {target} failed"}},
+                status_code=503,
+            )
+
+        return {"slot": target, "model": model_name, "status": "ok"}
+
+    # ------------------------------------------------------------------
     # GET /collections/{collection_id}/reindex/{job_id}
     # ------------------------------------------------------------------
 

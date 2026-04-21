@@ -247,3 +247,67 @@ def test_chat_completions_503_on_batch_unhealthy(client):
     assert r.status_code == 503
     body = r.json()
     assert body["error"]["type"] == "batch_unavailable"
+
+
+def test_swap_valid_main(client, monkeypatch):
+    app = client.app
+    server = app.state.server
+    # Short-circuit the actual swap; ensure_model_on_slot calls mark_swapped on success.
+    async def fake_swap(self, model):
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"slot": "main", "model": "test-model-q4", "status": "ok"}
+    assert server.slots["main"].loaded_model == "test-model-q4"
+
+
+def test_swap_valid_batch(client, monkeypatch):
+    app = client.app
+    server = app.state.server
+    async def fake_swap(self, model):
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    r = client.post("/swap", json={"model": "test-model-q8", "target": "batch"})
+    assert r.status_code == 200
+    assert r.json()["slot"] == "batch"
+    assert server.slots["batch"].loaded_model == "test-model-q8"
+
+
+def test_swap_default_target_is_main(client, monkeypatch):
+    async def fake_swap(self, model):
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    r = client.post("/swap", json={"model": "test-model-q4"})
+    assert r.status_code == 200
+    assert r.json()["slot"] == "main"
+
+
+def test_swap_invalid_target(client):
+    r = client.post("/swap", json={"model": "test-model-q4", "target": "xxx"})
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_target"
+
+
+def test_swap_missing_model(client):
+    r = client.post("/swap", json={"target": "main"})
+    assert r.status_code == 400
+
+
+def test_swap_nonexistent_model_file(client):
+    r = client.post("/swap", json={"model": "does-not-exist", "target": "main"})
+    assert r.status_code == 404
+
+
+def test_swap_fails_returns_503(client, monkeypatch):
+    async def fake_swap(self, model):
+        return False  # health timeout
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
+    assert r.status_code == 503
+    assert r.json()["error"]["type"] == "swap_failed"

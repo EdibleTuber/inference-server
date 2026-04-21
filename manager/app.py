@@ -421,6 +421,12 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         if not slot.healthy and slot.loaded_model == model_name:
             # Model IS loaded on this slot but the slot is unhealthy.
             # 503 with a typed error the PAL client recognizes.
+            #
+            # Narrow by design: only fires for the "loaded-but-sick" case.
+            # The "not-loaded-anywhere" path (resolve_slot returns 'main'
+            # with a different loaded_model) falls through to the queue
+            # so the main consumer's ensure_model_on_slot can trigger an
+            # implicit swap. That preserves pre-Phase-B behavior.
             return JSONResponse(
                 {"error": {
                     "type": f"{slot_name}_unavailable",

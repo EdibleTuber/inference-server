@@ -176,6 +176,18 @@ def _setup_logging(config: ManagerConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background queue consumer helpers
+# ---------------------------------------------------------------------------
+
+async def _reprobe_for(slot) -> None:
+    """Fire-and-forget re-probe used after a backend 5xx.
+    Called via asyncio.create_task so the consumer loop is not blocked.
+    """
+    async with httpx.AsyncClient() as probe_client:
+        await slot.reconcile_on_error(probe_client)
+
+
+# ---------------------------------------------------------------------------
 # Background queue consumer
 # ---------------------------------------------------------------------------
 
@@ -208,6 +220,8 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
             is_streaming = body.get("stream", False)
             try:
                 if is_streaming:
+                    # Note: streaming errors are out of scope for reconcile;
+                    # stream failures have too many non-health-related causes.
                     async def _stream_gen(request_body=body, url=backend_url):
                         async with httpx.AsyncClient() as client:
                             async with client.stream(
@@ -222,6 +236,9 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 else:
                     async with httpx.AsyncClient() as client:
                         resp = await client.post(backend_url, json=body, timeout=120)
+                    if resp.status_code >= 500:
+                        slot.mark_unhealthy()
+                        asyncio.create_task(_reprobe_for(slot))
                     item["response"] = Response(
                         content=resp.content,
                         status_code=resp.status_code,
@@ -230,6 +247,8 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
             except Exception as exc:
                 logger.exception("slot=%s proxy error: %s", slot_name, exc)
                 item["error"] = f"Proxy error: {exc}"
+                slot.mark_unhealthy()
+                asyncio.create_task(_reprobe_for(slot))
 
             event.set()
 

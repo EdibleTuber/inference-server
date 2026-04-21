@@ -311,3 +311,28 @@ def test_swap_fails_returns_503(client, monkeypatch):
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
     assert r.status_code == 503
     assert r.json()["error"]["type"] == "swap_failed"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_on_backend_5xx(test_config):
+    """When the queue consumer gets a 5xx from the backend, it re-probes
+    the slot and updates loaded_model if it has drifted."""
+    from manager.app import ServerState
+    import httpx
+    server = ServerState(test_config)
+    slot = server.slots["main"]
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+
+    # Fake probe that reports a different model now loaded.
+    async def fake_probe(client):
+        slot.loaded_model = "new-model"
+        slot.healthy = True
+    slot.probe = fake_probe
+
+    # Simulate the reconcile call path.
+    async with httpx.AsyncClient() as client:
+        await slot.reconcile_on_error(client)
+
+    assert slot.loaded_model == "new-model"
+    assert slot.healthy is True

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from manager.names import display_name
 from manager.queue import RequestQueue
 
 logger = logging.getLogger(__name__)
@@ -83,12 +84,9 @@ class SlotState:
             return
 
         raw_id = entries[0].get("id") or ""
-        # Normalize: llama-server sometimes returns the GGUF filename
-        # (with .gguf suffix); the manager's own /v1/models and PAL both
-        # use the stem. Keep loaded_model in the stem form.
-        if raw_id.endswith(".gguf"):
-            raw_id = raw_id[: -len(".gguf")]
-        self.loaded_model = raw_id or None
+        # Normalize to the clean display form (basename, no .gguf, original case).
+        # display_name also collapses a full path to its stem and "" -> None.
+        self.loaded_model = display_name(raw_id)
         self.healthy = bool(self.loaded_model)
 
     async def reconcile_on_error(self, client) -> None:

@@ -336,3 +336,30 @@ async def test_reconcile_on_backend_5xx(test_config):
 
     assert slot.loaded_model == "new-model"
     assert slot.healthy is True
+
+
+@pytest.mark.asyncio
+async def test_mark_swapped_stores_ondisk_stem_not_request_casing(test_config):
+    """A swap requested with odd casing/suffix is stored as the real on-disk stem."""
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    server.slots["main"].swapper.swap_to = AsyncMock(return_value=True)
+
+    ok = await server.ensure_model_on_slot("main", "TEST-MODEL-Q4.gguf")
+    assert ok is True
+    # tmp_models_dir has 'test-model-q4.gguf' (lowercase) -> canonical stem stored.
+    assert server.slots["main"].loaded_model == "test-model-q4"
+
+
+@pytest.mark.asyncio
+async def test_ensure_model_skips_swap_on_case_variant(test_config):
+    """Already-loaded model requested with different case must NOT re-swap."""
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    server.slots["main"].healthy = True
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].swapper.swap_to = AsyncMock(return_value=True)
+
+    result = await server.ensure_model_on_slot("main", "TEST-MODEL-Q4")
+    assert result is True
+    server.slots["main"].swapper.swap_to.assert_not_called()

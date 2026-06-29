@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
 from manager.gpu import get_gpu_info
+from manager.names import display_name, same_model
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
@@ -90,10 +91,23 @@ class ServerState:
     # ------------------------------------------------------------------
 
     def model_path(self, model_name: str) -> str | None:
-        """Resolve a model name to its file path in MODELS_DIR."""
-        name = model_name if model_name.endswith(".gguf") else f"{model_name}.gguf"
-        path = Path(self._config.models_dir) / name
-        return str(path) if path.exists() else None
+        """Resolve a model name to its real on-disk path in MODELS_DIR.
+
+        Case-insensitive: always returns the actual filesystem path so that
+        callers storing display_name(path) get the authoritative on-disk stem.
+        """
+        name = model_name if model_name.lower().endswith(".gguf") else f"{model_name}.gguf"
+        models_dir = Path(self._config.models_dir)
+        # Fast path: exact match.
+        exact = models_dir / name
+        if exact.exists():
+            return str(exact)
+        # Case-insensitive fallback: find the real on-disk filename.
+        name_lower = name.lower()
+        for p in models_dir.glob("*.gguf"):
+            if p.name.lower() == name_lower:
+                return str(p)
+        return None
 
     def list_models(self) -> list[str]:
         models_dir = Path(self._config.models_dir)
@@ -113,7 +127,7 @@ class ServerState:
         """
         slot = self.slots[slot_name]
         async with slot.swap_lock:
-            if slot.healthy and slot.loaded_model == model_name:
+            if slot.healthy and same_model(model_name, slot.loaded_model):
                 return True
 
             path = self.model_path(model_name)
@@ -126,7 +140,7 @@ class ServerState:
             logger.info("slot=%s swapping to %s", slot_name, model_name)
             success = await slot.swapper.swap_to(path)
             if success:
-                slot.mark_swapped(model_name)
+                slot.mark_swapped(display_name(path))   # store the real on-disk stem
                 return True
 
             msg = f"Model swap timed out on slot {slot_name}: {model_name}"

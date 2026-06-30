@@ -30,15 +30,22 @@ Group=_llama
 # Load runtime configuration
 EnvironmentFile=/etc/llama/llama-server.env
 
+# Unit-level default for DEVICE — overridden by any DEVICE= in the env file.
+# Keeps the Tesla P40 pinned even on a redeploy that skips the live env file
+# (setup.sh does not overwrite an existing env).
+Environment=DEVICE=CUDA0
+
 # Start llama-server with config from env file.
 # --host/--port: localhost only (manager handles external access)
 # --model: GGUF file path (updated by manager during swaps)
+# --device: explicit CUDA device selector (fail-loud; no silent iGPU fallback)
 # --n-gpu-layers: GPU offload (-1 = auto/all)
 # --ctx-size: context window in tokens
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
     --model ${MODEL_PATH} \
+    --device ${DEVICE} \
     --n-gpu-layers ${N_GPU_LAYERS} \
     --ctx-size ${CTX_SIZE}
 

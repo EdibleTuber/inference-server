@@ -7,6 +7,10 @@ One vocabulary, used everywhere a model name is stored or compared:
   - same_model:   the single comparison primitive (None-safe)
 
 Model filenames are assumed ASCII; casefold() is locale-independent.
+
+Correctness assumes llama-server reports the model by its file path/stem (no
+--alias), so probe() and a swap agree on the same physical file. If --alias is
+ever added it must equal the GGUF stem, or probe() must resolve it back.
 """
 from __future__ import annotations
 

@@ -438,3 +438,24 @@ def test_model_path_collision_is_deterministic_and_warns(test_config, caplog):
         resolved = server.model_path("DUP-MODEL")
     assert resolved.endswith("Dup-Model.gguf")
     assert any("collision" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# reprobe swap_lock gate (Task 5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reprobe_waits_for_swap_lock(test_config):
+    """A post-5xx reprobe must not run while a swap holds the slot lock."""
+    from manager.app import ServerState, _reprobe_for
+    server = ServerState(test_config)
+    slot = server.slots["main"]
+    slot.reconcile_on_error = AsyncMock()
+
+    await slot.swap_lock.acquire()          # simulate an in-flight swap
+    task = asyncio.create_task(_reprobe_for(slot))
+    await asyncio.sleep(0.01)
+    slot.reconcile_on_error.assert_not_called()   # blocked on the lock
+    slot.swap_lock.release()
+    await task
+    slot.reconcile_on_error.assert_awaited_once()  # ran after release

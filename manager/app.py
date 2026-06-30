@@ -204,10 +204,14 @@ def _setup_logging(config: ManagerConfig) -> None:
 
 async def _reprobe_for(slot) -> None:
     """Fire-and-forget re-probe used after a backend 5xx.
-    Called via asyncio.create_task so the consumer loop is not blocked.
+
+    Acquires the slot's swap_lock first, so the reprobe serializes AFTER any
+    in-flight/queued swap and can never clobber a fresh mark_swapped. Between
+    the two writers of loaded_model, the swap is authoritative.
     """
-    async with httpx.AsyncClient() as probe_client:
-        await slot.reconcile_on_error(probe_client)
+    async with slot.swap_lock:
+        async with httpx.AsyncClient() as probe_client:
+            await slot.reconcile_on_error(probe_client)
 
 
 # ---------------------------------------------------------------------------

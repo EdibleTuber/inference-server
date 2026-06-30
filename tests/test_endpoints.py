@@ -348,6 +348,22 @@ def test_swap_fails_returns_503(client, monkeypatch):
     assert r.json()["error"]["type"] == "swap_failed"
 
 
+def test_swap_echo_is_canonical(client, monkeypatch):
+    """A swap requested with odd casing/suffix echoes the canonical on-disk stem."""
+    app = client.app
+    server = app.state.server
+
+    async def fake_swap(self, model):
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    r = client.post("/swap", json={"model": "TEST-MODEL-Q4.gguf", "target": "main"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["model"] == "test-model-q4"                       # canonical
+    assert body["model"] == server.slots["main"].loaded_model     # agrees with /status
+
+
 @pytest.mark.asyncio
 async def test_reconcile_on_backend_5xx(test_config):
     """When the queue consumer gets a 5xx from the backend, it re-probes

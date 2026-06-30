@@ -721,7 +721,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=503,
             )
 
-        return {"slot": target, "model": model_name, "status": "ok"}
+        return {"slot": target, "model": server.slots[target].loaded_model, "status": "ok"}
 
     # ------------------------------------------------------------------
     # GET /collections/{collection_id}/reindex/{job_id}

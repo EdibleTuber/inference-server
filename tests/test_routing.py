@@ -26,9 +26,9 @@ def test_resolve_model_on_batch():
     assert resolve_slot("model-B", slots) == "batch"
 
 
-def test_resolve_model_on_neither_returns_main():
+def test_resolve_model_on_neither_returns_none():
     slots = {"main": _slot("main", "model-A"), "batch": _slot("batch", "model-B")}
-    assert resolve_slot("unknown-C", slots) == "main"
+    assert resolve_slot("unknown-C", slots) is None
 
 
 def test_resolve_model_on_both_prefers_main():
@@ -37,10 +37,22 @@ def test_resolve_model_on_both_prefers_main():
     assert resolve_slot("shared", slots) == "main"
 
 
-def test_resolve_empty_model_returns_main():
-    """Empty model string routes to main (implicit main swap preserved)."""
+def test_resolve_empty_model_returns_none():
     slots = {"main": _slot("main", None), "batch": _slot("batch", None)}
-    assert resolve_slot("", slots) == "main"
+    assert resolve_slot("", slots) is None
+
+
+def test_resolve_is_case_and_suffix_and_path_insensitive():
+    slots = {"main": _slot("main", "gemma-4-E4B-it-Q4_K_M"), "batch": _slot("batch", None)}
+    assert resolve_slot("gemma-4-e4b-it-q4_k_m", slots) == "main"
+    assert resolve_slot("GEMMA-4-E4B-IT-Q4_K_M.gguf", slots) == "main"
+    assert resolve_slot("/mnt/models/gemma-4-E4B-it-Q4_K_M.gguf", slots) == "main"
+
+
+def test_resolve_none_loaded_model_is_safe():
+    """A slot with loaded_model=None must not crash the comparison."""
+    slots = {"main": _slot("main", None), "batch": _slot("batch", None)}
+    assert resolve_slot("anything", slots) is None
 
 
 def test_resolve_main_unloaded_but_batch_loaded():

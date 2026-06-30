@@ -193,8 +193,8 @@ def test_chat_completions_routes_batch_model(client):
     assert enqueued_on == ["batch"]
 
 
-def test_chat_completions_routes_main_for_unknown(client):
-    """Model loaded on main routes to main (implicit main-swap path preserved)."""
+def test_chat_completions_routes_main_when_loaded_on_main(client):
+    """Model loaded on main routes to main."""
     app = client.app
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
@@ -231,6 +231,39 @@ def test_chat_completions_routes_main_for_unknown(client):
         server.slots["batch"].queue.enqueue = original_enqueue_batch
 
     assert enqueued_on == ["main"]
+
+
+def test_chat_completions_409_when_not_loaded(client):
+    """A model that exists on disk but is loaded on neither slot -> 409 (no implicit swap)."""
+    app = client.app
+    server = app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = None
+    server.slots["batch"].healthy = False
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "test-model-q8",  # on disk, not loaded anywhere
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 409
+    assert r.json()["error"]["type"] == "model_not_loaded"
+
+
+def test_chat_completions_cold_start_no_crash(client):
+    """Both slots unloaded (loaded_model=None, unhealthy): request must not 500."""
+    app = client.app
+    server = app.state.server
+    server.slots["main"].loaded_model = None
+    server.slots["main"].healthy = False
+    server.slots["batch"].loaded_model = None
+    server.slots["batch"].healthy = False
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "test-model-q4",  # exists on disk, not loaded
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 409  # not a 500
 
 
 def test_chat_completions_503_on_batch_unhealthy(client):

@@ -439,17 +439,20 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         item: dict = {"body": body, "event": event, "response": None, "error": None}
 
         slot_name = resolve_slot(model_name, server.slots)
+        if slot_name is None:
+            # Loaded on neither slot. Do NOT implicitly restart main; tell the
+            # caller to load it explicitly. (Implicit swaps live only on POST /swap.)
+            return JSONResponse(
+                {"error": {
+                    "type": "model_not_loaded",
+                    "message": f"model {model_name} not loaded on any slot; use POST /swap",
+                }},
+                status_code=409,
+            )
         slot = server.slots[slot_name]
 
-        if not slot.healthy and slot.loaded_model == model_name:
-            # Model IS loaded on this slot but the slot is unhealthy.
-            # 503 with a typed error the PAL client recognizes.
-            #
-            # Narrow by design: only fires for the "loaded-but-sick" case.
-            # The "not-loaded-anywhere" path (resolve_slot returns 'main'
-            # with a different loaded_model) falls through to the queue
-            # so the main consumer's ensure_model_on_slot can trigger an
-            # implicit swap. That preserves pre-Phase-B behavior.
+        if not slot.healthy and same_model(model_name, slot.loaded_model):
+            # Model IS loaded on this slot but the slot is unhealthy: typed 503.
             return JSONResponse(
                 {"error": {
                     "type": f"{slot_name}_unavailable",

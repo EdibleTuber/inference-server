@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 
+_Path = Path  # alias used by model_path tests (brief requirement)
+
 
 @pytest.fixture
 def app(test_config):
@@ -363,3 +365,43 @@ async def test_ensure_model_skips_swap_on_case_variant(test_config):
     result = await server.ensure_model_on_slot("main", "TEST-MODEL-Q4")
     assert result is True
     server.slots["main"].swapper.swap_to.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# model_path resolution (Task 3)
+# ---------------------------------------------------------------------------
+
+def test_model_path_exact_and_suffix(test_config):
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    assert server.model_path("test-model-q4").endswith("test-model-q4.gguf")
+    assert server.model_path("test-model-q4.gguf").endswith("test-model-q4.gguf")
+
+
+def test_model_path_case_insensitive(test_config):
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    assert server.model_path("TEST-MODEL-Q4").endswith("test-model-q4.gguf")
+
+
+def test_model_path_unknown_is_none(test_config):
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    assert server.model_path("nope") is None
+    assert server.model_path("") is None
+
+
+def test_model_path_collision_is_deterministic_and_warns(test_config, caplog):
+    from manager.app import ServerState
+    d = test_config.models_dir
+    _Path(d, "Dup-Model.gguf").touch()
+    _Path(d, "dup-model.gguf").touch()
+    server = ServerState(test_config)
+    # Exact-case match wins, no warning needed.
+    assert server.model_path("Dup-Model").endswith("Dup-Model.gguf")
+    assert server.model_path("dup-model").endswith("dup-model.gguf")
+    # A folded-only variant resolves to the sorted-first file ('D' < 'd') and warns.
+    with caplog.at_level("WARNING"):
+        resolved = server.model_path("DUP-MODEL")
+    assert resolved.endswith("Dup-Model.gguf")
+    assert any("collision" in r.message.lower() for r in caplog.records)

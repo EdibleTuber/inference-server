@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
 from manager.gpu import get_gpu_info
-from manager.names import display_name, same_model
+from manager.names import display_name, match_key, same_model
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
@@ -91,23 +91,32 @@ class ServerState:
     # ------------------------------------------------------------------
 
     def model_path(self, model_name: str) -> str | None:
-        """Resolve a model name to its real on-disk path in MODELS_DIR.
+        """Resolve a model name to its file path in MODELS_DIR.
 
-        Case-insensitive: always returns the actual filesystem path so that
-        callers storing display_name(path) get the authoritative on-disk stem.
+        Case- and .gguf-suffix-insensitive. An exact-case stem match wins;
+        otherwise a case-folded (match_key) match is used. NOTE: the glob is
+        case-sensitive, so on-disk files MUST use a lowercase '.gguf' extension.
         """
-        name = model_name if model_name.lower().endswith(".gguf") else f"{model_name}.gguf"
+        requested = display_name(model_name)
+        if requested is None:
+            return None
         models_dir = Path(self._config.models_dir)
-        # Fast path: exact match.
-        exact = models_dir / name
-        if exact.exists():
-            return str(exact)
-        # Case-insensitive fallback: find the real on-disk filename.
-        name_lower = name.lower()
-        for p in models_dir.glob("*.gguf"):
-            if p.name.lower() == name_lower:
+        if not models_dir.exists():
+            return None
+        by_key: dict[str, Path] = {}
+        for p in sorted(models_dir.glob("*.gguf")):
+            if p.stem == requested:                 # exact-case match wins
                 return str(p)
-        return None
+            key = match_key(p.stem)
+            if key in by_key:
+                logger.warning(
+                    "model_path: case-collision on %r; keeping %s, ignoring %s",
+                    key, by_key[key].name, p.name,
+                )
+                continue
+            by_key[key] = p
+        match = by_key.get(match_key(model_name))
+        return str(match) if match is not None else None
 
     def list_models(self) -> list[str]:
         models_dir = Path(self._config.models_dir)

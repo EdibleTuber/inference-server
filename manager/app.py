@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
 from manager.gpu import get_gpu_info
+from manager.names import display_name, match_key, same_model
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
@@ -90,10 +91,32 @@ class ServerState:
     # ------------------------------------------------------------------
 
     def model_path(self, model_name: str) -> str | None:
-        """Resolve a model name to its file path in MODELS_DIR."""
-        name = model_name if model_name.endswith(".gguf") else f"{model_name}.gguf"
-        path = Path(self._config.models_dir) / name
-        return str(path) if path.exists() else None
+        """Resolve a model name to its file path in MODELS_DIR.
+
+        Case- and .gguf-suffix-insensitive. An exact-case stem match wins;
+        otherwise a case-folded (match_key) match is used. NOTE: the glob is
+        case-sensitive, so on-disk files MUST use a lowercase '.gguf' extension.
+        """
+        requested = display_name(model_name)
+        if requested is None:
+            return None
+        models_dir = Path(self._config.models_dir)
+        if not models_dir.exists():
+            return None
+        by_key: dict[str, Path] = {}
+        for p in sorted(models_dir.glob("*.gguf")):
+            if p.stem == requested:                 # exact-case match wins
+                return str(p)
+            key = match_key(p.stem)
+            if key in by_key:
+                logger.warning(
+                    "model_path: case-collision on %r; keeping %s, ignoring %s",
+                    key, by_key[key].name, p.name,
+                )
+                continue
+            by_key[key] = p
+        match = by_key.get(match_key(model_name))
+        return str(match) if match is not None else None
 
     def list_models(self) -> list[str]:
         models_dir = Path(self._config.models_dir)
@@ -113,7 +136,7 @@ class ServerState:
         """
         slot = self.slots[slot_name]
         async with slot.swap_lock:
-            if slot.healthy and slot.loaded_model == model_name:
+            if slot.healthy and same_model(model_name, slot.loaded_model):
                 return True
 
             path = self.model_path(model_name)
@@ -126,7 +149,7 @@ class ServerState:
             logger.info("slot=%s swapping to %s", slot_name, model_name)
             success = await slot.swapper.swap_to(path)
             if success:
-                slot.mark_swapped(model_name)
+                slot.mark_swapped(display_name(path))   # store the real on-disk stem
                 return True
 
             msg = f"Model swap timed out on slot {slot_name}: {model_name}"
@@ -181,10 +204,14 @@ def _setup_logging(config: ManagerConfig) -> None:
 
 async def _reprobe_for(slot) -> None:
     """Fire-and-forget re-probe used after a backend 5xx.
-    Called via asyncio.create_task so the consumer loop is not blocked.
+
+    Acquires the slot's swap_lock first, so the reprobe serializes AFTER any
+    in-flight/queued swap and can never clobber a fresh mark_swapped. Between
+    the two writers of loaded_model, the swap is authoritative.
     """
-    async with httpx.AsyncClient() as probe_client:
-        await slot.reconcile_on_error(probe_client)
+    async with slot.swap_lock:
+        async with httpx.AsyncClient() as probe_client:
+            await slot.reconcile_on_error(probe_client)
 
 
 # ---------------------------------------------------------------------------
@@ -416,17 +443,20 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         item: dict = {"body": body, "event": event, "response": None, "error": None}
 
         slot_name = resolve_slot(model_name, server.slots)
+        if slot_name is None:
+            # Loaded on neither slot. Do NOT implicitly restart main; tell the
+            # caller to load it explicitly. (Implicit swaps live only on POST /swap.)
+            return JSONResponse(
+                {"error": {
+                    "type": "model_not_loaded",
+                    "message": f"model {model_name} not loaded on any slot; use POST /swap",
+                }},
+                status_code=409,
+            )
         slot = server.slots[slot_name]
 
-        if not slot.healthy and slot.loaded_model == model_name:
-            # Model IS loaded on this slot but the slot is unhealthy.
-            # 503 with a typed error the PAL client recognizes.
-            #
-            # Narrow by design: only fires for the "loaded-but-sick" case.
-            # The "not-loaded-anywhere" path (resolve_slot returns 'main'
-            # with a different loaded_model) falls through to the queue
-            # so the main consumer's ensure_model_on_slot can trigger an
-            # implicit swap. That preserves pre-Phase-B behavior.
+        if not slot.healthy and same_model(model_name, slot.loaded_model):
+            # Model IS loaded on this slot but the slot is unhealthy: typed 503.
             return JSONResponse(
                 {"error": {
                     "type": f"{slot_name}_unavailable",
@@ -691,7 +721,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=503,
             )
 
-        return {"slot": target, "model": model_name, "status": "ok"}
+        return {"slot": target, "model": server.slots[target].loaded_model, "status": "ok"}
 
     # ------------------------------------------------------------------
     # GET /collections/{collection_id}/reindex/{job_id}

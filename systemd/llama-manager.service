@@ -38,6 +38,7 @@ ExecStart=/opt/llama/manager/venv/bin/python -m uvicorn \
     --factory \
     --host ${HOST} \
     --port ${PORT} \
+    --timeout-keep-alive 120 \
     --log-level info
 
 Restart=on-failure

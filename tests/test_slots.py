@@ -161,3 +161,19 @@ def test_to_status_dict_shape():
     assert status["last_swap_utc"] == "2026-04-19T14:00:00+00:00"
     assert status["queue_depth"] == 0
     assert status["queue_limit"] == 20
+
+
+@pytest.mark.asyncio
+async def test_probe_normalizes_full_path_id():
+    """If llama-server reports a full path, probe stores the clean stem."""
+    slot = _make_slot()
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {
+        "data": [{"id": "/mnt/secondary/llama-models/gemma-4-26b-a4b-it-q4_k_m.gguf"}],
+    }
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)
+    assert slot.loaded_model == "gemma-4-26b-a4b-it-q4_k_m"
+    assert slot.healthy is True

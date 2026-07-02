@@ -246,7 +246,12 @@ Use descriptive names that encode the model family, size, and quantization level
 - `llama-3-8b-instruct-q5_k_m` — Llama 3, 8B, instruction-tuned, Q5_K_M quantization
 - `deepseek-r1-14b-q6_k` — DeepSeek R1, 14B, Q6_K quantization
 
-The manager uses exact filename matching — the model name in a request must exactly match the filename without `.gguf`.
+The manager matches model names **case-insensitively** and ignores a `.gguf`
+suffix or any leading path; an exact-case filename match wins when present.
+The authoritative model identity for clients is `slots.<slot>.loaded_model`
+in `GET /status` (the canonical on-disk stem). On-disk GGUF files must use a
+lowercase `.gguf` extension. A request for a model loaded on neither slot
+returns **409**; load it first via `POST /swap`.
 
 ---
 

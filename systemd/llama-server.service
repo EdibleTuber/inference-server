@@ -35,19 +35,37 @@ EnvironmentFile=/etc/llama/llama-server.env
 # (setup.sh does not overwrite an existing env).
 Environment=DEVICE=CUDA0
 
+# Work around a CUDA-backend leak where CUDA graphs are cached per generation
+# and not freed, growing host RAM under sustained load (llama.cpp issue #20315).
+# Negligible perf cost on Pascal (P40). Secondary guard; the primary OOM fix is
+# --cache-ram 0 below.
+Environment=GGML_CUDA_DISABLE_GRAPHS=1
+
 # Start llama-server with config from env file.
 # --host/--port: localhost only (manager handles external access)
 # --model: GGUF file path (updated by manager during swaps)
 # --device: explicit CUDA device selector (fail-loud; no silent iGPU fallback)
 # --n-gpu-layers: GPU offload (-1 = auto/all)
 # --ctx-size: context window in tokens
+# --cache-ram 0: DISABLE llama-server's default host-memory KV/prompt cache.
+#   That cache (default ~8GB, llama.cpp PR #16391) accumulates KV across
+#   conversations and never releases, and its size cap is ineffective on Linux
+#   due to overcommit (issue #22629) — it grew unbounded to 23.6GB and OOM-killed
+#   this service (2026-07-04). Disabling it drops idle host RAM ~9.7GB -> ~250MB
+#   and makes memory grow-under-load / release-on-idle instead of leaking.
+#   Trade-off: no cross-conversation prompt reuse (minor prefill cost).
+# --parallel 1: one slot. The manager serializes to one request at a time, so
+#   extra slots are pure waste that multiply the per-slot context footprint
+#   (4 slots x 64k ctx ~= 4.8GB host vs ~1.2GB at 1 slot).
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
     --model ${MODEL_PATH} \
     --device ${DEVICE} \
     --n-gpu-layers ${N_GPU_LAYERS} \
-    --ctx-size ${CTX_SIZE}
+    --ctx-size ${CTX_SIZE} \
+    --cache-ram 0 \
+    --parallel 1
 
 # Auto-restart on crash with delay to prevent loops.
 Restart=on-failure

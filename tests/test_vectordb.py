@@ -55,6 +55,26 @@ def test_upsert_and_search_document(db):
     assert "score" in results[0]
 
 
+def test_search_score_is_cosine_similarity(db):
+    """score must be cosine similarity (embeddings are unit-normalized), NOT the raw
+    sqlite-vec L2 distance mapped through 1 - distance. Regression for on-topic hits
+    reporting ~0.25 when true cosine was ~0.85."""
+    db.upsert_collection("c", "/tmp", "markdown")
+    doc = [1.0] + [0.0] * 767                      # unit vector e1
+    db.upsert_document("d", "c", "D", {}, "s", "content", "/tmp/d.md", "h", doc)
+
+    # query at a known cosine of 0.6 to the doc: [0.6, 0.8, 0, ...] (unit norm).
+    # Under the old `1 - L2` this would report ~0.106; true cosine is 0.6.
+    q = [0.6, 0.8] + [0.0] * 766
+    results = db.search("c", q, limit=1)
+    assert len(results) == 1
+    assert results[0]["score"] == pytest.approx(0.6, abs=1e-4)
+
+    # identical vector => cosine 1.0
+    same = db.search("c", doc, limit=1)
+    assert same[0]["score"] == pytest.approx(1.0, abs=1e-4)
+
+
 def test_search_with_tag_filter(db):
     """Search filters by tags when provided."""
     db.upsert_collection("skills", "/tmp/skills", "skill")

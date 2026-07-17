@@ -139,7 +139,13 @@ class VectorDB:
                 "collection": doc["collection"],
                 "summary": doc["summary"],
                 "tags": doc_tags,
-                "score": 1.0 - row["distance"],
+                # documents_vec uses sqlite-vec's DEFAULT L2 (Euclidean) metric, so
+                # row["distance"] is an L2 distance, not cosine distance. Embeddings are
+                # unit-normalized, for which cosine = 1 - L2^2/2. Recover that so score
+                # is a true cosine similarity in [-1, 1]. (The old `1 - distance` treated
+                # L2 as cosine distance, compressing ~0.85-cosine hits to ~0.25 and going
+                # negative below 0.5 cosine.)
+                "score": 1.0 - (row["distance"] ** 2) / 2.0,
             })
             if len(results) >= limit:
                 break

@@ -27,13 +27,17 @@ Type=simple
 User=_llama
 Group=_llama
 
-# Load runtime configuration
-EnvironmentFile=/etc/llama/llama-server.env
-
 # Unit-level default for DEVICE — overridden by any DEVICE= in the env file.
 # Keeps the Tesla P40 pinned even on a redeploy that skips the live env file
-# (setup.sh does not overwrite an existing env).
+# (setup.sh does not overwrite an existing env). MUST come before
+# EnvironmentFile= below: systemd applies Environment=/EnvironmentFile= in
+# file order and later assignments win, so if this line comes after
+# EnvironmentFile= it always overrides the env file's DEVICE= instead of
+# being overridden by it.
 Environment=DEVICE=CUDA0
+
+# Load runtime configuration
+EnvironmentFile=/etc/llama/llama-server.env
 
 # Start llama-server with config from env file.
 # --host/--port: localhost only (manager handles external access)

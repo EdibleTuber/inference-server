@@ -288,6 +288,11 @@ def test_chat_completions_409_when_not_loaded(client):
     })
     assert r.status_code == 409
     assert r.json()["error"]["type"] == "model_not_loaded"
+    # The message must name WHAT is loaded (self-evident mismatch), not just
+    # "not loaded" — this is the finicky-error fix.
+    msg = r.json()["error"]["message"]
+    assert "test-model-q8" in msg          # the requested (missing) model
+    assert "test-model-q4" in msg          # what main actually has loaded
 
 
 def test_chat_completions_cold_start_no_crash(client):

@@ -36,7 +36,9 @@ Group=_llama
 # being overridden by it.
 Environment=DEVICE=CUDA0
 
-# Load runtime configuration
+# Load runtime configuration. GGML_CUDA_DISABLE_GRAPHS=1 (workaround for a
+# CUDA-graph-cache host-RAM leak, llama.cpp issue #20315) lives in that env
+# file rather than here, so it's visible alongside the other tuning knobs.
 EnvironmentFile=/etc/llama/llama-server.env
 
 # Start llama-server with config from env file.
@@ -48,12 +50,15 @@ EnvironmentFile=/etc/llama/llama-server.env
 # --ctx-checkpoints: cap GPU-side context-checkpoint accumulation (default 32 is
 #   too high for this card — see ggml-org/llama.cpp#23181, --cache-ram 0 does not
 #   disable checkpoint creation, and unbounded growth can OOM the P40's VRAM).
-# --parallel: explicit slot count (was "auto" -> 4); bounds how many concurrent
-#   conversations can each grow their own checkpoint stack at once.
-# --cache-ram 0: disable llama-server's default host-memory KV/prompt cache
-#   (default ~8GB, llama.cpp PR #16391). It accumulates KV across conversations
-#   and never releases, and its cap is ineffective on Linux due to overcommit
-#   (issue #22629) — root cause of the 2026-07-04 host-RAM OOM.
+# --parallel: explicit slot count (was "auto" -> 4, then briefly 1); bounds how
+#   many concurrent conversations can each grow their own checkpoint stack at once.
+# --cache-ram 0: DISABLE llama-server's default host-memory KV/prompt cache.
+#   That cache (default ~8GB, llama.cpp PR #16391) accumulates KV across
+#   conversations and never releases, and its size cap is ineffective on Linux
+#   due to overcommit (issue #22629) — it grew unbounded to 23.6GB and OOM-killed
+#   this service (2026-07-04). Disabling it drops idle host RAM ~9.7GB -> ~250MB
+#   and makes memory grow-under-load / release-on-idle instead of leaking.
+#   Trade-off: no cross-conversation prompt reuse (minor prefill cost).
 # --jinja: enable Jinja2 chat-template parsing (required for tool-calling).
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \

@@ -445,11 +445,20 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         slot_name = resolve_slot(model_name, server.slots)
         if slot_name is None:
             # Loaded on neither slot. Do NOT implicitly restart main; tell the
-            # caller to load it explicitly. (Implicit swaps live only on POST /swap.)
+            # caller WHAT IS loaded so the mismatch is self-evident, not just
+            # "not loaded". (Implicit swaps live only on POST /swap.)
+            loaded_desc = ", ".join(
+                f"{name}='{s.loaded_model or 'none'}'"
+                for name, s in server.slots.items()
+            )
             return JSONResponse(
                 {"error": {
                     "type": "model_not_loaded",
-                    "message": f"model {model_name} not loaded on any slot; use POST /swap",
+                    "message": (
+                        f"model '{model_name}' not loaded on any slot "
+                        f"(loaded: {loaded_desc}); POST /swap to load it, "
+                        f"or request the model that is already loaded"
+                    ),
                 }},
                 status_code=409,
             )

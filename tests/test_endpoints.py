@@ -67,6 +67,46 @@ def test_status_main_queue_limit_matches_config(client):
     assert data["slots"]["batch"]["queue_limit"] == 20
 
 
+@pytest.mark.asyncio
+async def test_status_endpoint_does_not_block_event_loop(app):
+    """A slow nvidia-smi call must not stall other in-flight requests.
+
+    Regression test: GET /status used to call subprocess.run synchronously
+    inside the async handler, freezing the single-threaded event loop (and
+    therefore every queued chat request) for as long as nvidia-smi took.
+    """
+    import time
+    import httpx
+
+    def slow_nvidia_smi(*args, **kwargs):
+        time.sleep(0.3)
+        result = MagicMock()
+        result.stdout = (
+            "gpu_name, memory.total [MiB], memory.used [MiB]\n"
+            "Tesla P40, 24576 MiB, 18200 MiB"
+        )
+        result.returncode = 0
+        return result
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        for _ in range(10):
+            await asyncio.sleep(0.03)
+            ticks += 1
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("manager.gpu.subprocess.run", side_effect=slow_nvidia_smi):
+            start = time.monotonic()
+            await asyncio.gather(client.get("/status"), ticker())
+            elapsed = time.monotonic() - start
+
+    assert ticks == 10
+    assert elapsed < 0.45  # ~0.6s if /status still blocks the event loop
+
+
 def test_models_endpoint(client):
     response = client.get("/v1/models")
     data = response.json()

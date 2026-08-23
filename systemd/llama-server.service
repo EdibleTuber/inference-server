@@ -41,13 +41,27 @@ Environment=DEVICE=CUDA0
 # --device: explicit CUDA device selector (fail-loud; no silent iGPU fallback)
 # --n-gpu-layers: GPU offload (-1 = auto/all)
 # --ctx-size: context window in tokens
+# --ctx-checkpoints: cap GPU-side context-checkpoint accumulation (default 32 is
+#   too high for this card — see ggml-org/llama.cpp#23181, --cache-ram 0 does not
+#   disable checkpoint creation, and unbounded growth can OOM the P40's VRAM).
+# --parallel: explicit slot count (was "auto" -> 4); bounds how many concurrent
+#   conversations can each grow their own checkpoint stack at once.
+# --cache-ram 0: disable llama-server's default host-memory KV/prompt cache
+#   (default ~8GB, llama.cpp PR #16391). It accumulates KV across conversations
+#   and never releases, and its cap is ineffective on Linux due to overcommit
+#   (issue #22629) — root cause of the 2026-07-04 host-RAM OOM.
+# --jinja: enable Jinja2 chat-template parsing (required for tool-calling).
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
     --model ${MODEL_PATH} \
     --device ${DEVICE} \
     --n-gpu-layers ${N_GPU_LAYERS} \
-    --ctx-size ${CTX_SIZE}
+    --ctx-size ${CTX_SIZE} \
+    --ctx-checkpoints 4 \
+    --parallel 2 \
+    --cache-ram 0 \
+    --jinja
 
 # Auto-restart on crash with delay to prevent loops.
 Restart=on-failure

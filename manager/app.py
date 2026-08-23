@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
-from manager.gpu import get_gpu_info
+from manager.gpu import get_gpu_info_async
 from manager.names import display_name, match_key, same_model
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
@@ -376,7 +376,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status():
-        gpu = get_gpu_info()
+        gpu = await get_gpu_info_async()
         return {
             "slots": {
                 name: slot.to_status_dict()

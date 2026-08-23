@@ -27,19 +27,19 @@ Type=simple
 User=_llama
 Group=_llama
 
-# Load runtime configuration
-EnvironmentFile=/etc/llama/llama-server.env
-
 # Unit-level default for DEVICE — overridden by any DEVICE= in the env file.
 # Keeps the Tesla P40 pinned even on a redeploy that skips the live env file
-# (setup.sh does not overwrite an existing env).
+# (setup.sh does not overwrite an existing env). MUST come before
+# EnvironmentFile= below: systemd applies Environment=/EnvironmentFile= in
+# file order and later assignments win, so if this line comes after
+# EnvironmentFile= it always overrides the env file's DEVICE= instead of
+# being overridden by it.
 Environment=DEVICE=CUDA0
 
-# Work around a CUDA-backend leak where CUDA graphs are cached per generation
-# and not freed, growing host RAM under sustained load (llama.cpp issue #20315).
-# Negligible perf cost on Pascal (P40). Secondary guard; the primary OOM fix is
-# --cache-ram 0 below.
-Environment=GGML_CUDA_DISABLE_GRAPHS=1
+# Load runtime configuration. GGML_CUDA_DISABLE_GRAPHS=1 (workaround for a
+# CUDA-graph-cache host-RAM leak, llama.cpp issue #20315) lives in that env
+# file rather than here, so it's visible alongside the other tuning knobs.
+EnvironmentFile=/etc/llama/llama-server.env
 
 # Start llama-server with config from env file.
 # --host/--port: localhost only (manager handles external access)
@@ -47,6 +47,11 @@ Environment=GGML_CUDA_DISABLE_GRAPHS=1
 # --device: explicit CUDA device selector (fail-loud; no silent iGPU fallback)
 # --n-gpu-layers: GPU offload (-1 = auto/all)
 # --ctx-size: context window in tokens
+# --ctx-checkpoints: cap GPU-side context-checkpoint accumulation (default 32 is
+#   too high for this card — see ggml-org/llama.cpp#23181, --cache-ram 0 does not
+#   disable checkpoint creation, and unbounded growth can OOM the P40's VRAM).
+# --parallel: explicit slot count (was "auto" -> 4, then briefly 1); bounds how
+#   many concurrent conversations can each grow their own checkpoint stack at once.
 # --cache-ram 0: DISABLE llama-server's default host-memory KV/prompt cache.
 #   That cache (default ~8GB, llama.cpp PR #16391) accumulates KV across
 #   conversations and never releases, and its size cap is ineffective on Linux
@@ -54,9 +59,7 @@ Environment=GGML_CUDA_DISABLE_GRAPHS=1
 #   this service (2026-07-04). Disabling it drops idle host RAM ~9.7GB -> ~250MB
 #   and makes memory grow-under-load / release-on-idle instead of leaking.
 #   Trade-off: no cross-conversation prompt reuse (minor prefill cost).
-# --parallel 1: one slot. The manager serializes to one request at a time, so
-#   extra slots are pure waste that multiply the per-slot context footprint
-#   (4 slots x 64k ctx ~= 4.8GB host vs ~1.2GB at 1 slot).
+# --jinja: enable Jinja2 chat-template parsing (required for tool-calling).
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
@@ -64,8 +67,10 @@ ExecStart=/opt/llama/bin/llama-server \
     --device ${DEVICE} \
     --n-gpu-layers ${N_GPU_LAYERS} \
     --ctx-size ${CTX_SIZE} \
+    --ctx-checkpoints 4 \
+    --parallel 2 \
     --cache-ram 0 \
-    --parallel 1
+    --jinja
 
 # Auto-restart on crash with delay to prevent loops.
 Restart=on-failure

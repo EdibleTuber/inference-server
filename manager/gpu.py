@@ -5,10 +5,22 @@ Provides GPU name and VRAM usage for the /status endpoint. Queries
 on-demand since VRAM usage changes as models load/unload. Falls back
 to safe defaults if nvidia-smi is unavailable (e.g., during development).
 """
+import asyncio
 import subprocess
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+async def get_gpu_info_async() -> dict:
+    """Async wrapper: runs get_gpu_info() in an executor.
+
+    get_gpu_info() shells out via subprocess.run, which blocks the calling
+    thread. Called from an async handler, that would freeze the single
+    event loop (and every queued request behind it) for as long as
+    nvidia-smi takes to return.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, get_gpu_info)
 
 
 def get_gpu_info() -> dict:

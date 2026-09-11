@@ -128,6 +128,34 @@ class ServerState:
     # Model swap
     # ------------------------------------------------------------------
 
+    async def reprobe_all_slots(self) -> None:
+        """Refresh every slot's view of its backend. Never raises.
+
+        Probing otherwise happens only at startup and after a backend 5xx, so a
+        backend that became ready LATER is invisible for the life of the
+        process. Observed on the live server: llama-manager and
+        llama-server-batch both started at 23:36:45 -- the same second -- so the
+        startup probe ran before the iGPU had finished loading a 4B model. The
+        batch backend was serving a model this manager reported as
+        loaded_model: null, and every request for it got a 409 telling the
+        caller to load a model that was already loaded.
+
+        Takes each slot's swap_lock, matching _reprobe_for: between the two
+        writers of loaded_model, a swap is authoritative and a probe must never
+        clobber a fresh mark_swapped.
+
+        A slot whose lock is already held is SKIPPED rather than waited on. A
+        swap in flight is both authoritative and already producing fresh state,
+        and blocking here would stall the caller behind a whole model load.
+        """
+        async with httpx.AsyncClient() as probe_client:
+            for name, slot in self.slots.items():
+                if slot.swap_lock.locked():
+                    logger.debug("slot=%s mid-swap, skipping reprobe", name)
+                    continue
+                async with slot.swap_lock:
+                    await slot.probe(probe_client)
+
     async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
         """Ensure model_name is loaded on the named slot.
 
@@ -443,6 +471,12 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         item: dict = {"body": body, "event": event, "response": None, "error": None}
 
         slot_name = resolve_slot(model_name, server.slots)
+        if slot_name is None:
+            # Our view of the slots may simply be stale -- see
+            # reprobe_all_slots. Ask the backends before telling the caller to
+            # load something that may already be loaded.
+            await server.reprobe_all_slots()
+            slot_name = resolve_slot(model_name, server.slots)
         if slot_name is None:
             # Loaded on neither slot. Do NOT implicitly restart main; tell the
             # caller WHAT IS loaded so the mismatch is self-evident, not just

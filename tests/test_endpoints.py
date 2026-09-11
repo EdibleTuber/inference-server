@@ -273,8 +273,29 @@ def test_chat_completions_routes_main_when_loaded_on_main(client):
     assert enqueued_on == ["main"]
 
 
-def test_chat_completions_409_when_not_loaded(client):
-    """A model that exists on disk but is loaded on neither slot -> 409 (no implicit swap)."""
+def test_chat_completions_409_when_not_loaded(client, monkeypatch):
+    """A model that exists on disk but is loaded on neither slot -> 409 (no implicit swap).
+
+    The probe is stubbed because this test asserts on the 409 MESSAGE, and the
+    message is built from slot state this test sets by hand. The chat handler
+    now re-probes before declaring a model unloaded (so a stale slot is not
+    reported as empty), and test_config points the slots at 127.0.0.1:8081/8083
+    -- which on a machine where the real backends are running is not a fixture,
+    it is production. Without this stub the probe replaced the fabricated state
+    with the live models and the assertion read
+    `main='gemma-4-26b-a4b-it-q4_k_m'`.
+
+    Worth knowing more broadly: TestClient runs the lifespan, so the startup
+    probe has always reached those ports. This stub makes one test hermetic; the
+    suite as a whole still depends on what happens to be listening.
+    """
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
     app = client.app
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
@@ -520,3 +541,113 @@ async def test_reprobe_waits_for_swap_lock(test_config):
     slot.swap_lock.release()
     await task
     slot.reconcile_on_error.assert_awaited_once()  # ran after release
+
+
+# --- a stale slot view must not be reported as "not loaded" ----------------
+
+def test_a_stale_slot_is_reprobed_before_returning_409(client, monkeypatch):
+    """Probing happens at startup and after a 5xx. A backend that became ready
+    LATER was invisible forever.
+
+    Observed on the live server: llama-manager and llama-server-batch both
+    started at 23:36:45 -- the same second -- so the startup probe ran before
+    the iGPU had finished loading a 4B model. :8083 was serving
+    gemma-4-E4B-it-Q4_K_M with 4 slots while /status reported
+    loaded_model: null, and every request for that model got a 409 telling the
+    caller to load a model that was already loaded.
+    """
+    from manager.slots import SlotState
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = None       # stale; it IS loaded
+    server.slots["batch"].healthy = False
+
+    async def fake_probe(self, probe_client):
+        if self.name == "batch":
+            self.loaded_model = "test-model-q8"
+            self.healthy = True
+
+    monkeypatch.setattr(SlotState, "probe", fake_probe)
+
+    enqueued_on = []
+
+    async def wrap(item, _name=None):
+        enqueued_on.append(_name)
+        from fastapi.responses import Response
+        item["response"] = Response(content=b'{}', media_type="application/json")
+        item["event"].set()
+
+    server.slots["main"].queue.enqueue = lambda i: wrap(i, "main")
+    server.slots["batch"].queue.enqueue = lambda i: wrap(i, "batch")
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "test-model-q8",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert r.status_code != 409, r.json()
+    assert enqueued_on == ["batch"], enqueued_on
+
+
+def test_a_genuinely_unloaded_model_still_409s_after_the_reprobe(client, monkeypatch):
+    """The re-probe must not turn a real 409 into something else. If the probe
+    finds nothing, the answer is unchanged."""
+    from manager.slots import SlotState
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = None
+    server.slots["batch"].healthy = False
+
+    probed = []
+
+    async def fake_probe(self, probe_client):
+        probed.append(self.name)          # finds nothing new
+
+    monkeypatch.setattr(SlotState, "probe", fake_probe)
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "test-model-q8",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 409
+    assert r.json()["error"]["type"] == "model_not_loaded"
+    assert set(probed) == {"main", "batch"}, probed
+
+
+def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
+    """A swap in flight is authoritative and already producing fresh state.
+    Waiting on its lock would stall this request behind a model load, and
+    probing past it could clobber a fresh mark_swapped."""
+    from manager.slots import SlotState
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = None
+    server.slots["batch"].healthy = False
+
+    probed = []
+
+    async def fake_probe(self, probe_client):
+        probed.append(self.name)
+
+    monkeypatch.setattr(SlotState, "probe", fake_probe)
+
+    async def hold_and_request():
+        await server.slots["batch"].swap_lock.acquire()
+        try:
+            return await asyncio.to_thread(
+                client.post, "/v1/chat/completions",
+                json={"model": "test-model-q8",
+                      "messages": [{"role": "user", "content": "hi"}]})
+        finally:
+            server.slots["batch"].swap_lock.release()
+
+    r = asyncio.run(hold_and_request())
+    assert r.status_code == 409
+    assert "batch" not in probed, probed
+    assert "main" in probed, probed

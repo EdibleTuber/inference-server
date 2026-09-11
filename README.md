@@ -83,12 +83,32 @@ sudo chmod +x /opt/llama/bin/llama-server
 
 **3. Deploy the model manager:**
 
+First install only — `scripts/setup.sh` does this as step 7, along with the
+users, permissions, sudoers entry and systemd units:
+
 ```bash
-sudo cp -r manager/ /opt/llama/manager/
-cd /opt/llama/manager
-sudo python3 -m venv venv
-sudo venv/bin/pip install -r requirements.txt
+sudo ./scripts/setup.sh
 ```
+
+To ship a code change to an existing install, use the deploy script. It reports
+drift without privilege, so you can see what would change before changing it:
+
+```bash
+./scripts/deploy-manager.sh --check     # read-only, no sudo
+sudo ./scripts/deploy-manager.sh        # install, stamp, restart, verify
+cat /opt/llama/manager/DEPLOYED_FROM    # which commit is actually running
+```
+
+> **Do not use `cp -r manager/ /opt/llama/manager/`.** This README said that for
+> a long time, and it is correct exactly once — against a target that does not
+> exist yet. With `/opt/llama/manager` already present it creates
+> `/opt/llama/manager/manager/`, leaving the new code one level down while the
+> service keeps running the old: a silent no-op with no error to notice.
+>
+> That is not hypothetical. Three modules — `app.py`, `gpu.py` and
+> `vectordb.py` — were found behind this repo on the live host, carrying merged
+> work that had never shipped, because there was no safe documented way to ship
+> it.
 
 **4. Edit the config files:**
 

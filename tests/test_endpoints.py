@@ -388,6 +388,34 @@ def test_swap_default_target_is_main(client, monkeypatch):
     assert r.json()["slot"] == "main"
 
 
+def test_swap_default_target_is_first_configured_slot_not_the_literal_main(
+    test_config, monkeypatch
+):
+    """The default /swap target must be resolved from configuration (the
+    first configured slot), not the hardcoded string "main" -- proven with
+    a config whose first slot is named something else, so a regression to
+    a literal "main" default would 400 here instead of passing by
+    coincidence (as it would against test_config, where "main" happens to
+    already be first)."""
+    import dataclasses
+    from manager.app import create_app
+
+    reordered = dataclasses.replace(
+        test_config, slots=tuple(reversed(test_config.slots))
+    )
+    assert reordered.slots[0].name == "batch"
+
+    async def fake_swap(self, model):
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    app = create_app(reordered)
+    client = TestClient(app)
+    r = client.post("/swap", json={"model": "test-model-q8"})
+    assert r.status_code == 200, r.text
+    assert r.json()["slot"] == "batch"
+
+
 def test_swap_invalid_target(client):
     r = client.post("/swap", json={"model": "test-model-q4", "target": "xxx"})
     assert r.status_code == 400

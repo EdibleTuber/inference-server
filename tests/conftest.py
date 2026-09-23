@@ -154,29 +154,19 @@ def collections_config(tmp_path, skills_dir):
 
 @pytest.fixture
 def collection_config(test_config, tmp_path, collections_config):
-    """Extend test_config with collection settings."""
-    from manager.config import ManagerConfig
-    return ManagerConfig(
-        host=test_config.host,
-        port=test_config.port,
-        llama_server_host=test_config.llama_server_host,
-        llama_server_port=test_config.llama_server_port,
-        models_dir=test_config.models_dir,
-        llama_server_env=test_config.llama_server_env,
-        llama_server_unit=test_config.llama_server_unit,
-        queue_limit=test_config.queue_limit,
-        swap_timeout=test_config.swap_timeout,
-        log_file=test_config.log_file,
-        embeddings_host="127.0.0.1",
-        embeddings_port=8082,
+    """Extend test_config with collection settings.
+
+    Built via dataclasses.replace on test_config (as three_slot_config above
+    does) rather than a manual field-by-field copy, so it inherits
+    test_config.slots -- a hand-copy that predates the slot work previously
+    omitted slots=, producing a ManagerConfig with zero slots that could
+    never serve a chat request.
+    """
+    import dataclasses
+    return dataclasses.replace(
+        test_config,
         collections_config=collections_config,
         skills_db_path=str(tmp_path / "test.db"),
-        batch_server_host=test_config.batch_server_host,
-        batch_server_port=test_config.batch_server_port,
-        batch_server_env=test_config.batch_server_env,
-        batch_server_unit=test_config.batch_server_unit,
-        batch_queue_limit=test_config.batch_queue_limit,
-        batch_model_default=test_config.batch_model_default,
     )
 
 

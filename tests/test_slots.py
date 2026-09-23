@@ -78,27 +78,36 @@ async def test_probe_empty_data_unhealthy():
 
 @pytest.mark.asyncio
 async def test_probe_connection_error_unhealthy():
-    """Probe catches httpx.ConnectError (or any exception): slot unhealthy, no raise."""
+    """Probe catches httpx.ConnectError (or any exception): slot unhealthy, no raise.
+
+    loaded_model must be preserved, not nulled -- a backend blip during a
+    /status poll should surface as "unhealthy, last known model X", not as
+    "no model loaded" (which agent_core treats as 409 model_not_loaded and
+    reacts to with an evicting swap)."""
     import httpx
     slot = _make_slot()
+    slot.loaded_model = "old-model"
     client = MagicMock()
     client.get = AsyncMock(side_effect=httpx.ConnectError("refused"))
 
     await slot.probe(client)
     assert slot.healthy is False
-    assert slot.loaded_model is None
+    assert slot.loaded_model == "old-model"
 
 
 @pytest.mark.asyncio
 async def test_probe_non_200_unhealthy():
-    """Probe with 500 response: unhealthy, no raise."""
+    """Probe with 500 response: unhealthy, no raise, loaded_model preserved
+    (see test_probe_connection_error_unhealthy for why preservation matters)."""
     slot = _make_slot()
+    slot.loaded_model = "old-model"
     client = MagicMock()
     mock_response = MagicMock(status_code=500)
     client.get = AsyncMock(return_value=mock_response)
 
     await slot.probe(client)
     assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
 
 
 @pytest.mark.asyncio

@@ -809,7 +809,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     async def swap_slot(request: Request):
         """Admin endpoint: swap a slot to a different model.
 
-        Body: {"model": str, "target": "main"|"batch" (optional, default main)}.
+        Body: {"model": str, "target": <slot name> (optional, default is
+        the first configured slot)}.
         No auth; LAN-only is the trust boundary.
         """
         try:
@@ -827,7 +828,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=400,
             )
 
-        target = body.get("target", "main")
+        target = body.get("target", next(iter(server.slots)))
         if not isinstance(target, str) or target not in server.slots:
             valid = ", ".join(repr(n) for n in server.slots)
             return JSONResponse(

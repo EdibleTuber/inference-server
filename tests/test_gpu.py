@@ -4,8 +4,8 @@ from unittest.mock import patch, MagicMock
 from manager.gpu import get_gpu_info
 
 
-SAMPLE_NVIDIA_SMI_OUTPUT = """gpu_name, memory.total [MiB], memory.used [MiB]
-Tesla P40, 24576 MiB, 18200 MiB"""
+SAMPLE_NVIDIA_SMI_OUTPUT = """index, gpu_name, memory.total [MiB], memory.used [MiB]
+0, Tesla P40, 24576 MiB, 18200 MiB"""
 
 
 def test_parse_nvidia_smi_output():
@@ -33,9 +33,9 @@ def test_gpu_info_when_nvidia_smi_fails():
 
 
 _TWO_GPU_CSV = (
-    "name, memory.total [MiB], memory.used [MiB]\n"
-    "Tesla PG500-216, 32768 MiB, 19039 MiB\n"
-    "Tesla P40, 24576 MiB, 20710 MiB\n"
+    "index, name, memory.total [MiB], memory.used [MiB]\n"
+    "0, Tesla PG500-216, 32768 MiB, 19039 MiB\n"
+    "1, Tesla P40, 24576 MiB, 20710 MiB\n"
 )
 
 
@@ -71,11 +71,28 @@ def test_top_level_keys_mirror_the_first_gpu():
 
 
 def test_single_gpu_still_reports_one_entry():
-    csv = "name, memory.total [MiB], memory.used [MiB]\nTesla PG500-216, 32768 MiB, 19039 MiB\n"
+    csv = "index, name, memory.total [MiB], memory.used [MiB]\n0, Tesla PG500-216, 32768 MiB, 19039 MiB\n"
     with patch("manager.gpu.subprocess.run", return_value=_run(csv)):
         info = get_gpu_info()
     assert len(info["gpus"]) == 1
     assert info["name"] == "Tesla PG500-216"
+
+
+def test_skipped_row_does_not_renumber_the_survivor():
+    """A short/unparseable first row must not shift the second physical
+    card's reported index -- index now comes from nvidia-smi's own index
+    column (manager/gpu.py), not from len(gpus), so a skipped row can no
+    longer cause GPU 1 to be misreported as index 0."""
+    csv = (
+        "index, name, memory.total [MiB], memory.used [MiB]\n"
+        "0, bad row\n"
+        "1, Tesla P40, 24576 MiB, 20710 MiB\n"
+    )
+    with patch("manager.gpu.subprocess.run", return_value=_run(csv)):
+        info = get_gpu_info()
+    assert len(info["gpus"]) == 1
+    assert info["gpus"][0]["index"] == 1
+    assert info["gpus"][0]["name"] == "Tesla P40"
 
 
 def test_nvidia_smi_failure_returns_empty_gpu_list():

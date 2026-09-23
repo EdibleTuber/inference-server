@@ -190,21 +190,3 @@ def test_test_config_fixture_slots_match_its_own_ports_and_env_files(test_config
     assert by_name["batch"].env_file == test_config.batch_server_env
 
 
-def test_slots_default_is_empty_tuple_for_direct_construction():
-    """A ManagerConfig built directly, without passing slots=, still works --
-    slots defaults to an empty tuple rather than requiring every call site
-    to know about it."""
-    cfg = ManagerConfig(
-        host="0.0.0.0", port=11434,
-        llama_server_host="127.0.0.1", llama_server_port=8081,
-        models_dir="/tmp", llama_server_env="/tmp/env",
-        llama_server_unit="llama-server.service",
-        queue_limit=50, swap_timeout=60, log_file="/dev/null",
-        embeddings_host="127.0.0.1", embeddings_port=8082,
-        collections_config="/dev/null", skills_db_path="",
-        batch_server_host="127.0.0.1", batch_server_port=8083,
-        batch_server_env="/tmp/batch.env",
-        batch_server_unit="llama-server-batch.service",
-        batch_queue_limit=20, batch_model_default="gemma-4-E4B-it-Q4_K_M",
-    )
-    assert cfg.slots == ()

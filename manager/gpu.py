@@ -38,7 +38,7 @@ def get_gpu_info() -> dict:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=gpu_name,memory.total,memory.used",
+                "--query-gpu=index,gpu_name,memory.total,memory.used",
                 "--format=csv",
             ],
             capture_output=True,
@@ -56,16 +56,16 @@ def get_gpu_info() -> dict:
             if not line.strip():
                 continue
             values = [v.strip() for v in line.split(",")]
-            if len(values) < 3:
+            if len(values) < 4:
                 logger.warning("nvidia-smi unexpected row: %s", line)
                 continue
             try:
                 gpus.append(
                     {
-                        "index": len(gpus),
-                        "name": values[0],
-                        "vram_total_mb": int(values[1].replace(" MiB", "")),
-                        "vram_used_mb": int(values[2].replace(" MiB", "")),
+                        "index": int(values[0]),
+                        "name": values[1],
+                        "vram_total_mb": int(values[2].replace(" MiB", "")),
+                        "vram_used_mb": int(values[3].replace(" MiB", "")),
                     }
                 )
             except ValueError:

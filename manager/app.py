@@ -123,8 +123,21 @@ class ServerState:
     # Model swap
     # ------------------------------------------------------------------
 
+    async def _reprobe_slot_if_unlocked(self, name: str, slot, probe_client) -> None:
+        """Probe one slot unless a swap already holds its lock.
+
+        Shared by reprobe_all_slots and reprobe_all_slots_concurrently so both
+        keep exactly the same skip-if-mid-swap rule; only the fan-out (loop vs
+        gather) differs between them.
+        """
+        if slot.swap_lock.locked():
+            logger.debug("slot=%s mid-swap, skipping reprobe", name)
+            return
+        async with slot.swap_lock:
+            await slot.probe(probe_client)
+
     async def reprobe_all_slots(self) -> None:
-        """Refresh every slot's view of its backend. Never raises.
+        """Refresh every slot's view of its backend, one at a time. Never raises.
 
         Probing otherwise happens only at startup and after a backend 5xx, so a
         backend that became ready LATER is invisible for the life of the
@@ -142,14 +155,43 @@ class ServerState:
         A slot whose lock is already held is SKIPPED rather than waited on. A
         swap in flight is both authoritative and already producing fresh state,
         and blocking here would stall the caller behind a whole model load.
+
+        Sequential and up to 3s-per-slot: worst case is N * 3s if every slot
+        is unreachable. That is deliberate and unchanged here -- this is the
+        chat 409 path's reprobe, called for one request already in flight
+        that is about to fail anyway, so a few extra seconds of serialized,
+        easy-to-reason-about probing costs little. GET /status calls the
+        concurrent variant below instead; see its docstring for why.
         """
         async with httpx.AsyncClient() as probe_client:
             for name, slot in self.slots.items():
-                if slot.swap_lock.locked():
-                    logger.debug("slot=%s mid-swap, skipping reprobe", name)
-                    continue
-                async with slot.swap_lock:
-                    await slot.probe(probe_client)
+                await self._reprobe_slot_if_unlocked(name, slot, probe_client)
+
+    async def reprobe_all_slots_concurrently(self) -> None:
+        """Refresh every slot's view of its backend, all at once. Never raises.
+
+        Used only by GET /status. reprobe_all_slots (above) is sequential by
+        design for the chat 409 path, where that's fine. /status is a
+        monitoring endpoint: its worst case matters most exactly when slots
+        are down, since that's when someone is anxiously checking it or an
+        automated health check is polling it on a tight timeout. Sequential
+        probing there would cost up to N * 3s (3s per unreachable slot,
+        currently up to 2 deployed slots = 6s, growing to 9s once the third
+        slot lands) -- multiplying the outage's visible cost instead of just
+        reporting it. Probing concurrently bounds /status's worst case to
+        ~3s (one probe timeout) regardless of slot count.
+
+        Same skip-if-mid-swap rule as reprobe_all_slots, via
+        _reprobe_slot_if_unlocked; only the fan-out is different. Slots are
+        probed with one shared AsyncClient but each against its own
+        swap_lock, so there is no cross-slot contention from running them
+        concurrently.
+        """
+        async with httpx.AsyncClient() as probe_client:
+            await asyncio.gather(*(
+                self._reprobe_slot_if_unlocked(name, slot, probe_client)
+                for name, slot in self.slots.items()
+            ))
 
     async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
         """Ensure model_name is loaded on the named slot.
@@ -399,6 +441,15 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status():
+        # Refresh before reporting. The startup probe runs once, and until this
+        # was added the only other reprobe was on the chat 409 path -- so a
+        # backend that became ready later showed here as a total outage for the
+        # life of the process, while requests to it succeeded. Uses the
+        # concurrent variant (see ServerState.reprobe_all_slots_concurrently)
+        # so this endpoint's worst case is one probe timeout, not one per
+        # slot; slots mid-swap are still skipped, so this cannot stall behind
+        # a model load either way.
+        await server.reprobe_all_slots_concurrently()
         gpu = await get_gpu_info_async()
         return {
             "slots": {

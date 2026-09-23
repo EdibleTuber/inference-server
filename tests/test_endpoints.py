@@ -735,3 +735,38 @@ def test_slot_count_follows_configuration(test_config):
     ))
     server = ServerState(cfg)
     assert len(server.slots) == len(cfg.slots)
+
+
+def test_status_reprobes_before_reporting(test_config):
+    """F8: /status must not serve stale startup state.
+
+    Fails against the pre-fix code, which reports whatever the startup probe
+    left behind until some chat request happens to trigger a reprobe.
+
+    Patches reprobe_all_slots_concurrently, not reprobe_all_slots: /status
+    uses the concurrent variant so its worst case is one probe timeout
+    rather than one per slot (see ServerState.reprobe_all_slots_concurrently
+    and the /status handler for why). reprobe_all_slots itself stays
+    sequential, unchanged, for the chat 409 path.
+    """
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from manager.app import create_app
+
+    with patch("manager.app.ServerState.reprobe_all_slots_concurrently",
+               new_callable=AsyncMock) as reprobe:
+        app = create_app(test_config)
+        with TestClient(app) as client:
+            reprobe.reset_mock()          # ignore any startup-time calls
+            resp = client.get("/status")
+    assert resp.status_code == 200
+    reprobe.assert_awaited_once()
+
+
+def test_status_still_reports_every_slot(test_config):
+    from fastapi.testclient import TestClient
+    from manager.app import create_app
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        body = client.get("/status").json()
+    assert len(body["slots"]) == len(test_config.slots)

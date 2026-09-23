@@ -414,6 +414,30 @@ def test_swap_fails_returns_503(client, monkeypatch):
     assert r.json()["error"]["type"] == "swap_failed"
 
 
+def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
+    """A slot beyond the legacy main/batch pair is a valid /swap target when configured."""
+    resp = client_with_three_slots.post(
+        "/swap", json={"model": "test-model-q4", "target": "re"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["slot"] == "re"
+
+
+def test_swap_rejects_an_unconfigured_target(client_with_three_slots):
+    """The 400 body must name every configured slot, derived from config -- not a
+    hardcoded literal list -- so it stays correct as the configured slots change."""
+    app = client_with_three_slots.app
+    configured_names = list(app.state.server.slots.keys())
+    assert len(configured_names) == 3  # sanity: fixture actually wired up 3 slots
+
+    resp = client_with_three_slots.post(
+        "/swap", json={"model": "test-model-q4", "target": "nope"})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "invalid_target"
+    body = resp.json()["error"]["message"]
+    for name in configured_names:
+        assert name in body, f"400 message should name configured slot {name!r}: {body}"
+
+
 def test_swap_echo_is_canonical(client, monkeypatch):
     """A swap requested with odd casing/suffix echoes the canonical on-disk stem."""
     app = client.app

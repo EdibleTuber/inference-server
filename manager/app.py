@@ -737,10 +737,11 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             )
 
         target = body.get("target", "main")
-        if target not in ("main", "batch"):
+        if target not in server.slots:
+            valid = ", ".join(repr(n) for n in server.slots)
             return JSONResponse(
                 {"error": {"type": "invalid_target",
-                           "message": "'target' must be 'main' or 'batch'"}},
+                           "message": f"'target' must be one of: {valid}"}},
                 status_code=400,
             )
 

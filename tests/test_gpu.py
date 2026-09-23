@@ -30,3 +30,56 @@ def test_gpu_info_when_nvidia_smi_fails():
     assert info["name"] == "unknown"
     assert info["vram_total_mb"] == 0
     assert info["vram_used_mb"] == 0
+
+
+_TWO_GPU_CSV = (
+    "name, memory.total [MiB], memory.used [MiB]\n"
+    "Tesla PG500-216, 32768 MiB, 19039 MiB\n"
+    "Tesla P40, 24576 MiB, 20710 MiB\n"
+)
+
+
+def _run(stdout):
+    class R:
+        pass
+    r = R()
+    r.stdout = stdout
+    return r
+
+
+def test_reports_every_gpu():
+    with patch("manager.gpu.subprocess.run", return_value=_run(_TWO_GPU_CSV)):
+        info = get_gpu_info()
+    assert len(info["gpus"]) == 2
+    assert info["gpus"][1]["name"] == "Tesla P40"
+    assert info["gpus"][1]["vram_total_mb"] == 24576
+    assert info["gpus"][1]["vram_used_mb"] == 20710
+
+
+def test_gpus_carry_their_index():
+    with patch("manager.gpu.subprocess.run", return_value=_run(_TWO_GPU_CSV)):
+        info = get_gpu_info()
+    assert [g["index"] for g in info["gpus"]] == [0, 1]
+
+
+def test_top_level_keys_mirror_the_first_gpu():
+    """Backwards compatibility for any consumer of the single-GPU shape."""
+    with patch("manager.gpu.subprocess.run", return_value=_run(_TWO_GPU_CSV)):
+        info = get_gpu_info()
+    assert info["name"] == info["gpus"][0]["name"] == "Tesla PG500-216"
+    assert info["vram_total_mb"] == info["gpus"][0]["vram_total_mb"]
+
+
+def test_single_gpu_still_reports_one_entry():
+    csv = "name, memory.total [MiB], memory.used [MiB]\nTesla PG500-216, 32768 MiB, 19039 MiB\n"
+    with patch("manager.gpu.subprocess.run", return_value=_run(csv)):
+        info = get_gpu_info()
+    assert len(info["gpus"]) == 1
+    assert info["name"] == "Tesla PG500-216"
+
+
+def test_nvidia_smi_failure_returns_empty_gpu_list():
+    with patch("manager.gpu.subprocess.run", side_effect=FileNotFoundError):
+        info = get_gpu_info()
+    assert info["gpus"] == []
+    assert info["name"] == "unknown"

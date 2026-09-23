@@ -34,6 +34,13 @@ Group=_llama
 # file order and later assignments win, so if this line comes after
 # EnvironmentFile= it always overrides the env file's DEVICE= instead of
 # being overridden by it.
+#
+# CUDA_VISIBLE_DEVICES has no unit-level default here, deliberately: unlike
+# DEVICE=CUDA0 (a stable convention any CUDA slot can share), the UUID it
+# must hold is specific to one physical card in one machine, so it belongs
+# only in the host-local env file below -- never in this repo-committed
+# unit. See config/llama-server.env's CUDA_VISIBLE_DEVICES comment for how
+# that value is obtained and why an ordinal is not sufficient.
 Environment=DEVICE=CUDA0
 
 # Load runtime configuration. GGML_CUDA_DISABLE_GRAPHS=1 (workaround for a

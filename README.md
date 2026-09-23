@@ -316,10 +316,16 @@ Configuration for the llama-server inference backend. **The manager updates `MOD
 | Variable | Default | Description |
 |---|---|---|
 | `MODEL_PATH` | _(empty)_ | Absolute path to the currently loaded GGUF file. Leave empty on first boot; the manager sets it on the first request. |
+| `DEVICE` | `CUDA0` | `--device` selector passed to llama-server. Names an enumeration position, not a physical card — unambiguous only in combination with `CUDA_VISIBLE_DEVICES` below. |
+| `CUDA_VISIBLE_DEVICES` | _(host-specific, no safe default)_ | Restricts this process to exactly one physical GPU by UUID (`GPU-<uuid>`), so `DEVICE=CUDA0` above always names the same card regardless of enumeration order. Get the UUID with `nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv`; never use a bare ordinal (`0`) here, since that reintroduces the same enumeration-order ambiguity. See the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). |
 | `N_GPU_LAYERS` | `-1` | Number of model layers to offload to GPU. `-1` = auto (fill all available VRAM). Set to a specific number to limit GPU usage. |
-| `CTX_SIZE` | `4096` | Context window size in tokens. Larger values use more VRAM. 4096 is safe for large models on the 24GB P40. |
+| `CTX_SIZE` | `4096` | Context window size in tokens. Larger values use more VRAM. Derive this from the `llama_kv_cache` line in llama-server's own log (`-lv 5` required) after loading the target model — see the comments in `config/llama-server.env` — rather than guessing from a projection. |
 | `HOST` | `127.0.0.1` | Bind address for llama-server. Always localhost — never expose directly. |
 | `PORT` | `8081` | Port for llama-server. The manager connects here. |
+
+### `/etc/llama/llama-server-re.env`
+
+Configuration for the `re` slot's llama-server backend (P40 eGPU, not yet installed on this host — see `config/llama-server-re.env`). Same variables and semantics as `/etc/llama/llama-server.env` above; `PORT` defaults to `8084` and `CTX_SIZE` is an explicit placeholder until measured on the real card.
 
 ### `/etc/llama/manager.env`
 
@@ -340,6 +346,8 @@ Configuration for the model manager proxy service.
 | `EMBEDDINGS_PORT` | `8082` | Port where llama-embeddings listens. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
+| `SLOTS` | `main,batch` | Comma-separated slot names the manager fronts, in routing-priority order. `re` (the P40 eGPU slot) is deliberately left out until that card is installed — see `SLOT_RE_*` below. |
+| `SLOT_RE_HOST` / `SLOT_RE_PORT` / `SLOT_RE_ENV` / `SLOT_RE_UNIT` / `SLOT_RE_QUEUE_LIMIT` / `SLOT_RE_DEVICE` | `127.0.0.1` / `8084` / `/etc/llama/llama-server-re.env` / `llama-server-re.service` / `20` / _(host-specific)_ | The `re` slot's configuration, read by `manager/slot_config.py`. Not active until `re` is added to `SLOTS` above. `SLOT_RE_DEVICE` mirrors the P40's UUID set in `CUDA_VISIBLE_DEVICES` in `config/llama-server-re.env`. |
 
 ---
 
@@ -536,6 +544,53 @@ sudo systemctl disable llama-server llama-manager
 3. `llama-manager.service` starts (`After=llama-server.service`), connects to llama-server, begins accepting requests
 
 If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server fails to start. The manager starts in `error` state and waits. The first API request with a valid model name triggers a swap, which loads the model and transitions to `ready`.
+
+### Verify each GPU-backed slot is bound to the right physical card
+
+**Why this exists.** `--device CUDA0` names an enumeration position, not a physical card, and CUDA's default enumeration order is not guaranteed to match PCI bus order. Each GPU-backed unit's `CUDA_VISIBLE_DEVICES` (in its `/etc/llama/` env file) pins it to one card by UUID specifically to remove that ambiguity — see the comments in `config/llama-server.env` and `config/llama-server-re.env`, and the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). The failure mode if the pin is wrong is **silent**: the service starts, loads a model, and serves requests normally, while sitting on the wrong card. Run this procedure whenever a second GPU-backed slot (e.g. `re`) is brought up, after changing any `CUDA_VISIBLE_DEVICES` value, and once after any reboot.
+
+**The invariant this checks:** restarting any GPU-backed slot's service, in any order, with all its cards present, must never place a model on another slot's card.
+
+This procedure is written generically for however many CUDA-backed slots are active (currently `main`; `re` once the P40 eGPU is installed) — substitute the real unit/env names.
+
+1. **Record each card's identity.** With all cards physically present:
+
+   ```bash
+   nvidia-smi --query-gpu=index,name,uuid,pci.bus_id --format=csv
+   ```
+
+   Write down each row (name, UUID, bus id) somewhere durable — e.g. as a comment in the deployed env file that sets `CUDA_VISIBLE_DEVICES` for that card. The names alone are enough to tell cards apart here (e.g. `Tesla PG500-216` vs `Tesla P40`), but the UUID is what the config actually pins on, so record both.
+
+2. **Confirm each service's own log names the card you expect.** For every GPU-backed unit (e.g. `llama-server`, `llama-server-re`):
+
+   ```bash
+   sudo systemctl restart llama-server        # repeat per GPU-backed unit
+   sudo journalctl -u llama-server -b | grep ggml_cuda_init
+   ```
+
+   `ggml_cuda_init` prints the device(s) it found. With `CUDA_VISIBLE_DEVICES` set correctly it must report **exactly one** device, and its name must be the card recorded in step 1 for that slot's UUID — not the other card's name. Seeing more than one device, or the wrong name, means the pin is wrong or missing; stop and fix the env file before continuing.
+
+3. **Restart in reverse order and recheck.** Order-dependence is exactly the failure this guards against — a stale CUDA enumeration cached by one service should not leak into another's.
+
+   ```bash
+   sudo systemctl restart llama-server-re     # reverse of the order used in step 2
+   sudo systemctl restart llama-server
+   ```
+
+   Repeat the `journalctl | grep ggml_cuda_init` check from step 2 for each unit. Every service must still report the same card it did before.
+
+4. **Reboot and recheck.** CUDA enumeration order can differ across a cold boot even when it held across warm restarts.
+
+   ```bash
+   sudo reboot
+   # after it comes back up:
+   sudo journalctl -u llama-server -b | grep ggml_cuda_init
+   sudo journalctl -u llama-server-re -b | grep ggml_cuda_init
+   ```
+
+   Confirm each unit's `ggml_cuda_init` line still names the card recorded for it in step 1.
+
+If any step shows a service on the wrong card, the fix is in the relevant `/etc/llama/llama-server*.env`'s `CUDA_VISIBLE_DEVICES` — never in `DEVICE`, which should stay `CUDA0` on every GPU-backed slot.
 
 ---
 

@@ -191,17 +191,30 @@ Useful if you want to avoid waiting through a model swap, or to check queue dept
 curl http://YOUR_LAN_IP:11434/status
 ```
 
-This is illustrative — the authoritative shape is whatever `GET /status` actually returns. In particular, `gpu.gpus` has one entry per GPU card detected on the host, not a fixed number; the example below shows two only because this host has two:
+This is illustrative — the authoritative shape is whatever `GET /status` actually returns. `gpu.gpus` has one entry per GPU card detected on the host, not a fixed number; the example below shows two cards to illustrate that a multi-GPU host is reported in full, not because any particular host has exactly two:
 
 ```json
 {
-  "state": "ready",
-  "current_model": "qwen2.5-7b-instruct-q4_k_m",
-  "loading_model": null,
-  "error_message": null,
-  "queue_depth": 0,
-  "queue_limit": 20,
-  "uptime_seconds": 3421,
+  "slots": {
+    "main": {
+      "host": "127.0.0.1",
+      "port": 8081,
+      "loaded_model": "qwen2.5-7b-instruct-q4_k_m",
+      "healthy": true,
+      "last_swap_utc": "2026-09-23T14:02:11+00:00",
+      "queue_depth": 0,
+      "queue_limit": 20
+    },
+    "batch": {
+      "host": "127.0.0.1",
+      "port": 8083,
+      "loaded_model": null,
+      "healthy": false,
+      "last_swap_utc": null,
+      "queue_depth": 0,
+      "queue_limit": 20
+    }
+  },
   "gpu": {
     "name": "Tesla PG500-216",
     "vram_total_mb": 32768,
@@ -220,7 +233,8 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
         "vram_used_mb": 20710
       }
     ]
-  }
+  },
+  "uptime_seconds": 3421
 }
 ```
 

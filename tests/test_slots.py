@@ -102,6 +102,71 @@ async def test_probe_non_200_unhealthy():
 
 
 @pytest.mark.asyncio
+async def test_probe_malformed_top_level_payload_does_not_raise():
+    """A 200 whose JSON body is not an object (e.g. some other HTTP service
+    answering on a collided port, returning a bare list) must not raise.
+
+    Pre-fix, `data.get("data")` on a list raises AttributeError, which
+    propagates out of probe() -- violating "never raises" and, when probe()
+    is fanned out via asyncio.gather, capable of tearing down a shared
+    client out from under a sibling probe (see reprobe_all_slots_concurrently).
+    """
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = ["unexpected", "list", "body"]
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    # Malformed, not "backend told us nothing is loaded" -- last-known model
+    # is preserved, same as the other failure branches (connection error,
+    # non-200, non-JSON).
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_probe_malformed_data_field_does_not_raise():
+    """A 200 whose 'data' field is present but not a list must not raise."""
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"data": "not-a-list"}
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_probe_malformed_entry_does_not_raise():
+    """A 200 whose first 'data' entry is not an object must not raise.
+
+    Pre-fix, `entries[0].get("id")` on a non-dict entry (e.g. a bare string)
+    raises AttributeError.
+    """
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"data": ["not-a-dict-entry"]}
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_on_error_reprobes():
     """reconcile_on_error() runs probe() again (short-hand verification)."""
     slot = _make_slot()

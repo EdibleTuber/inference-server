@@ -156,12 +156,13 @@ class ServerState:
         swap in flight is both authoritative and already producing fresh state,
         and blocking here would stall the caller behind a whole model load.
 
-        Sequential and up to 3s-per-slot: worst case is N * 3s if every slot
-        is unreachable. That is deliberate and unchanged here -- this is the
-        chat 409 path's reprobe, called for one request already in flight
-        that is about to fail anyway, so a few extra seconds of serialized,
-        easy-to-reason-about probing costs little. GET /status calls the
-        concurrent variant below instead; see its docstring for why.
+        Sequential: worst case is N slots times the per-slot probe timeout
+        (see slot.probe) if every slot is unreachable. That is deliberate
+        and unchanged here -- this is the chat 409 path's reprobe, called
+        for one request already in flight that is about to fail anyway, so
+        a few extra seconds of serialized, easy-to-reason-about probing
+        costs little. GET /status calls the concurrent variant below
+        instead; see its docstring for why.
         """
         async with httpx.AsyncClient() as probe_client:
             for name, slot in self.slots.items():
@@ -175,23 +176,49 @@ class ServerState:
         monitoring endpoint: its worst case matters most exactly when slots
         are down, since that's when someone is anxiously checking it or an
         automated health check is polling it on a tight timeout. Sequential
-        probing there would cost up to N * 3s (3s per unreachable slot,
-        currently up to 2 deployed slots = 6s, growing to 9s once the third
-        slot lands) -- multiplying the outage's visible cost instead of just
-        reporting it. Probing concurrently bounds /status's worst case to
-        ~3s (one probe timeout) regardless of slot count.
+        probing there would cost up to N * (the per-slot probe timeout) if
+        every slot is unreachable -- multiplying the outage's visible cost
+        instead of just reporting it. Probing concurrently bounds /status's
+        worst case to one probe timeout regardless of slot count.
 
         Same skip-if-mid-swap rule as reprobe_all_slots, via
         _reprobe_slot_if_unlocked; only the fan-out is different. Slots are
         probed with one shared AsyncClient but each against its own
         swap_lock, so there is no cross-slot contention from running them
         concurrently.
+
+        return_exceptions=True is load-bearing, not decorative. Without it,
+        asyncio.gather re-raises the first child exception immediately,
+        without awaiting or cancelling its siblings -- so this method's
+        `async with httpx.AsyncClient()` block would exit and close the
+        shared client while another slot's probe is still in flight. That
+        sibling's in-flight request then fails with "client has been
+        closed", which manifests as a *healthy* slot being marked
+        unhealthy -- exactly the false-outage failure mode this task exists
+        to eliminate, and one the sequential 409-path version cannot
+        produce (a raising slot there simply stops that loop; it never
+        tears down a client another slot is still using). slot.probe()
+        itself never raises (see its docstring), so this is defense in
+        depth against a probe somehow still raising -- gather waits for
+        every child either way, so the client is never closed early, and
+        any exception a child does produce is logged and otherwise ignored
+        rather than propagated to the /status caller.
         """
         async with httpx.AsyncClient() as probe_client:
-            await asyncio.gather(*(
-                self._reprobe_slot_if_unlocked(name, slot, probe_client)
-                for name, slot in self.slots.items()
-            ))
+            results = await asyncio.gather(
+                *(
+                    self._reprobe_slot_if_unlocked(name, slot, probe_client)
+                    for name, slot in self.slots.items()
+                ),
+                return_exceptions=True,
+            )
+            for name, result in zip(self.slots, results):
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "slot=%s reprobe raised during concurrent /status "
+                        "reprobe (should not happen; slot.probe is expected "
+                        "to never raise): %s", name, result,
+                    )
 
     async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
         """Ensure model_name is loaded on the named slot.

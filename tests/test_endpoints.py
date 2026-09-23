@@ -770,3 +770,50 @@ def test_status_still_reports_every_slot(test_config):
     with TestClient(app) as client:
         body = client.get("/status").json()
     assert len(body["slots"]) == len(test_config.slots)
+
+
+def test_status_survives_a_raising_slot_probe(test_config):
+    """A slot whose probe raises must not 500 /status or corrupt a sibling.
+
+    Fix-round-1 regression test. Without return_exceptions=True,
+    asyncio.gather propagates the first child exception immediately,
+    without awaiting or cancelling siblings -- so reprobe_all_slots_concurrently's
+    `async with httpx.AsyncClient()` block exits and closes the shared
+    client while another slot's probe is still in flight. On the real
+    server that manifests as the in-flight sibling's request failing with
+    "client has been closed", swallowed by slot.probe's own try/except as
+    healthy=False -- turning a genuinely healthy slot into a reported
+    outage, and (per the reviewer's repro) 500ing /status outright.
+
+    slot.probe() itself is supposed to never raise (see its docstring and
+    the malformed-payload tests in test_slots.py); this poisons main's
+    probe directly to simulate some other bug reaching past that
+    guarantee, so the test isolates reprobe_all_slots_concurrently's own
+    fan-out behavior rather than re-testing slot.probe.
+    """
+    from fastapi.testclient import TestClient
+    from manager.app import create_app
+
+    app = create_app(test_config)
+
+    with TestClient(app) as client:
+        server = client.app.state.server
+        main = server.slots["main"]
+        batch = server.slots["batch"]
+
+        # batch starts healthy with a known model (as the startup probe
+        # against the live test backend already made it, per the /status
+        # tests above) -- reprobing must not disturb it.
+        assert batch.healthy is True
+        batch_model_before = batch.loaded_model
+
+        async def raise_immediately(probe_client):
+            raise AttributeError("boom: simulated bug past slot.probe's own guard")
+
+        main.probe = AsyncMock(side_effect=raise_immediately)
+
+        resp = client.get("/status")
+
+    assert resp.status_code == 200
+    assert batch.healthy is True
+    assert batch.loaded_model == batch_model_before

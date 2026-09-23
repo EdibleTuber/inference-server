@@ -125,11 +125,31 @@ has a history of host-RAM OOM — see the `--cache-ram 0` rationale in
 - `manager/routing.py:23-28` hardcodes `main` then `batch`.
 - `manager/config.py` carries `batch_*` fields rather than a slot collection.
 
-### F8 — Live defect: slots report unhealthy while their backends serve
+### F8 — Live defect: `/status` reports stale startup state indefinitely
 
-`/status` currently returns `loaded_model: null, healthy: false` for both slots while `:8081`
-serves gemma-4-26b and `:8083` serves gemma-4-E4B. Routing and `/swap` depend on this state, so
-it must be understood before the slot code is generalized. Cause not yet diagnosed.
+`/status` returned `loaded_model: null, healthy: false` for both slots while `:8081` served
+gemma-4-26b and `:8083` served gemma-4-E4B.
+
+Diagnosed, and narrower than it first appeared. `lifespan` (`manager/app.py:336-347`) probes each
+slot once at startup. `reprobe_all_slots` (`manager/app.py:131`) exists — added by `e222feb` for
+exactly this startup race, and its docstring describes this very symptom — but it is called only
+from the chat-completions 409 path (`manager/app.py:478`). `/status` (`manager/app.py:404-414`)
+is a passive reader of `to_status_dict()` and never triggers a probe.
+
+Confirmed by experiment on the live server:
+
+```
+/status before any chat request : {'main': (None, False), 'batch': (None, False)}
+one chat request for gemma-4-26b -> 200, served correctly
+/status after                    : {'main': ('gemma-4-26b-a4b-it-q4_k_m', True),
+                                    'batch': ('gemma-4-E4B-it-Q4_K_M', True)}
+```
+
+**So the routing path self-heals and only the monitoring surface lies.** This is a reporting bug,
+not a routing bug, and therefore **not a prerequisite** for the slot generalization — it is an
+independent small fix. It still matters: `/status` is what a human or a dashboard consults to
+decide whether the fleet is healthy, and it currently reads as a total outage when nothing is
+wrong.
 
 ### F9 — agent_core auto-swaps on 409
 
@@ -238,9 +258,11 @@ before changing it.
 current answer is 409, and agent_core reacts by calling `POST /swap`. Decide which slot, if any,
 such a request may evict, and make that explicit rather than emergent.
 
-**The F8 defect is a prerequisite, not a sub-task.** Diagnose why `/status` reports both slots
-unhealthy while both backends serve before generalizing the slot code, or the generalization
-will be built on a misunderstanding of how slot state is maintained.
+**F8 is an independent fix, not a prerequisite.** Now that it is diagnosed, `/status` simply
+needs to reflect reality — either by re-probing before reporting, or by a periodic background
+probe that serves every reader rather than only this one endpoint. Prefer the latter if any
+other surface depends on freshness; it stops the same class of bug recurring at the next passive
+reader, rather than patching this one call site.
 
 **Testing.** Routing and configuration are pure and should be unit-tested with three slots
 configured. Every regression test must be verified failing against the pre-fix code. Prefer
@@ -269,5 +291,8 @@ Deferred until the hardware arrives; scope recorded so it is not lost.
 ## Open questions
 
 1. Which Qwen3.8-27B quantization, settled by the Phase 2 measurement rather than by projection.
-2. The cause of F8, which Phase 3 depends on.
+2. Whether Qwen3.8-27B is dense, and whether its GGUF architecture is `qwen35` — both taken from
+   published material, both checked in Phase 2, and the first underpins the model choice.
 3. Whether any consumer depends on the single-GPU `/status` shape before Phase 3 changes it.
+4. For F8, whether to re-probe inside `/status` or add a periodic background probe. The periodic
+   probe serves every future reader; the per-endpoint fix is smaller. Decide in the plan.

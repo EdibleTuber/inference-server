@@ -31,7 +31,7 @@ class SlotState:
     The queue, queue_event, and swap_lock are per-slot so work on one
     slot does not interfere with the other.
     """
-    name: str                               # "main" | "batch"
+    name: str                               # configured slot identifier
     host: str
     port: int
     env_file: str                           # path for the swap to rewrite

@@ -10,6 +10,8 @@ need to deal with raw env vars or string parsing.
 import os
 from dataclasses import dataclass
 
+from manager.slot_config import SlotConfig, build_slots
+
 
 def _int_env(key: str, default: int) -> int:
     """Read an integer from an env var with a clear error on bad values."""
@@ -49,6 +51,7 @@ class ManagerConfig:
         batch_server_unit: systemd unit name for the batch llama-server.
         batch_queue_limit: Max number of requests to hold in the batch FIFO queue.
         batch_model_default: Default model name for the batch slot.
+        slots: Ordered slot list built from SLOTS and SLOT_<NAME>_* (or legacy) env vars.
     """
     host: str
     port: int
@@ -70,6 +73,7 @@ class ManagerConfig:
     batch_server_unit: str
     batch_queue_limit: int
     batch_model_default: str
+    slots: tuple[SlotConfig, ...] = ()
 
     @property
     def llama_server_url(self) -> str:
@@ -110,4 +114,5 @@ class ManagerConfig:
             batch_server_unit=os.getenv("BATCH_SERVER_UNIT", "llama-server-batch.service"),
             batch_queue_limit=_int_env("BATCH_QUEUE_LIMIT", 20),
             batch_model_default=os.getenv("BATCH_MODEL_DEFAULT", "gemma-4-E4B-it-Q4_K_M"),
+            slots=build_slots(),
         )

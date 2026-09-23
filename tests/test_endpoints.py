@@ -792,17 +792,13 @@ class _FakeV1ModelsServer:
         import http.server
         import threading
 
-        self.delay = 0.0
         self.body: dict = {"data": []}
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 import json as _json
-                import time as _time
                 if self.path == "/v1/models":
-                    if outer.delay:
-                        _time.sleep(outer.delay)
                     payload = _json.dumps(outer.body).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -837,15 +833,43 @@ def fake_v1_models_backend():
 def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backend):
     """A slot whose probe raises must not 500 /status or corrupt a sibling.
 
-    Fix-round-1/round-2 regression test. Without return_exceptions=True,
-    asyncio.gather propagates the first child exception immediately,
-    without awaiting or cancelling siblings -- so reprobe_all_slots_concurrently's
-    `async with httpx.AsyncClient()` block exits and closes the shared
-    client while another slot's probe is still in flight. That sibling's
-    in-flight request then fails with "Cannot send a request, as the
-    client has been closed" (or similar), swallowed by slot.probe's own
-    try/except as healthy=False -- turning a genuinely healthy slot into a
-    reported outage, and (per the reviewer's repro) 500ing /status outright.
+    Fix-round-1/round-2/round-3 regression test. Without
+    return_exceptions=True, asyncio.gather propagates the first child
+    exception immediately, without awaiting or cancelling siblings -- so
+    reprobe_all_slots_concurrently's `async with httpx.AsyncClient()`
+    block exits and closes the shared client while another slot's probe
+    may still be running. On the real, unforced interleaving (confirmed by
+    the round-3 reviewer: 9/9 runs, batch.probe unwrapped, no client-side
+    sleep, backend delays of 0/50/300ms), the sibling is NEVER corrupted --
+    asyncio.gather's ensure_future queues both tasks' first step before
+    the awaiting coroutine suspends, so the sibling always reaches
+    client.get(...) and suspends inside connection setup before aclose()
+    runs. The 500 IS the real, every-run production symptom (main's
+    exception propagates uncaught, past nothing that would catch it, out
+    of the /status handler); the sibling-corruption limb is NOT a
+    naturally-occurring production race.
+
+    This test therefore does two different things, and is honest about
+    the difference:
+      - it demonstrates the 500 the way production actually produces it
+        (no forcing needed -- any raising slot 500s /status pre-fix);
+      - it additionally pins a PROPERTY -- "even if a sibling's request
+        happens to still be pending when the client closes, it must not
+        be corrupted" -- against a class of wrong fixes (e.g. one that
+        adds return_exceptions=True but also cancels siblings, or one
+        that closes the client eagerly). To exercise that property at all
+        requires deliberately forcing an interleaving production does not
+        naturally produce, since gather's task-scheduling order means the
+        sibling normally finishes sending before the raise propagates.
+        batch's probe is wrapped to `await asyncio.sleep(...)` BEFORE
+        calling the real, unmodified SlotState.probe against a real fake
+        backend, guaranteeing the shared client is already closed by the
+        time batch's real client.get() call happens, so batch
+        deterministically hits the client's real
+        "if self._state == ClientState.CLOSED: raise RuntimeError(...)"
+        check at send() ENTRY (httpx/_client.py) -- this is a request
+        that never got dispatched, not one that was in flight and got torn
+        down mid-request.
 
     The 'batch' slot is pointed at fake_v1_models_backend (a real HTTP
     server this test controls) rather than test_config's real port, so
@@ -854,26 +878,16 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     other /status tests in this module, which do rely on that real
     backend and are unaffected by this one using a fake instead).
 
-    Getting the corrupting *race* itself to happen deterministically is
-    the harder part: a plain server-side response delay does NOT reliably
-    reproduce it, because asyncio schedules both tasks' first steps before
-    either completes, so batch's request is normally already sent (and
-    survives the later aclose()) by the time main's near-instant raise
-    propagates -- confirmed empirically with a minimal repro outside this
-    suite. To make the ordering deterministic rather than a timing race,
-    batch's probe is wrapped to `await asyncio.sleep(...)` BEFORE calling
-    the real, unmodified SlotState.probe against the real fake backend.
-    That sleep guarantees main's raise has already propagated and closed
-    the shared client by the time batch's real client.get() call actually
-    happens, so batch deterministically hits the client's real "already
-    closed" check -- the same failure mode the reviewer's repro named --
-    rather than probabilistically racing real socket I/O.
-
-    The assertions on batch.healthy / batch.loaded_model after the
-    /status call are the part that actually discriminates a broken
-    gather: a version that checks only resp.status_code == 200 would miss
-    a healthy sibling being fabricated as dead (see the mutation evidence
-    in the round-2 report).
+    The final assertion checks loaded_model against a SECOND, distinct
+    fake-backend body set just before the /status call (not the same
+    "batch-model" the startup probe already saw) -- this closes a
+    coverage gap the round-2 version left open: with the STALE body, a
+    wrong fix that cancelled the sibling instead of awaiting it (silently
+    leaving batch's prior state untouched) would still pass every
+    assertion, since "never probed" and "probed successfully" look
+    identical when the answer doesn't change. Asserting on the NEW value
+    proves the probe actually ran to completion, not merely that nothing
+    clobbered its old result.
 
     slot.probe() itself is supposed to never raise (see its docstring and
     the malformed-payload tests in test_slots.py); this poisons main's
@@ -916,6 +930,16 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
         assert batch.healthy is True
         assert batch.loaded_model == "batch-model"
 
+        # Change what the fake backend reports BEFORE triggering the
+        # reprobe below, to a value the startup probe never saw. The final
+        # assertion checks for THIS value, not "batch-model" again -- so a
+        # wrong fix that skips/cancels the sibling's probe instead of
+        # awaiting it (leaving batch's old state untouched) fails here,
+        # instead of accidentally passing because "never probed" and
+        # "probed successfully" look identical when the value doesn't
+        # change. See docstring's "coverage gap" paragraph.
+        fake_v1_models_backend.body = {"data": [{"id": "batch-model-v2.gguf"}]}
+
         async def raise_immediately(probe_client):
             raise AttributeError("boom: simulated bug past slot.probe's own guard")
 
@@ -949,5 +973,8 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     # the status-code assertion below: a genuinely healthy sibling must not
     # be fabricated as dead just because another slot's probe raised.
     assert batch.healthy is True
-    assert batch.loaded_model == "batch-model"
+    # The value changed above, not the one the startup probe already saw --
+    # this proves the reprobe actually ran to completion rather than a
+    # wrong fix silently leaving batch's prior state untouched.
+    assert batch.loaded_model == "batch-model-v2"
     assert resp.status_code == 200

@@ -189,19 +189,32 @@ class ServerState:
 
         return_exceptions=True is load-bearing, not decorative. Without it,
         asyncio.gather re-raises the first child exception immediately,
-        without awaiting or cancelling its siblings -- so this method's
-        `async with httpx.AsyncClient()` block would exit and close the
-        shared client while another slot's probe is still in flight. That
-        sibling's in-flight request then fails with "client has been
-        closed", which manifests as a *healthy* slot being marked
-        unhealthy -- exactly the false-outage failure mode this task exists
-        to eliminate, and one the sequential 409-path version cannot
-        produce (a raising slot there simply stops that loop; it never
-        tears down a client another slot is still using). slot.probe()
-        itself never raises (see its docstring), so this is defense in
-        depth against a probe somehow still raising -- gather waits for
-        every child either way, so the client is never closed early, and
-        any exception a child does produce is logged and otherwise ignored
+        without awaiting or cancelling its siblings, and that exception
+        would propagate straight out of this method -- past nothing that
+        would catch it -- and 500 /status. That is the real, every-run
+        production symptom of dropping this flag: confirmed by testing
+        the un-forced, naturally-occurring interleaving (main.probe
+        raising, batch.probe untouched, real backend delays of 0/50/300ms):
+        9/9 runs gave /status a 500, with batch's own state left
+        untouched (asyncio.gather's ensure_future queues both slots' first
+        step before either completes, so in practice a sibling already
+        reaches client.get() and suspends inside connection setup before
+        this method's `async with httpx.AsyncClient()` block would exit
+        and close the shared client -- so the natural race here does not
+        corrupt a sibling's health, only crashes the endpoint).
+
+        Guarding against a sibling being corrupted anyway is still the
+        right design, not overkill: it is one `async with` block away from
+        happening (e.g. if a slower probe start, more slots, or a
+        different scheduler ever changes that interleaving), and
+        `tests/test_endpoints.py::test_status_survives_a_raising_slot_probe`
+        deliberately forces that interleaving to pin it as a property,
+        rather than relying on it never mattering. slot.probe() itself
+        never raises (see its docstring), so return_exceptions=True is
+        defense in depth against a probe somehow still raising either
+        way -- gather waits for every child regardless, so the client is
+        never closed while a sibling might still be using it, and any
+        exception a child does produce is logged and otherwise ignored
         rather than propagated to the /status caller.
         """
         async with httpx.AsyncClient() as probe_client:

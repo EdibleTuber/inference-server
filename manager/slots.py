@@ -1,10 +1,10 @@
 """
 Per-slot state for the dual-slot model manager.
 
-Each inference backend ('main', 'batch') has its own SlotState containing
-loaded-model tracking, health, swap lock, queue, and an event the handler
-signals when a new item is enqueued. Swap operations and routing decisions
-read/write this state in-process.
+Each inference backend has its own SlotState containing loaded-model
+tracking, health, swap lock, queue, and an event the handler signals when a
+new item is enqueued. Which backends exist is configuration, not code. Swap
+operations and routing decisions read/write this state in-process.
 """
 from __future__ import annotations
 

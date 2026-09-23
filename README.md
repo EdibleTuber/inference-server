@@ -551,6 +551,8 @@ If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server f
 
 **The invariant this checks:** restarting any GPU-backed slot's service, in any order, with all its cards present, must never place a model on another slot's card.
 
+**How the mapping is read.** `nvidia-smi --query-compute-apps` reports, per running CUDA process, the PID and the **physical card UUID** it is actually using — the invariant's exact question, read directly from the driver rather than inferred from a log line. `ps -o unit=` then maps that PID to the systemd unit that owns it. Together these two commands answer "which physical card is this service on" independently of llama.cpp's version or log verbosity. (An earlier draft of this procedure grepped the log for `ggml_cuda_init`; on this host's current build that string appears only in a CUDA-init *failure* message, never on a successful startup, so the grep silently matched nothing regardless of whether the binding was right or wrong — exactly the failure mode this section exists to catch. Do not resurrect that check.)
+
 This procedure is written generically for however many CUDA-backed slots are active (currently `main`; `re` once the P40 eGPU is installed) — substitute the real unit/env names.
 
 1. **Record each card's identity.** With all cards physically present:
@@ -561,14 +563,21 @@ This procedure is written generically for however many CUDA-backed slots are act
 
    Write down each row (name, UUID, bus id) somewhere durable — e.g. as a comment in the deployed env file that sets `CUDA_VISIBLE_DEVICES` for that card. The names alone are enough to tell cards apart here (e.g. `Tesla PG500-216` vs `Tesla P40`), but the UUID is what the config actually pins on, so record both.
 
-2. **Confirm each service's own log names the card you expect.** For every GPU-backed unit (e.g. `llama-server`, `llama-server-re`):
+2. **Confirm each service's actual card, from the driver.** For every GPU-backed unit (e.g. `llama-server`, `llama-server-re`):
 
    ```bash
    sudo systemctl restart llama-server        # repeat per GPU-backed unit
-   sudo journalctl -u llama-server -b | grep ggml_cuda_init
+
+   # Map each running CUDA process to the physical card it is on:
+   nvidia-smi --query-compute-apps=pid,gpu_uuid,used_gpu_memory --format=csv
+
+   # Map each PID from that output to the systemd unit that owns it:
+   ps -o pid,unit= -p <pid>
    ```
 
-   `ggml_cuda_init` prints the device(s) it found. With `CUDA_VISIBLE_DEVICES` set correctly it must report **exactly one** device, and its name must be the card recorded in step 1 for that slot's UUID — not the other card's name. Seeing more than one device, or the wrong name, means the pin is wrong or missing; stop and fix the env file before continuing.
+   For each GPU-backed unit, its PID's `gpu_uuid` must be the UUID recorded in step 1 for the card that slot's `CUDA_VISIBLE_DEVICES` names — not the other card's UUID. Seeing the wrong UUID, or no row at all for a unit that should be running, means the pin is wrong or the service isn't actually up; stop and fix the env file before continuing.
+
+   As a secondary, log-based cross-check (not the primary signal — see the note above): `llama_prepare_model_devices: using device CUDA0 (...)` does name the card, but only appears with `-lv 5`, which is not something to add to the units permanently just to serve this check. Add `-lv 5` to the command temporarily if you want a second line of evidence.
 
 3. **Restart in reverse order and recheck.** Order-dependence is exactly the failure this guards against — a stale CUDA enumeration cached by one service should not leak into another's.
 
@@ -577,18 +586,18 @@ This procedure is written generically for however many CUDA-backed slots are act
    sudo systemctl restart llama-server
    ```
 
-   Repeat the `journalctl | grep ggml_cuda_init` check from step 2 for each unit. Every service must still report the same card it did before.
+   Repeat the `nvidia-smi --query-compute-apps` + `ps -o unit=` check from step 2 for each unit. Every service must still map to the same card UUID it did before.
 
 4. **Reboot and recheck.** CUDA enumeration order can differ across a cold boot even when it held across warm restarts.
 
    ```bash
    sudo reboot
    # after it comes back up:
-   sudo journalctl -u llama-server -b | grep ggml_cuda_init
-   sudo journalctl -u llama-server-re -b | grep ggml_cuda_init
+   nvidia-smi --query-compute-apps=pid,gpu_uuid,used_gpu_memory --format=csv
+   ps -o pid,unit= -p <pid>   # for each pid from the query above
    ```
 
-   Confirm each unit's `ggml_cuda_init` line still names the card recorded for it in step 1.
+   Confirm each unit still maps to the card UUID recorded for it in step 1.
 
 If any step shows a service on the wrong card, the fix is in the relevant `/etc/llama/llama-server*.env`'s `CUDA_VISIBLE_DEVICES` — never in `DEVICE`, which should stay `CUDA0` on every GPU-backed slot.
 

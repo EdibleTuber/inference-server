@@ -394,6 +394,26 @@ def test_swap_invalid_target(client):
     assert r.json()["error"]["type"] == "invalid_target"
 
 
+def test_swap_non_string_target_returns_structured_400_not_500(client):
+    """A non-string target (e.g. a list or dict) must fail like any other invalid
+    target -- a structured 400 -- not crash the handler.
+
+    `target not in server.slots` is a dict membership test, which hashes its
+    operand; an unhashable target (list, dict) raises TypeError from inside the
+    handler, and with no custom exception handler registered Starlette turns
+    that into a generic 500 -- unlike the old tuple-membership check, which
+    compared by equality and never hashed.
+    """
+    from fastapi.testclient import TestClient
+    unraising_client = TestClient(client.app, raise_server_exceptions=False)
+
+    for bad_target in (["main"], {"main": 1}):
+        r = unraising_client.post(
+            "/swap", json={"model": "test-model-q4", "target": bad_target})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"]["type"] == "invalid_target"
+
+
 def test_swap_missing_model(client):
     r = client.post("/swap", json={"target": "main"})
     assert r.status_code == 400

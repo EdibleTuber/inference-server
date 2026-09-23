@@ -49,17 +49,6 @@ _DEFAULTS = {
               "systemd_unit": "llama-server-batch.service", "queue_limit": 20},
 }
 
-# Fallback port for a slot with no entry in _DEFAULTS (i.e. not "main" or
-# "batch") and no SLOT_<NAME>_PORT / legacy variable set. Deliberately not
-# one of the ports already in use by this service (manager 8080, main 8081,
-# embeddings 8082, batch 8083), so an unconfigured extra slot fails loudly
-# (a connection refused / bind conflict at the port it's told to use) rather
-# than silently colliding with an existing one. Real deployments should
-# always set SLOT_<NAME>_PORT explicitly; this only keeps enumeration
-# (listing slot names/order) from raising when a slot is intentionally
-# left otherwise unconfigured, e.g. in tests.
-_GENERIC_DEFAULT_PORT = 8090
-
 
 @dataclass(frozen=True)
 class SlotConfig:
@@ -117,7 +106,7 @@ def build_slots(getenv=os.getenv) -> tuple[SlotConfig, ...]:
     for name in names:
         d = _DEFAULTS.get(name, {})
         host, _ = _lookup(getenv, name, "host", d.get("host", "127.0.0.1"))
-        port_raw, port_src = _lookup(getenv, name, "port", d.get("port", _GENERIC_DEFAULT_PORT))
+        port_raw, port_src = _lookup(getenv, name, "port", d.get("port"))
         env_file, _ = _lookup(getenv, name, "env_file", d.get("env_file"))
         unit, _ = _lookup(getenv, name, "systemd_unit", d.get("systemd_unit"))
         ql_raw, ql_src = _lookup(getenv, name, "queue_limit", d.get("queue_limit", 20))

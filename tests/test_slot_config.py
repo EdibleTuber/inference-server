@@ -35,23 +35,30 @@ def test_main_reads_legacy_llama_server_vars():
 
 
 def test_batch_reads_legacy_batch_server_vars():
-    # Same reasoning as above: use a systemd_unit value distinct from the
-    # "batch" default ("llama-server-batch.service") so this genuinely
-    # exercises the legacy BATCH_SERVER_UNIT lookup rather than passing
-    # vacuously because the default happens to match.
+    # Every value here is deliberately distinct from _DEFAULTS["batch"]
+    # (port 8083, env_file ".../llama-server-batch.env", systemd_unit
+    # "llama-server-batch.service", queue_limit 20). If any assertion used
+    # a value that matched the default, it would keep passing even when the
+    # legacy lookup for that field was broken and silently fell through to
+    # the hardcoded default instead of reading the env var.
     slots = build_slots(_env({
         "BATCH_SERVER_HOST": "127.0.0.1",
-        "BATCH_SERVER_PORT": "8083",
+        "BATCH_SERVER_PORT": "8099",
+        "BATCH_SERVER_ENV": "/etc/llama/batch.env",
         "BATCH_SERVER_UNIT": "custom-llama-batch.service",
-        "BATCH_QUEUE_LIMIT": "20",
+        "BATCH_QUEUE_LIMIT": "45",
     }))
     batch = next(s for s in slots if s.name == "batch")
-    assert (batch.port, batch.queue_limit) == (8083, 20)
+    assert (batch.port, batch.queue_limit) == (8099, 45)
+    assert batch.env_file == "/etc/llama/batch.env"
     assert batch.systemd_unit == "custom-llama-batch.service"
 
 
 def test_slots_var_controls_membership_and_order():
-    slots = build_slots(_env({"SLOTS": "main,re,batch"}))
+    # SLOT_RE_PORT is required here: an unconfigured port raises (see
+    # test_unconfigured_port_raises_and_names_the_variable below), and this
+    # test is only about membership/order, not port validation.
+    slots = build_slots(_env({"SLOTS": "main,re,batch", "SLOT_RE_PORT": "8084"}))
     assert [s.name for s in slots] == ["main", "re", "batch"]
 
 
@@ -80,7 +87,9 @@ def test_prefixed_var_overrides_legacy_for_main():
 
 
 def test_slot_names_are_normalised_and_whitespace_tolerant():
-    slots = build_slots(_env({"SLOTS": " main , RE "}))
+    # SLOT_RE_PORT is required for the same reason as in
+    # test_slots_var_controls_membership_and_order above.
+    slots = build_slots(_env({"SLOTS": " main , RE ", "SLOT_RE_PORT": "8084"}))
     assert [s.name for s in slots] == ["main", "re"]
 
 
@@ -97,6 +106,14 @@ def test_empty_slots_var_is_rejected():
 def test_bad_port_names_the_variable():
     with pytest.raises(ValueError, match="SLOT_RE_PORT"):
         build_slots(_env({"SLOTS": "re", "SLOT_RE_PORT": "not-a-number"}))
+
+
+def test_unconfigured_port_raises_and_names_the_variable():
+    """A slot with no default (not main/batch) and no configured port must
+    fail loudly, naming the variable the operator needs to set, rather than
+    silently picking a port that could collide with another slot."""
+    with pytest.raises(ValueError, match="SLOT_RE_PORT"):
+        build_slots(_env({"SLOTS": "re"}))
 
 
 def test_slot_config_is_frozen():

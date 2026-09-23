@@ -651,3 +651,43 @@ def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
     assert r.status_code == 409
     assert "batch" not in probed, probed
     assert "main" in probed, probed
+
+
+def test_server_builds_every_configured_slot(test_config):
+    """Slot construction follows configuration, including a third slot."""
+    from dataclasses import replace
+    from manager.slot_config import SlotConfig
+    from manager.app import ServerState
+
+    cfg = replace(test_config, slots=(
+        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
+        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+    ))
+    server = ServerState(cfg)
+
+    assert list(server.slots) == ["main", "batch", "re"]
+    assert server.slots["re"].port == 8084
+    assert server.slots["re"].queue.max_size == 30
+    assert server.slots["re"].env_file == "/tmp/re.env"
+    assert server.slots["re"].systemd_unit == "re.service"
+    assert all(s.swapper is not None for s in server.slots.values())
+
+
+def test_slot_count_follows_configuration(test_config):
+    """A relationship, not a literal: adding a slot must not need a test edit.
+
+    Deliberately uses a 3-slot config (not test_config's own 2) so this
+    can't pass by coincidence against code that still hardcodes main/batch.
+    """
+    from dataclasses import replace
+    from manager.slot_config import SlotConfig
+    from manager.app import ServerState
+
+    cfg = replace(test_config, slots=(
+        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
+        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+    ))
+    server = ServerState(cfg)
+    assert len(server.slots) == len(cfg.slots)

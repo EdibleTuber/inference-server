@@ -41,6 +41,7 @@ def tmp_batch_env_file(tmp_path):
 def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
     """Create a ManagerConfig pointing at temporary test paths."""
     from manager.config import ManagerConfig
+    from manager.slot_config import SlotConfig
     return ManagerConfig(
         host="127.0.0.1",
         port=8080,
@@ -62,6 +63,18 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
         batch_server_unit="llama-server-batch.service",
         batch_queue_limit=20,
         batch_model_default="test-batch-model",
+        slots=(
+            SlotConfig(
+                name="main", host="127.0.0.1", port=8081,
+                env_file=tmp_env_file, systemd_unit="llama-server.service",
+                queue_limit=20,
+            ),
+            SlotConfig(
+                name="batch", host="127.0.0.1", port=8083,
+                env_file=tmp_batch_env_file, systemd_unit="llama-server-batch.service",
+                queue_limit=20,
+            ),
+        ),
     )
 
 

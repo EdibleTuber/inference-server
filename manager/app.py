@@ -55,30 +55,25 @@ class ServerState:
     def __init__(self, config: ManagerConfig):
         self._config = config
 
-        # Build slots dict.
-        self.slots: dict[str, SlotState] = {
-            "main": SlotState(
-                name="main",
-                host=config.llama_server_host,
-                port=config.llama_server_port,
-                env_file=config.llama_server_env,
-                systemd_unit=config.llama_server_unit,
-                queue=RequestQueue(max_size=config.queue_limit),
-            ),
-            "batch": SlotState(
-                name="batch",
-                host=config.batch_server_host,
-                port=config.batch_server_port,
-                env_file=config.batch_server_env,
-                systemd_unit=config.batch_server_unit,
-                queue=RequestQueue(max_size=config.batch_queue_limit),
-            ),
-        }
+        # Build slots dict from configuration, in configured order. Order is
+        # significant -- it is the routing priority resolve_slot walks --
+        # and dict preserves insertion order, so iterating config.slots here
+        # is what makes server.slots ordered the same way.
+        self.slots: dict[str, SlotState] = {}
+        for sc in config.slots:
+            self.slots[sc.name] = SlotState(
+                name=sc.name,
+                host=sc.host,
+                port=sc.port,
+                env_file=sc.env_file,
+                systemd_unit=sc.systemd_unit,
+                queue=RequestQueue(max_size=sc.queue_limit),
+            )
 
         # One swapper per slot. Attach dynamically to avoid circular import
         # (SlotState does not reference ModelSwapper).
-        self.slots["main"].swapper = ModelSwapper(config, slot=self.slots["main"])
-        self.slots["batch"].swapper = ModelSwapper(config, slot=self.slots["batch"])
+        for slot in self.slots.values():
+            slot.swapper = ModelSwapper(config, slot=slot)
 
         # Collection retrieval (unchanged).
         self.db: VectorDB | None = None

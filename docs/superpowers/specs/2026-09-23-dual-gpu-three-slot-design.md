@@ -208,6 +208,57 @@ prompt-processing benchmark on gemma-4-26b compared against a baseline captured 
 rebuild. If that number does not move, the Volta path did not engage and the rebuild did not do
 what F1 predicts — treat an unchanged benchmark as a failure, not a pass.
 
+### Phase 1 build record (completed 2026-09-23)
+
+```
+llama.cpp b11136 = 057494f93f859308297cf8d21eee88e3fa17603c
+installed to      /opt/llama/llamacpp-b11136   (bin/ + lib/, self-contained)
+bin/llama-server  sha256 5a0337d681469286d446118e9dbe9de340252299c494c99b9bf24d17c5f6475c
+replaced          sha256 2eac9d2ffe8e275ba98c4eeff663f288685688af49c090b51a10c5f2e6bf0a0a
+                  kept at /opt/llama/bin/llama-server.b8851-e365e658f for rollback
+/opt/llama/bin/llama-server is now a symlink into the versioned prefix, so the
+units need no edit and a rollback is one symlink.
+```
+
+Measured, same model and flags on CUDA0 before and after:
+
+| | prompt eval | generation |
+|---|---|---|
+| gemma-4-E4B, old `sm_61` binary | 2338.5 tok/s | 74.8 tok/s |
+| gemma-4-E4B, new `sm_61;70` binary | 3181.5 tok/s | 96.6 tok/s |
+| gemma-4-26b deployed, before | 865.8 tok/s | 81.1 tok/s |
+| gemma-4-26b deployed, after | 1418.1 tok/s | 90.4 tok/s |
+
+F1 predicted the Volta path was unreachable; enabling it is worth **+36% to +64%**
+on prompt processing. The verification criterion was "if this number does not move, the
+rebuild did not work" — it moved.
+
+**Install trap worth recording.** CMake strips the build-tree RPATH on install and sets no
+replacement, so the first staged install produced a binary that died with
+`libllama-server-impl.so: cannot open shared object file`. Configuring
+`CMAKE_INSTALL_RPATH='$ORIGIN/../lib'` fixes it, and `$ORIGIN` resolves correctly through the
+`/opt/llama/bin/llama-server` symlink (tested). Any future rebuild must set this, or the
+install is broken in a way that only appears when the services restart.
+
+### F10 — b11136 reports full model paths where b8851 reported basenames
+
+`/v1/models` and the chat-completion `model` field now return
+`/opt/llama/models/gemma-4-26b-a4b-it-q4_k_m.gguf` rather than
+`gemma-4-26b-a4b-it-q4_k_m.gguf`. Routing is unaffected — `display_name()` collapses a path to
+its stem, which is exactly the case `2026-06-29-model-name-normalization-design.md` anticipated
+— but any consumer that compares the returned `model` string against what it requested now sees
+a different shape. Check PARE and the coding agent before assuming this is harmless.
+
+### F11 — The deployed main unit has drifted from the repo
+
+`/etc/systemd/system/llama-server.service` carries `--parallel 1` and `--temp 0.2`;
+`systemd/llama-server.service` in this repo has `--parallel 2` and no `--temp`. The other three
+units match the repo exactly. These are hand-edits made on the live host and never committed;
+they were **not** made by this work and have been left in place. They need reconciling in one
+direction or the other, and until they are, the repo does not describe what runs.
+
+Note the Phase 1 benchmark above is unaffected: before and after used this same deployed unit.
+
 ### Phase 2 — Qwen3.8-27B on the V100
 
 1. Download a GGUF. Quantization is chosen **after** step 2, not before.

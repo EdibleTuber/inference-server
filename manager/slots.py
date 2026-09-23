@@ -52,13 +52,27 @@ class SlotState:
 
         Never raises. On any failure (connection, timeout, non-200, non-JSON
         body, or a 200 whose JSON is not shaped like the /v1/models response
-        we expect -- e.g. some unrelated HTTP service answering on a
-        collided port), sets healthy=False and leaves loaded_model as
+        we expect -- a non-object body, a non-list or missing "data" field, a
+        non-object first entry, or a first entry whose "id" is present and
+        truthy but not a string -- e.g. some unrelated HTTP service answering
+        on a collided port), sets healthy=False and leaves loaded_model as
         whatever it was — the last-known loaded model is still useful for
-        status reporting until a successful probe or swap updates it. The
-        empty-data branch is the exception: it nulls loaded_model because
-        the backend actively told us (in a well-formed response) that
-        nothing is loaded.
+        status reporting until a successful probe or swap updates it.
+
+        Two branches intentionally do NOT follow that "leave loaded_model
+        alone" rule, and null it instead:
+          - a well-formed empty "data" list -- the backend is actively
+            telling us nothing is loaded, which is different from a
+            malformed response we can't interpret at all;
+          - a "data" field that is present but not a list, or missing
+            entirely (falsy) -- pre-fix, `data.get("data") or []` funnelled
+            {"data": null}/a missing "data" key/{"data": {}} into the
+            empty-data branch above, nulling loaded_model. Post-fix this is
+            a DELIBERATE classification change: those payloads are treated
+            as malformed (unrecognizable), not as "backend says nothing
+            loaded", so loaded_model is now preserved for them instead.
+            Flagging this explicitly since it's shared with the chat 409
+            path's reprobe and changes prior behavior.
         """
         try:
             resp = await client.get(f"{self.url}/v1/models", timeout=3)
@@ -115,10 +129,23 @@ class SlotState:
             self.healthy = False
             return
 
-        raw_id = first.get("id") or ""
+        raw_id = first.get("id")
+        if raw_id and not isinstance(raw_id, str):
+            # display_name() unconditionally calls raw.rsplit("/", 1)
+            # (manager/names.py) -- a truthy non-string id would raise
+            # there. Guard here rather than in display_name(), whose
+            # string-in contract other callers rely on.
+            logger.warning(
+                "slot %s /v1/models first entry 'id' is malformed (not a string): %s",
+                self.name, type(raw_id).__name__,
+            )
+            self.healthy = False
+            return
+
         # Normalize to the clean display form (basename, no .gguf, original case).
-        # display_name also collapses a full path to its stem and "" -> None.
-        self.loaded_model = display_name(raw_id)
+        # display_name also collapses a full path to its stem, falsy input
+        # (missing/empty id), and "" -> None.
+        self.loaded_model = display_name(raw_id or "")
         self.healthy = bool(self.loaded_model)
 
     async def reconcile_on_error(self, client) -> None:

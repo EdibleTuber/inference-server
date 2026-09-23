@@ -191,6 +191,8 @@ Useful if you want to avoid waiting through a model swap, or to check queue dept
 curl http://YOUR_LAN_IP:11434/status
 ```
 
+This is illustrative — the authoritative shape is whatever `GET /status` actually returns. In particular, `gpu.gpus` has one entry per GPU card detected on the host, not a fixed number; the example below shows two only because this host has two:
+
 ```json
 {
   "state": "ready",
@@ -201,12 +203,28 @@ curl http://YOUR_LAN_IP:11434/status
   "queue_limit": 20,
   "uptime_seconds": 3421,
   "gpu": {
-    "name": "Tesla P40",
-    "vram_total_mb": 24576,
-    "vram_used_mb": 18200
+    "name": "Tesla PG500-216",
+    "vram_total_mb": 32768,
+    "vram_used_mb": 19039,
+    "gpus": [
+      {
+        "index": 0,
+        "name": "Tesla PG500-216",
+        "vram_total_mb": 32768,
+        "vram_used_mb": 19039
+      },
+      {
+        "index": 1,
+        "name": "Tesla P40",
+        "vram_total_mb": 24576,
+        "vram_used_mb": 20710
+      }
+    ]
   }
 }
 ```
+
+`name`, `vram_total_mb`, and `vram_used_mb` at the top of `gpu` always mirror `gpus[0]`, for any consumer that only expects a single GPU.
 
 ### Using with OpenAI Python client
 

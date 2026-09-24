@@ -22,7 +22,25 @@ DEST=/opt/llama/manager
 OWNER=_llama-mgr
 UNIT=llama-manager
 STAMP="$DEST/DEPLOYED_FROM"
-HEALTH=http://127.0.0.1:11434/health
+# Where to verify the manager after restarting it. Derived from the DEPLOYED
+# manager.env, not hardcoded: this host binds the manager to its LAN IP, so a
+# hardcoded 127.0.0.1 got connection-refused every time and the script reported
+# "did not report healthy within 15s" and exit 1 for deploys that had in fact
+# succeeded. A verification that can never pass also can never fail
+# meaningfully -- it reports the same thing whether the deploy worked or not,
+# which is the opposite of what this script exists for.
+# 0.0.0.0 is a bind address, not a destination, so fall back to loopback there.
+MGR_ENV=/etc/llama/manager.env
+MGR_HOST="$(sed -n 's/^HOST=//p' "$MGR_ENV" 2>/dev/null | tail -1)"
+MGR_PORT="$(sed -n 's/^PORT=//p' "$MGR_ENV" 2>/dev/null | tail -1)"
+if [ -z "$MGR_HOST" ] || [ "$MGR_HOST" = "0.0.0.0" ]; then
+  MGR_HOST=127.0.0.1
+fi
+if [ -z "$MGR_PORT" ]; then
+  MGR_PORT=11434
+fi
+BASE="http://${MGR_HOST}:${MGR_PORT}"
+HEALTH="$BASE/health"
 
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
@@ -97,7 +115,7 @@ for i in $(seq 1 15); do
   code=$(curl -s -m3 -o /dev/null -w '%{http_code}' "$HEALTH" 2>/dev/null)
   if [ "$code" = "200" ]; then
     echo "  $UNIT healthy after ${i}s"
-    curl -s -m5 http://127.0.0.1:11434/status 2>/dev/null |
+    curl -s -m5 "$BASE/status" 2>/dev/null |
       python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for n,s in d["slots"].items():

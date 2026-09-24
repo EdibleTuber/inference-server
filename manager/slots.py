@@ -1,5 +1,5 @@
 """
-Per-slot state for the dual-slot model manager.
+Per-slot state for the model manager.
 
 Each inference backend has its own SlotState containing loaded-model
 tracking, health, swap lock, queue, and an event the handler signals when a

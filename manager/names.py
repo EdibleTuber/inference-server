@@ -1,5 +1,5 @@
 """
-Model-name normalization for the dual-slot manager.
+Model-name normalization for the model manager.
 
 One vocabulary, used everywhere a model name is stored or compared:
   - display_name: the clean form we STORE and REPORT (basename, no .gguf, original case)

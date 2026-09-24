@@ -26,7 +26,7 @@ A native llama.cpp inference server with an OpenAI-compatible API, API-driven mo
 │                          │ localhost:8081                        │
 │  ┌───────────────────────┴──────────────────────────────────┐   │
 │  │  llama-server (systemd)              127.0.0.1:8081      │   │
-│  │  user: _llama  ·  NVIDIA P40  ·  --n-gpu-layers auto    │   │
+│  │  user: _llama  ·  NVIDIA V100  ·  --n-gpu-layers auto   │   │
 │  └───────────────────────┬──────────────────────────────────┘   │
 │                          │                                      │
 │  ┌───────────────────────┴──────────────────────────────────┐   │
@@ -44,7 +44,7 @@ A native llama.cpp inference server with an OpenAI-compatible API, API-driven mo
 
 **llama.cpp instead of Ollama.** Running llama-server natively (not in Docker) gives direct GPU access, no container overhead, and access to any GGUF on HuggingFace without waiting for Ollama to support it. The tradeoff is more setup — this repo contains the setup scripts and config templates to make it repeatable.
 
-**FIFO queue instead of parallel inference.** The Tesla P40 has 24GB VRAM. Running one request at a time maximizes throughput per request (the GPU is fully dedicated to each). Parallel inference would split VRAM across requests and slow down each individual one. The queue ensures requests are processed in order, even during model swaps.
+**FIFO queue instead of parallel inference.** The Tesla V100 has 32GB VRAM. Running one request at a time maximizes throughput per request (the GPU is fully dedicated to each). Parallel inference would split VRAM across requests and slow down each individual one. The queue ensures requests are processed in order, even during model swaps.
 
 **Dedicated system users.** `_llama` runs llama-server with read-only access to model files. `_llama-mgr` runs the manager with write access to one config file and a narrow sudoers entry to restart llama-server. Neither user has a shell or home directory. If either service were compromised, the blast radius is minimal.
 
@@ -319,7 +319,7 @@ Configuration for the llama-server inference backend. **The manager updates `MOD
 | `DEVICE` | `CUDA0` | `--device` selector passed to llama-server. Names an enumeration position, not a physical card — unambiguous only in combination with `CUDA_VISIBLE_DEVICES` below. |
 | `CUDA_VISIBLE_DEVICES` | _(host-specific, no safe default)_ | Restricts this process to exactly one physical GPU by UUID (`GPU-<uuid>`), so `DEVICE=CUDA0` above always names the same card regardless of enumeration order. Get the UUID with `nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv`; never use a bare ordinal (`0`) here, since that reintroduces the same enumeration-order ambiguity. See the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). |
 | `N_GPU_LAYERS` | `-1` | Number of model layers to offload to GPU. `-1` = auto (fill all available VRAM). Set to a specific number to limit GPU usage. |
-| `CTX_SIZE` | `4096` | Context window size in tokens. Larger values use more VRAM. Derive this from the `llama_kv_cache` line in llama-server's own log (`-lv 5` required) after loading the target model — see the comments in `config/llama-server.env` — rather than guessing from a projection. |
+| `CTX_SIZE` | `4096` | Context window size in tokens. Larger values use more VRAM. Derive this from the `llama_kv_cache` line in llama-server's own log (raise `-lv` until the line appears) after loading the target model — see the comments in `config/llama-server.env` — rather than guessing from a projection. |
 | `HOST` | `127.0.0.1` | Bind address for llama-server. Always localhost — never expose directly. |
 | `PORT` | `8081` | Port for llama-server. The manager connects here. |
 
@@ -360,7 +360,7 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/chat/completions` | Chat completions. Reads the `model` field, swaps if needed, queues if busy. Supports streaming (`"stream": true`). |
 | `POST` | `/v1/embeddings` | Proxy to llama-embeddings instance. OpenAI-compatible. |
 | `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
-| `GET` | `/status` | Server state, current model, queue depth, GPU VRAM usage, uptime. |
+| `GET` | `/status` | Per-slot health, loaded model, and queue depth; GPU VRAM usage; uptime. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |
@@ -369,22 +369,20 @@ All endpoints are on `LAN_IP:11434`.
 | `GET` | `/collections/{id}/reindex/status` | Current or most recent reindex job for a collection. 404 if none has run. |
 | `GET` | `/collections/{id}/reindex/{job_id}` | State of a specific reindex job (status, stats, error, timestamps). |
 
-### Server states
+### Slot health
 
-The `state` field in `/status` tells you what the manager is doing:
+There is no single top-level readiness flag. Each entry under `/status`'s `slots` map reports its own state instead:
 
-| State | Meaning |
-|---|---|
-| `loading` | llama-server is starting up on boot. No model available yet. |
-| `ready` | Accepting and processing requests normally. |
-| `swapping` | Actively changing models. Requests are queuing. |
-| `error` | llama-server failed to start or health poll timed out. Send a new request with a valid model name to trigger a fresh swap attempt. |
+- `healthy` (bool) — set from the outcome of the slot's most recent probe or swap attempt: `true` after a successful probe or swap, `false` at startup or after a failed one (backend unreachable, bad response, model file not found, or swap timeout). It is not updated while a swap is in progress — a slot that was healthy before a swap started still reports `healthy: true` until that swap resolves.
+- `loaded_model` — the model currently loaded on that slot, or `null` if none has loaded successfully yet. It generally lags behind a swap in progress, and is only cleared to `null` when a probe explicitly reports nothing loaded.
+
+A chat request for a model that isn't loaded on any slot returns **409** rather than triggering an implicit swap; load it first via `POST /swap`.
 
 ### Client timeout guidance
 
 Model swaps take 30–60+ seconds depending on model size (the GPU must load a new model file into VRAM). During a swap, the manager holds your HTTP connection open. **Set your HTTP client timeout to at least 120 seconds** to avoid timing out while waiting for a swap.
 
-If you prefer not to wait, poll `/status` before sending requests and only proceed when `state` is `"ready"`.
+If you prefer not to wait, poll `/status` before sending requests and check the target slot's `healthy` flag (and `loaded_model`) rather than a top-level state.
 
 ---
 
@@ -543,7 +541,7 @@ sudo systemctl disable llama-server llama-manager
 2. `llama-server.service` starts with the model configured in `/etc/llama/llama-server.env`
 3. `llama-manager.service` starts (`After=llama-server.service`), connects to llama-server, begins accepting requests
 
-If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server fails to start. The manager starts in `error` state and waits. The first API request with a valid model name triggers a swap, which loads the model and transitions to `ready`.
+If `MODEL_PATH` is empty or points to a nonexistent file on boot, llama-server fails to start. That slot reports `"healthy": false` (with `"loaded_model": null`) in `/status` and waits. The first API request for a valid model on that slot triggers a swap, which loads the model and marks the slot healthy.
 
 ### Verify each GPU-backed slot is bound to the right physical card
 
@@ -577,7 +575,7 @@ This procedure is written generically for however many CUDA-backed slots are act
 
    For each GPU-backed unit, its PID's `gpu_uuid` must be the UUID recorded in step 1 for the card that slot's `CUDA_VISIBLE_DEVICES` names — not the other card's UUID. Seeing the wrong UUID, or no row at all for a unit that should be running, means the pin is wrong or the service isn't actually up; stop and fix the env file before continuing.
 
-   As a secondary, log-based cross-check (not the primary signal — see the note above): `llama_prepare_model_devices: using device CUDA0 (...)` does name the card, but only appears with `-lv 5`, which is not something to add to the units permanently just to serve this check. Add `-lv 5` to the command temporarily if you want a second line of evidence.
+   As a secondary, log-based cross-check (not the primary signal — see the note above): `llama_prepare_model_devices: using device CUDA0 (...)` does name the card, but only appears once `-lv` is raised enough to surface it (the exact level has moved before and isn't worth pinning here), which is not something to add to the units permanently just to serve this check. Raise `-lv` on the command temporarily if you want a second line of evidence.
 
 3. **Restart in reverse order and recheck.** Order-dependence is exactly the failure this guards against — a stale CUDA enumeration cached by one service should not leak into another's.
 

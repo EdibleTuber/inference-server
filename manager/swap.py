@@ -1,9 +1,10 @@
 """
 Model swap orchestration for one slot.
 
-A ModelSwapper instance is bound to a specific slot (main or batch) via
-its SlotState and operates on that slot's env file and systemd unit.
-The manager instantiates one swapper per slot at startup.
+A ModelSwapper instance is bound to one backing llama-server process via
+its SlotState and operates on that slot's env file and systemd unit. Which
+slots exist is configuration; the manager instantiates one swapper per
+configured slot at startup.
 """
 import asyncio
 import re

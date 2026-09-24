@@ -55,30 +55,25 @@ class ServerState:
     def __init__(self, config: ManagerConfig):
         self._config = config
 
-        # Build slots dict.
-        self.slots: dict[str, SlotState] = {
-            "main": SlotState(
-                name="main",
-                host=config.llama_server_host,
-                port=config.llama_server_port,
-                env_file=config.llama_server_env,
-                systemd_unit=config.llama_server_unit,
-                queue=RequestQueue(max_size=config.queue_limit),
-            ),
-            "batch": SlotState(
-                name="batch",
-                host=config.batch_server_host,
-                port=config.batch_server_port,
-                env_file=config.batch_server_env,
-                systemd_unit=config.batch_server_unit,
-                queue=RequestQueue(max_size=config.batch_queue_limit),
-            ),
-        }
+        # Build slots dict from configuration, in configured order. Order is
+        # significant -- it is the routing priority resolve_slot walks --
+        # and dict preserves insertion order, so iterating config.slots here
+        # is what makes server.slots ordered the same way.
+        self.slots: dict[str, SlotState] = {}
+        for sc in config.slots:
+            self.slots[sc.name] = SlotState(
+                name=sc.name,
+                host=sc.host,
+                port=sc.port,
+                env_file=sc.env_file,
+                systemd_unit=sc.systemd_unit,
+                queue=RequestQueue(max_size=sc.queue_limit),
+            )
 
         # One swapper per slot. Attach dynamically to avoid circular import
         # (SlotState does not reference ModelSwapper).
-        self.slots["main"].swapper = ModelSwapper(config, slot=self.slots["main"])
-        self.slots["batch"].swapper = ModelSwapper(config, slot=self.slots["batch"])
+        for slot in self.slots.values():
+            slot.swapper = ModelSwapper(config, slot=slot)
 
         # Collection retrieval (unchanged).
         self.db: VectorDB | None = None
@@ -128,8 +123,21 @@ class ServerState:
     # Model swap
     # ------------------------------------------------------------------
 
+    async def _reprobe_slot_if_unlocked(self, name: str, slot, probe_client) -> None:
+        """Probe one slot unless a swap already holds its lock.
+
+        Shared by reprobe_all_slots and reprobe_all_slots_concurrently so both
+        keep exactly the same skip-if-mid-swap rule; only the fan-out (loop vs
+        gather) differs between them.
+        """
+        if slot.swap_lock.locked():
+            logger.debug("slot=%s mid-swap, skipping reprobe", name)
+            return
+        async with slot.swap_lock:
+            await slot.probe(probe_client)
+
     async def reprobe_all_slots(self) -> None:
-        """Refresh every slot's view of its backend. Never raises.
+        """Refresh every slot's view of its backend, one at a time. Never raises.
 
         Probing otherwise happens only at startup and after a backend 5xx, so a
         backend that became ready LATER is invisible for the life of the
@@ -147,14 +155,83 @@ class ServerState:
         A slot whose lock is already held is SKIPPED rather than waited on. A
         swap in flight is both authoritative and already producing fresh state,
         and blocking here would stall the caller behind a whole model load.
+
+        Sequential: worst case is N slots times the per-slot probe timeout
+        (see slot.probe) if every slot is unreachable. That is deliberate
+        and unchanged here -- this is the chat 409 path's reprobe, called
+        for one request already in flight that is about to fail anyway, so
+        a few extra seconds of serialized, easy-to-reason-about probing
+        costs little. GET /status calls the concurrent variant below
+        instead; see its docstring for why.
         """
         async with httpx.AsyncClient() as probe_client:
             for name, slot in self.slots.items():
-                if slot.swap_lock.locked():
-                    logger.debug("slot=%s mid-swap, skipping reprobe", name)
-                    continue
-                async with slot.swap_lock:
-                    await slot.probe(probe_client)
+                await self._reprobe_slot_if_unlocked(name, slot, probe_client)
+
+    async def reprobe_all_slots_concurrently(self) -> None:
+        """Refresh every slot's view of its backend, all at once. Never raises.
+
+        Used only by GET /status. reprobe_all_slots (above) is sequential by
+        design for the chat 409 path, where that's fine. /status is a
+        monitoring endpoint: its worst case matters most exactly when slots
+        are down, since that's when someone is anxiously checking it or an
+        automated health check is polling it on a tight timeout. Sequential
+        probing there would cost up to N * (the per-slot probe timeout) if
+        every slot is unreachable -- multiplying the outage's visible cost
+        instead of just reporting it. Probing concurrently bounds /status's
+        worst case to one probe timeout regardless of slot count.
+
+        Same skip-if-mid-swap rule as reprobe_all_slots, via
+        _reprobe_slot_if_unlocked; only the fan-out is different. Slots are
+        probed with one shared AsyncClient but each against its own
+        swap_lock, so there is no cross-slot contention from running them
+        concurrently.
+
+        return_exceptions=True is load-bearing, not decorative. Without it,
+        asyncio.gather re-raises the first child exception immediately,
+        without awaiting or cancelling its siblings, and that exception
+        would propagate straight out of this method -- past nothing that
+        would catch it -- and 500 /status. That is the real, every-run
+        production symptom of dropping this flag: confirmed by testing
+        the un-forced, naturally-occurring interleaving (main.probe
+        raising, batch.probe untouched, real backend delays of 0/50/300ms):
+        9/9 runs gave /status a 500, with batch's own state left
+        untouched (asyncio.gather's ensure_future queues both slots' first
+        step before either completes, so in practice a sibling already
+        reaches client.get() and suspends inside connection setup before
+        this method's `async with httpx.AsyncClient()` block would exit
+        and close the shared client -- so the natural race here does not
+        corrupt a sibling's health, only crashes the endpoint).
+
+        Guarding against a sibling being corrupted anyway is still the
+        right design, not overkill: it is one `async with` block away from
+        happening (e.g. if a slower probe start, more slots, or a
+        different scheduler ever changes that interleaving), and
+        `tests/test_endpoints.py::test_status_survives_a_raising_slot_probe`
+        deliberately forces that interleaving to pin it as a property,
+        rather than relying on it never mattering. slot.probe() itself
+        never raises (see its docstring), so return_exceptions=True is
+        defense in depth against a probe somehow still raising either
+        way -- gather waits for every child regardless, so the client is
+        never closed while a sibling might still be using it, and any
+        exception a child does produce is logged and otherwise ignored
+        rather than propagated to the /status caller.
+        """
+        async with httpx.AsyncClient() as probe_client:
+            results = await asyncio.gather(
+                *(
+                    self._reprobe_slot_if_unlocked(name, slot, probe_client)
+                    for name, slot in self.slots.items()
+                ),
+                return_exceptions=True,
+            )
+            for name, result in zip(self.slots, results):
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "slot=%s reprobe raised during concurrent /status "
+                        "reprobe (should not happen; slot.probe is expected "
+                        "to never raise): %s", name, result,
+                    )
 
     async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
         """Ensure model_name is loaded on the named slot.
@@ -404,6 +481,15 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status():
+        # Refresh before reporting. The startup probe runs once, and until this
+        # was added the only other reprobe was on the chat 409 path -- so a
+        # backend that became ready later showed here as a total outage for the
+        # life of the process, while requests to it succeeded. Uses the
+        # concurrent variant (see ServerState.reprobe_all_slots_concurrently)
+        # so this endpoint's worst case is one probe timeout, not one per
+        # slot; slots mid-swap are still skipped, so this cannot stall behind
+        # a model load either way.
+        await server.reprobe_all_slots_concurrently()
         gpu = await get_gpu_info_async()
         return {
             "slots": {
@@ -723,7 +809,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     async def swap_slot(request: Request):
         """Admin endpoint: swap a slot to a different model.
 
-        Body: {"model": str, "target": "main"|"batch" (optional, default main)}.
+        Body: {"model": str, "target": <slot name> (optional, default is
+        the first configured slot)}.
         No auth; LAN-only is the trust boundary.
         """
         try:
@@ -741,11 +828,12 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=400,
             )
 
-        target = body.get("target", "main")
-        if target not in ("main", "batch"):
+        target = body.get("target", next(iter(server.slots)))
+        if not isinstance(target, str) or target not in server.slots:
+            valid = ", ".join(repr(n) for n in server.slots)
             return JSONResponse(
                 {"error": {"type": "invalid_target",
-                           "message": "'target' must be 'main' or 'batch'"}},
+                           "message": f"'target' must be one of: {valid}"}},
                 status_code=400,
             )
 

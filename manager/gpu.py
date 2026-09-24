@@ -24,16 +24,21 @@ async def get_gpu_info_async() -> dict:
 
 
 def get_gpu_info() -> dict:
-    """Query NVIDIA GPU for name and VRAM usage.
+    """Query NVIDIA GPUs for name and VRAM usage.
 
-    Returns dict with name, vram_total_mb, vram_used_mb.
-    Falls back to "unknown"/0 if nvidia-smi fails.
+    Returns dict with a "gpus" list (one entry per GPU nvidia-smi reports,
+    each with index/name/vram_total_mb/vram_used_mb) plus top-level
+    name/vram_total_mb/vram_used_mb mirroring the first GPU, for consumers
+    of the original single-GPU shape.
+
+    Falls back to an empty "gpus" list and "unknown"/0 top-level values if
+    nvidia-smi fails or its output can't be parsed.
     """
     try:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=gpu_name,memory.total,memory.used",
+                "--query-gpu=index,gpu_name,memory.total,memory.used",
                 "--format=csv",
             ],
             capture_output=True,
@@ -46,11 +51,35 @@ def get_gpu_info() -> dict:
             logger.warning("nvidia-smi unexpected output: %s", result.stdout)
             return _unknown_gpu()
 
-        values = [v.strip() for v in lines[1].split(",")]
+        gpus = []
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            values = [v.strip() for v in line.split(",")]
+            if len(values) < 4:
+                logger.warning("nvidia-smi unexpected row: %s", line)
+                continue
+            try:
+                gpus.append(
+                    {
+                        "index": int(values[0]),
+                        "name": values[1],
+                        "vram_total_mb": int(values[2].replace(" MiB", "")),
+                        "vram_used_mb": int(values[3].replace(" MiB", "")),
+                    }
+                )
+            except ValueError:
+                logger.warning("nvidia-smi unparseable row: %s", line)
+                continue
+
+        if not gpus:
+            return _unknown_gpu()
+
         return {
-            "name": values[0],
-            "vram_total_mb": int(values[1].replace(" MiB", "")),
-            "vram_used_mb": int(values[2].replace(" MiB", "")),
+            "gpus": gpus,
+            "name": gpus[0]["name"],
+            "vram_total_mb": gpus[0]["vram_total_mb"],
+            "vram_used_mb": gpus[0]["vram_used_mb"],
         }
 
     except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
@@ -59,4 +88,4 @@ def get_gpu_info() -> dict:
 
 
 def _unknown_gpu() -> dict:
-    return {"name": "unknown", "vram_total_mb": 0, "vram_used_mb": 0}
+    return {"gpus": [], "name": "unknown", "vram_total_mb": 0, "vram_used_mb": 0}

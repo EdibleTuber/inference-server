@@ -17,7 +17,9 @@
 - Model-name comparison semantics are unchanged — keep using `manager.names.same_model` / `display_name` per `docs/superpowers/specs/2026-06-29-model-name-normalization-design.md`.
 - Tests assert **relationships**, not literals, wherever possible. `len(reported_slots) == len(configured_slots)` survives adding a slot; `len(...) == 2` does not.
 - Every regression test must be **verified failing against the pre-fix code** before the fix lands. A test that passes before the fix proves nothing.
-- Run the suite with `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest`.
+- Run the suite with `/opt/llama/manager/venv/bin/python -m pytest` from the repo root.
+  The repo's own `.venv` has **no pytest installed** — only the deployed manager venv does.
+  Baseline before any change: **150 passed**.
 
 **On the code in this plan:** the blocks below are sketches written away from the files. Verify each against the real source before committing it; where a sketch and the codebase disagree, the codebase wins and deviating from this plan is correct.
 
@@ -158,7 +160,7 @@ def test_slot_config_is_frozen():
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_slot_config.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_slot_config.py -v`
 Expected: collection error — `ModuleNotFoundError: No module named 'manager.slot_config'`.
 
 - [ ] **Step 3: Write the implementation**
@@ -272,12 +274,12 @@ Note: `_lookup` uses field key `"env"`/`"unit"` for the prefixed form but `_LEGA
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_slot_config.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_slot_config.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Run the whole suite to confirm nothing else moved**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest -q`
+Run: `/opt/llama/manager/venv/bin/python -m pytest -q`
 Expected: no new failures versus the baseline captured before starting.
 
 - [ ] **Step 6: Commit**
@@ -346,7 +348,7 @@ def test_slots_default_is_empty_for_direct_construction(test_config):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_config.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_config.py -v`
 Expected: FAIL — `AttributeError: 'ManagerConfig' object has no attribute 'slots'`.
 
 - [ ] **Step 3: Implement**
@@ -361,7 +363,7 @@ and in `from_env`, pass `slots=build_slots()`. Add `slots` to the class docstrin
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_config.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_config.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Commit**
@@ -421,7 +423,7 @@ Update the `test_config` fixture in `tests/conftest.py` to populate `slots=` wit
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_endpoints.py -k slot -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_endpoints.py -k slot -v`
 Expected: FAIL — only `main` and `batch` exist; `KeyError: 're'`.
 
 - [ ] **Step 3: Implement**
@@ -448,7 +450,7 @@ Replace the literal construction with a loop over `config.slots`:
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_endpoints.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_endpoints.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Commit**
@@ -503,7 +505,7 @@ def test_third_slot_comparison_is_normalised():
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_routing.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_routing.py -v`
 Expected: `test_resolves_a_third_slot` FAILS returning `None` — the current body only inspects `main` and `batch`. `test_first_configured_slot_wins_when_duplicated` FAILS returning `"main"`.
 
 - [ ] **Step 3: Implement**
@@ -526,7 +528,7 @@ def resolve_slot(model: str, slots: dict[str, SlotState]) -> Optional[str]:
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_routing.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_routing.py -v`
 Expected: all PASS, including the pre-existing `test_resolve_model_on_both_prefers_main` (its dict lists `main` first, so order preserves the old result).
 
 - [ ] **Step 5: Commit**
@@ -572,7 +574,7 @@ Add a `client_with_three_slots` fixture to `tests/conftest.py` mirroring the exi
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_endpoints.py -k swap -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_endpoints.py -k swap -v`
 Expected: `test_swap_accepts_a_configured_third_slot` FAILS with 400 — `target` is checked against the literal tuple `("main", "batch")`.
 
 - [ ] **Step 3: Implement**
@@ -594,7 +596,7 @@ Match the surrounding code's existing error-response idiom — check how neighbo
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_endpoints.py tests/test_swap.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_endpoints.py tests/test_swap.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Commit**
@@ -680,7 +682,7 @@ def test_nvidia_smi_failure_returns_empty_gpu_list():
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_gpu.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_gpu.py -v`
 Expected: FAIL — `KeyError: 'gpus'`.
 
 - [ ] **Step 3: Implement**
@@ -691,7 +693,7 @@ Keep the `--query-gpu` field list as it is. Consider adding `uuid` here only if 
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_gpu.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_gpu.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Check no consumer broke**
@@ -762,7 +764,7 @@ Check `create_app`'s real signature before using it — `manager/app.py:390` bui
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_endpoints.py -k status -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_endpoints.py -k status -v`
 Expected: `test_status_reprobes_before_reporting` FAILS — `reprobe.assert_awaited_once()` raises because `/status` never calls it. **Confirm this failure before writing the fix**; a passing test here would mean the test is not exercising the bug.
 
 - [ ] **Step 3: Implement**
@@ -790,7 +792,7 @@ Expected: `test_status_reprobes_before_reporting` FAILS — `reprobe.assert_awai
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd /mnt/secondary/inference-server && .venv/bin/python -m pytest tests/test_endpoints.py -v`
+Run: `/opt/llama/manager/venv/bin/python -m pytest tests/test_endpoints.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Verify against the live server**

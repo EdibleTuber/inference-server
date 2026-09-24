@@ -78,27 +78,181 @@ async def test_probe_empty_data_unhealthy():
 
 @pytest.mark.asyncio
 async def test_probe_connection_error_unhealthy():
-    """Probe catches httpx.ConnectError (or any exception): slot unhealthy, no raise."""
+    """Probe catches httpx.ConnectError (or any exception): slot unhealthy, no raise.
+
+    loaded_model must be preserved, not nulled -- a backend blip during a
+    /status poll should surface as "unhealthy, last known model X", not as
+    "no model loaded" (which agent_core treats as 409 model_not_loaded and
+    reacts to with an evicting swap)."""
     import httpx
     slot = _make_slot()
+    slot.loaded_model = "old-model"
     client = MagicMock()
     client.get = AsyncMock(side_effect=httpx.ConnectError("refused"))
 
     await slot.probe(client)
     assert slot.healthy is False
-    assert slot.loaded_model is None
+    assert slot.loaded_model == "old-model"
 
 
 @pytest.mark.asyncio
 async def test_probe_non_200_unhealthy():
-    """Probe with 500 response: unhealthy, no raise."""
+    """Probe with 500 response: unhealthy, no raise, loaded_model preserved
+    (see test_probe_connection_error_unhealthy for why preservation matters)."""
     slot = _make_slot()
+    slot.loaded_model = "old-model"
     client = MagicMock()
     mock_response = MagicMock(status_code=500)
     client.get = AsyncMock(return_value=mock_response)
 
     await slot.probe(client)
     assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_probe_malformed_top_level_payload_does_not_raise():
+    """A 200 whose JSON body is not an object (e.g. some other HTTP service
+    answering on a collided port, returning a bare list) must not raise.
+
+    Pre-fix, `data.get("data")` on a list raises AttributeError, which
+    propagates out of probe() -- violating "never raises" and, when probe()
+    is fanned out via asyncio.gather, capable of tearing down a shared
+    client out from under a sibling probe (see reprobe_all_slots_concurrently).
+    """
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = ["unexpected", "list", "body"]
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    # Malformed, not "backend told us nothing is loaded" -- last-known model
+    # is preserved, same as the other failure branches (connection error,
+    # non-200, non-JSON).
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_probe_malformed_data_field_does_not_raise():
+    """A 200 whose 'data' field is present but not a list must not raise."""
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"data": "not-a-list"}
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_probe_malformed_entry_does_not_raise():
+    """A 200 whose first 'data' entry is not an object must not raise.
+
+    Pre-fix, `entries[0].get("id")` on a non-dict entry (e.g. a bare string)
+    raises AttributeError.
+    """
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"data": ["not-a-dict-entry"]}
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [123, ["a"], {"x": 1}])
+async def test_probe_non_string_id_does_not_raise(bad_id):
+    """A well-formed entry whose 'id' is truthy but not a string must not
+    raise. Fails against the code before this guard was added:
+
+        {"data": [{"id": 123}]}     -> AttributeError: 'int' object has no attribute 'rsplit'
+        {"data": [{"id": ["a"]}]}   -> AttributeError: 'list' object has no attribute 'rsplit'
+        {"data": [{"id": {"x":1}}]} -> AttributeError: 'dict' object has no attribute 'rsplit'
+
+    display_name() unconditionally calls raw.rsplit("/", 1) (manager/names.py),
+    so a non-string id reaches that call unguarded. Fixed in probe() rather
+    than in display_name(), since display_name's string contract is relied
+    on by other callers.
+    """
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"data": [{"id": bad_id}]}
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_data", [None, "not-a-list", {}], ids=["null", "string", "empty-dict"])
+async def test_probe_malformed_data_field_preserves_loaded_model(malformed_data):
+    """Pin the classification decision for a malformed (non-list) 'data'
+    field, made in this fix round: it is treated as UNRECOGNIZABLE, not as
+    "the backend told us nothing is loaded".
+
+    Pre-fix, `entries = data.get("data") or []` funnelled a missing "data"
+    key, {"data": null}, and {"data": {}} (all falsy) into the same branch
+    as a well-formed empty list -- nulling loaded_model. Post-fix they hit
+    the not-a-list guard instead and PRESERVE loaded_model, same as the
+    other malformed-shape branches (non-object body, non-object entry,
+    non-string id). Only a well-formed empty list (`test_probe_empty_data_unhealthy`)
+    still nulls loaded_model, because that is the backend actively saying
+    nothing is loaded, which a malformed payload cannot say.
+
+    This is a deliberate, documented behavior change from pre-fix code,
+    shared with the chat 409 path's reprobe.
+    """
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"data": malformed_data}
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_probe_missing_data_key_preserves_loaded_model():
+    """Same classification decision as above, for a 'data' key that is
+    absent entirely rather than present-and-null."""
+    slot = _make_slot()
+    slot.loaded_model = "old-model"
+    slot.healthy = True
+    client = MagicMock()
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {"object": "list"}  # no "data" key
+    client.get = AsyncMock(return_value=mock_response)
+
+    await slot.probe(client)  # must not raise
+
+    assert slot.healthy is False
+    assert slot.loaded_model == "old-model"
 
 
 @pytest.mark.asyncio

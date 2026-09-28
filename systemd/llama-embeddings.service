@@ -6,6 +6,10 @@
 # Uses nomic-embed-text (~275MB), always loaded, no model swapping.
 # The model manager proxies /v1/embeddings requests to this service.
 #
+# "CPU-only" is enforced by --device none in ExecStart, and only by that.
+# It is not a consequence of --threads: that caps CPU threads and has no
+# bearing on offload. See the comment on the flag below before removing it.
+#
 # Install: sudo cp systemd/llama-embeddings.service /etc/systemd/system/
 #          sudo systemctl daemon-reload && sudo systemctl enable llama-embeddings
 
@@ -22,6 +26,21 @@ Type=simple
 User=_llama
 Group=_llama
 
+# --device none: keep this model off the GPU. llama.cpp's --n-gpu-layers
+# defaults to 'auto', so without this flag it offloads whatever fits onto
+# whatever card it can see, and this service did exactly that -- all 13
+# layers on the V100, ~461-533 MiB of VRAM -- while the unit's own
+# Description claimed it was CPU-only.
+#
+# Worse, b11136 fits params to the memory free AT LOAD TIME, so placement
+# depended on boot ordering: started before the main slot had claimed the
+# card, it took the GPU; started after, it might not have. Device placement
+# decided by service start order is the silent non-determinism this repo's
+# GPU-pinning work exists to remove.
+#
+# Embeddings here are batch work (indexing a notes vault), so CPU is the
+# right trade: the VRAM belongs to the resident coding model. Measured with
+# --device none: zero VRAM, /v1/embeddings returns correct 768-dim vectors.
 ExecStart=/opt/llama/bin/llama-server \
     --model /opt/llama/models/nomic-embed-text-v1.5.Q8_0.gguf \
     --host 127.0.0.1 \
@@ -30,7 +49,8 @@ ExecStart=/opt/llama/bin/llama-server \
     --ctx-size 2048 \
     --batch-size 2048 \
     --ubatch-size 2048 \
-    --threads 4
+    --threads 4 \
+    --device none
 
 Restart=on-failure
 RestartSec=5

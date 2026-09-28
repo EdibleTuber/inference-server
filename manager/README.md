@@ -31,7 +31,7 @@ The queue has a configurable maximum depth (default: 20). Requests beyond the li
 ### 4. Status and model listing
 
 - `GET /v1/models` scans `/opt/llama/models/` and returns available GGUF files in OpenAI-compatible format. No config needed — just drop a GGUF in the directory and it appears.
-- `GET /status` returns the server state, current model, queue depth, GPU VRAM usage, and uptime. Useful for health checks and for clients that want to check state before submitting a long job.
+- `GET /status` returns per-slot health, loaded model, and queue depth, plus GPU VRAM usage and uptime. Useful for health checks and for clients that want to check a slot's state before submitting a long job.
 - `GET /health` returns 200 OK. Use for basic uptime monitoring.
 
 ---
@@ -50,8 +50,8 @@ Currently loaded: "qwen2.5-7b-instruct-q4_k_m"
    (if not found, return 404 immediately — don't start a swap for a nonexistent model)
                         │
                         ▼
-2. Set state to "swapping"
-   New requests queue up; nothing is forwarded to llama-server during this phase
+2. Hold the slot's swap lock
+   New requests for this slot keep queuing; nothing is forwarded to llama-server during this phase
                         │
                         ▼
 3. Update /etc/llama/llama-server.env
@@ -66,8 +66,8 @@ Currently loaded: "qwen2.5-7b-instruct-q4_k_m"
                         ▼
 5. Poll health endpoint
    GET http://127.0.0.1:8081/health every 2 seconds, up to 120 seconds
-   On 200: set state to "ready", process queued requests
-   On timeout: set state to "error", drain queue with 503 responses
+   On 200: mark the slot healthy, process queued requests
+   On timeout: mark the slot unhealthy, drain its queue with 503 responses
 ```
 
 **Why update a file and restart instead of a hot-reload API?** llama-server does not have a runtime model-swap API. The env file + systemd restart approach is the supported mechanism. The manager owns `/etc/llama/llama-server.env` (it is the file's owner in the filesystem), so it can update it without elevated privileges. The sudoers entry covers only the `systemctl restart` command — it cannot touch anything else.
@@ -80,7 +80,7 @@ Currently loaded: "qwen2.5-7b-instruct-q4_k_m"
 
 | File | Purpose |
 |---|---|
-| `app.py` | The FastAPI application. Defines all endpoints, the `ServerState` class (holds mutable state: current model, queue, swap lock), and the background queue consumer task. This is the entry point and the glue between all other modules. |
+| `app.py` | The FastAPI application. Defines all endpoints, the `ServerState` class (holds a `slots` mapping — one `SlotState` per configured backend, each with its own loaded-model tracking, queue, and swap lock — plus the collection-retrieval state), and the background queue consumer task. This is the entry point and the glue between all other modules. |
 | `config.py` | Typed configuration dataclass (`ManagerConfig`). Reads all settings from environment variables with sensible defaults. The rest of the app imports config values from here rather than reading `os.environ` directly — centralizes all env var names and type conversions in one place. |
 | `queue.py` | The `RequestQueue` class: an async FIFO queue with a configurable size cap. Raises `QueueFullError` when at capacity (the API layer converts this to a 503 response). |
 | `swap.py` | The `ModelSwapper` class: executes the three concrete steps of a model swap — updating the env file, running `systemctl restart`, and polling the health endpoint. Isolated here so it can be tested and mocked independently. |
@@ -150,7 +150,7 @@ curl http://127.0.0.1:8080/status
 curl http://127.0.0.1:8080/v1/models
 ```
 
-With no llama-server running, `/status` returns `"state": "error"`. Chat completions will fail with a 503 (no server to forward to). This is expected — everything up to the point of actually calling llama-server works.
+With no llama-server running, each slot in `/status` reports `"healthy": false` (and `"loaded_model": null` if nothing has ever loaded successfully). Chat completions will fail with a 503 (no server to forward to). This is expected — everything up to the point of actually calling llama-server works.
 
 ---
 
@@ -194,5 +194,5 @@ pytest tests/ -v
 - **`test_config.py`** — Config loads values from env vars; uses sensible defaults when vars are absent; produces correct llama-server URL.
 - **`test_queue.py`** — Enqueue/dequeue ordering; `QueueFullError` at capacity; `drain()` clears all items.
 - **`test_swap.py`** — Env file is updated with correct `MODEL_PATH`; `systemctl restart` is called; health polling returns True on 200 and False on timeout. All subprocess and HTTP calls are mocked — no llama-server or systemd required.
-- **`test_endpoints.py`** — `/health`, `/status`, `/v1/models`, and `/v1/chat/completions` integration tests using FastAPI's test client. llama-server is mocked with an in-process HTTP server.
+- **`test_endpoints.py`** — `/health`, `/status`, `/v1/models`, and `/v1/chat/completions` integration tests using FastAPI's `TestClient`. `TestClient` runs the app's lifespan, so the startup slot probe — and several individual tests — issue real HTTP requests to whatever is actually listening on the configured slot ports (127.0.0.1:8081 main, 127.0.0.1:8083 batch in `test_config`), not an in-process mock; those tests are written to pass whether or not a backend is up there. A few tests instead monkeypatch `SlotState.probe` directly, or spin up a local `http.server` instance to control one backend's response precisely.
 - **`test_gpu.py`** — `nvidia-smi` output parsing; graceful fallback when `nvidia-smi` is missing.

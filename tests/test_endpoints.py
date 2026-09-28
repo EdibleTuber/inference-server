@@ -388,10 +388,58 @@ def test_swap_default_target_is_main(client, monkeypatch):
     assert r.json()["slot"] == "main"
 
 
+def test_swap_default_target_is_first_configured_slot_not_the_literal_main(
+    test_config, monkeypatch
+):
+    """The default /swap target must be resolved from configuration (the
+    first configured slot), not the hardcoded string "main" -- proven with
+    a config whose first slot is named something else, so a regression to
+    a literal "main" default would 400 here instead of passing by
+    coincidence (as it would against test_config, where "main" happens to
+    already be first)."""
+    import dataclasses
+    from manager.app import create_app
+
+    reordered = dataclasses.replace(
+        test_config, slots=tuple(reversed(test_config.slots))
+    )
+    assert reordered.slots[0].name == "batch"
+
+    async def fake_swap(self, model):
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    app = create_app(reordered)
+    client = TestClient(app)
+    r = client.post("/swap", json={"model": "test-model-q8"})
+    assert r.status_code == 200, r.text
+    assert r.json()["slot"] == "batch"
+
+
 def test_swap_invalid_target(client):
     r = client.post("/swap", json={"model": "test-model-q4", "target": "xxx"})
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_target"
+
+
+def test_swap_non_string_target_returns_structured_400_not_500(client):
+    """A non-string target (e.g. a list or dict) must fail like any other invalid
+    target -- a structured 400 -- not crash the handler.
+
+    `target not in server.slots` is a dict membership test, which hashes its
+    operand; an unhashable target (list, dict) raises TypeError from inside the
+    handler, and with no custom exception handler registered Starlette turns
+    that into a generic 500 -- unlike the old tuple-membership check, which
+    compared by equality and never hashed.
+    """
+    from fastapi.testclient import TestClient
+    unraising_client = TestClient(client.app, raise_server_exceptions=False)
+
+    for bad_target in (["main"], {"main": 1}):
+        r = unraising_client.post(
+            "/swap", json={"model": "test-model-q4", "target": bad_target})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"]["type"] == "invalid_target"
 
 
 def test_swap_missing_model(client):
@@ -412,6 +460,30 @@ def test_swap_fails_returns_503(client, monkeypatch):
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
     assert r.status_code == 503
     assert r.json()["error"]["type"] == "swap_failed"
+
+
+def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
+    """A slot beyond the legacy main/batch pair is a valid /swap target when configured."""
+    resp = client_with_three_slots.post(
+        "/swap", json={"model": "test-model-q4", "target": "re"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["slot"] == "re"
+
+
+def test_swap_rejects_an_unconfigured_target(client_with_three_slots):
+    """The 400 body must name every configured slot, derived from config -- not a
+    hardcoded literal list -- so it stays correct as the configured slots change."""
+    app = client_with_three_slots.app
+    configured_names = list(app.state.server.slots.keys())
+    assert len(configured_names) == 3  # sanity: fixture actually wired up 3 slots
+
+    resp = client_with_three_slots.post(
+        "/swap", json={"model": "test-model-q4", "target": "nope"})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "invalid_target"
+    body = resp.json()["error"]["message"]
+    for name in configured_names:
+        assert name in body, f"400 message should name configured slot {name!r}: {body}"
 
 
 def test_swap_echo_is_canonical(client, monkeypatch):
@@ -651,3 +723,286 @@ def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
     assert r.status_code == 409
     assert "batch" not in probed, probed
     assert "main" in probed, probed
+
+
+def test_server_builds_every_configured_slot(test_config):
+    """Slot construction follows configuration, including a third slot."""
+    from dataclasses import replace
+    from manager.slot_config import SlotConfig
+    from manager.app import ServerState
+
+    cfg = replace(test_config, slots=(
+        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
+        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+    ))
+    server = ServerState(cfg)
+
+    assert list(server.slots) == ["main", "batch", "re"]
+    assert server.slots["re"].port == 8084
+    assert server.slots["re"].queue.max_size == 30
+    assert server.slots["re"].env_file == "/tmp/re.env"
+    assert server.slots["re"].systemd_unit == "re.service"
+    assert all(s.swapper is not None for s in server.slots.values())
+
+
+def test_slot_count_follows_configuration(test_config):
+    """A relationship, not a literal: adding a slot must not need a test edit.
+
+    Deliberately uses a 3-slot config (not test_config's own 2) so this
+    can't pass by coincidence against code that still hardcodes main/batch.
+    """
+    from dataclasses import replace
+    from manager.slot_config import SlotConfig
+    from manager.app import ServerState
+
+    cfg = replace(test_config, slots=(
+        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
+        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+    ))
+    server = ServerState(cfg)
+    assert len(server.slots) == len(cfg.slots)
+
+
+def test_status_reprobes_before_reporting(test_config):
+    """F8: /status must not serve stale startup state.
+
+    Fails against the pre-fix code, which reports whatever the startup probe
+    left behind until some chat request happens to trigger a reprobe.
+
+    Patches reprobe_all_slots_concurrently, not reprobe_all_slots: /status
+    uses the concurrent variant so its worst case is one probe timeout
+    rather than one per slot (see ServerState.reprobe_all_slots_concurrently
+    and the /status handler for why). reprobe_all_slots itself stays
+    sequential, unchanged, for the chat 409 path.
+    """
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from manager.app import create_app
+
+    with patch("manager.app.ServerState.reprobe_all_slots_concurrently",
+               new_callable=AsyncMock) as reprobe:
+        app = create_app(test_config)
+        with TestClient(app) as client:
+            reprobe.reset_mock()          # ignore any startup-time calls
+            resp = client.get("/status")
+    assert resp.status_code == 200
+    reprobe.assert_awaited_once()
+
+
+def test_status_still_reports_every_slot(test_config):
+    from fastapi.testclient import TestClient
+    from manager.app import create_app
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        body = client.get("/status").json()
+    assert len(body["slots"]) == len(test_config.slots)
+
+
+class _FakeV1ModelsServer:
+    """A real HTTP server for one /v1/models endpoint, fully controlled by
+    the test that owns it.
+
+    Narrow and local to test_status_survives_a_raising_slot_probe -- NOT
+    the general fake-backend fixture for the whole endpoint suite (that is
+    deferred). Needed here specifically because the fixture's slot ports
+    otherwise collide with whatever is actually running on this machine
+    (see the module's other /status tests, which rely on that real
+    backend and are unaffected by this one using a fake instead): a test
+    asserting that a *healthy* sibling survives a concurrent reprobe needs
+    a backend whose health and response timing it actually controls,
+    independent of what happens to be listening on 127.0.0.1:8083 right
+    now.
+    """
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        self.body: dict = {"data": []}
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                import json as _json
+                if self.path == "/v1/models":
+                    payload = _json.dumps(outer.body).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                pass  # keep test output quiet
+
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.host, self.port = self._httpd.server_address
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def shutdown(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=2)
+
+
+@pytest.fixture
+def fake_v1_models_backend():
+    server = _FakeV1ModelsServer()
+    yield server
+    server.shutdown()
+
+
+def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backend):
+    """A slot whose probe raises must not 500 /status or corrupt a sibling.
+
+    Fix-round-1/round-2/round-3 regression test. Without
+    return_exceptions=True, asyncio.gather propagates the first child
+    exception immediately, without awaiting or cancelling siblings -- so
+    reprobe_all_slots_concurrently's `async with httpx.AsyncClient()`
+    block exits and closes the shared client while another slot's probe
+    may still be running. On the real, unforced interleaving (confirmed by
+    the round-3 reviewer: 9/9 runs, batch.probe unwrapped, no client-side
+    sleep, backend delays of 0/50/300ms), the sibling is NEVER corrupted --
+    asyncio.gather's ensure_future queues both tasks' first step before
+    the awaiting coroutine suspends, so the sibling always reaches
+    client.get(...) and suspends inside connection setup before aclose()
+    runs. The 500 IS the real, every-run production symptom (main's
+    exception propagates uncaught, past nothing that would catch it, out
+    of the /status handler); the sibling-corruption limb is NOT a
+    naturally-occurring production race.
+
+    This test therefore does two different things, and is honest about
+    the difference:
+      - it demonstrates the 500 the way production actually produces it
+        (no forcing needed -- any raising slot 500s /status pre-fix);
+      - it additionally pins a PROPERTY -- "even if a sibling's request
+        happens to still be pending when the client closes, it must not
+        be corrupted" -- against a class of wrong fixes (e.g. one that
+        adds return_exceptions=True but also cancels siblings, or one
+        that closes the client eagerly). To exercise that property at all
+        requires deliberately forcing an interleaving production does not
+        naturally produce, since gather's task-scheduling order means the
+        sibling normally finishes sending before the raise propagates.
+        batch's probe is wrapped to `await asyncio.sleep(...)` BEFORE
+        calling the real, unmodified SlotState.probe against a real fake
+        backend, guaranteeing the shared client is already closed by the
+        time batch's real client.get() call happens, so batch
+        deterministically hits the client's real
+        "if self._state == ClientState.CLOSED: raise RuntimeError(...)"
+        check at send() ENTRY (httpx/_client.py) -- this is a request
+        that never got dispatched, not one that was in flight and got torn
+        down mid-request.
+
+    The 'batch' slot is pointed at fake_v1_models_backend (a real HTTP
+    server this test controls) rather than test_config's real port, so
+    batch's baseline health/model is deterministic instead of depending on
+    "whatever happens to be running on 127.0.0.1:8083 right now" (see the
+    other /status tests in this module, which do rely on that real
+    backend and are unaffected by this one using a fake instead).
+
+    The final assertion checks loaded_model against a SECOND, distinct
+    fake-backend body set just before the /status call (not the same
+    "batch-model" the startup probe already saw) -- this closes a
+    coverage gap the round-2 version left open: with the STALE body, a
+    wrong fix that cancelled the sibling instead of awaiting it (silently
+    leaving batch's prior state untouched) would still pass every
+    assertion, since "never probed" and "probed successfully" look
+    identical when the answer doesn't change. Asserting on the NEW value
+    proves the probe actually ran to completion, not merely that nothing
+    clobbered its old result.
+
+    slot.probe() itself is supposed to never raise (see its docstring and
+    the malformed-payload tests in test_slots.py); this poisons main's
+    probe directly to simulate some other bug reaching past that
+    guarantee, so the test isolates reprobe_all_slots_concurrently's own
+    fan-out behavior rather than re-testing slot.probe.
+    """
+    import dataclasses
+    from manager.slots import SlotState
+    from fastapi.testclient import TestClient
+    from manager.app import create_app
+
+    fake_v1_models_backend.body = {"data": [{"id": "batch-model.gguf"}]}
+
+    batch_sc = dataclasses.replace(
+        next(sc for sc in test_config.slots if sc.name == "batch"),
+        host=fake_v1_models_backend.host,
+        port=fake_v1_models_backend.port,
+    )
+    config = dataclasses.replace(
+        test_config,
+        slots=tuple(batch_sc if sc.name == "batch" else sc for sc in test_config.slots),
+    )
+
+    app = create_app(config)
+
+    # raise_server_exceptions=False: an unhandled exception in the /status
+    # handler must surface as a real 500 response here, not as a Python
+    # exception raised into this test -- so that a broken fix's two
+    # symptoms (the 500, and the corrupted sibling) can be asserted on
+    # independently instead of one masking the other.
+    with TestClient(app, raise_server_exceptions=False) as client:
+        server = client.app.state.server
+        main = server.slots["main"]
+        batch = server.slots["batch"]
+
+        # batch starts healthy from the real startup probe against the
+        # fake backend above -- deterministic, not dependent on this
+        # machine's state.
+        assert batch.healthy is True
+        assert batch.loaded_model == "batch-model"
+
+        # Change what the fake backend reports BEFORE triggering the
+        # reprobe below, to a value the startup probe never saw. The final
+        # assertion checks for THIS value, not "batch-model" again -- so a
+        # wrong fix that skips/cancels the sibling's probe instead of
+        # awaiting it (leaving batch's old state untouched) fails here,
+        # instead of accidentally passing because "never probed" and
+        # "probed successfully" look identical when the value doesn't
+        # change. See docstring's "coverage gap" paragraph.
+        fake_v1_models_backend.body = {"data": [{"id": "batch-model-v2.gguf"}]}
+
+        async def raise_immediately(probe_client):
+            raise AttributeError("boom: simulated bug past slot.probe's own guard")
+
+        real_probe = SlotState.probe  # unbound, unmodified
+
+        async def delayed_real_probe(probe_client):
+            # Long enough that main's synchronous raise has already
+            # propagated through gather and closed the shared client
+            # before this even attempts client.get() -- see docstring.
+            await asyncio.sleep(0.05)
+            await real_probe(batch, probe_client)
+
+        main.probe = AsyncMock(side_effect=raise_immediately)
+        batch.probe = AsyncMock(side_effect=delayed_real_probe)
+
+        resp = client.get("/status")
+
+        # main's raise propagates near-instantly, so the /status response
+        # above returns well before batch's 0.05s delayed_real_probe has
+        # even attempted its client.get() call. That orphaned coroutine
+        # (gather without return_exceptions=True does not cancel siblings)
+        # keeps running on TestClient's background portal thread after
+        # this thread resumes -- a REAL wall-clock sleep here (not
+        # asyncio.sleep; this thread isn't in that event loop) gives it
+        # time to finish and actually mutate batch's state before this
+        # `with` block exits and tears the portal down.
+        import time as _time
+        _time.sleep(0.2)
+
+    # The limb that matters most, asserted first so it can't be masked by
+    # the status-code assertion below: a genuinely healthy sibling must not
+    # be fabricated as dead just because another slot's probe raised.
+    assert batch.healthy is True
+    # The value changed above, not the one the startup probe already saw --
+    # this proves the reprobe actually ran to completion rather than a
+    # wrong fix silently leaving batch's prior state untouched.
+    assert batch.loaded_model == "batch-model-v2"
+    assert resp.status_code == 200

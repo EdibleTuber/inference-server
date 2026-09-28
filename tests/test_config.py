@@ -147,3 +147,46 @@ def test_batch_server_url_property():
         batch_queue_limit=20, batch_model_default="gemma-4-E4B-it-Q4_K_M",
     )
     assert cfg.batch_server_url == "http://127.0.0.1:8083"
+
+
+from manager.slot_config import SlotConfig
+
+
+def test_from_env_populates_slots_in_order(monkeypatch):
+    monkeypatch.setenv("SLOTS", "main,re,batch")
+    monkeypatch.setenv("SLOT_RE_PORT", "8084")
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert [s.name for s in cfg.slots] == ["main", "re", "batch"]
+
+
+def test_from_env_defaults_to_the_legacy_two_slots(monkeypatch):
+    monkeypatch.delenv("SLOTS", raising=False)
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert [s.name for s in cfg.slots] == ["main", "batch"]
+
+
+def test_legacy_ports_flow_into_slots(monkeypatch):
+    monkeypatch.delenv("SLOTS", raising=False)
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
+    monkeypatch.setenv("BATCH_SERVER_PORT", "8083")
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    by_name = {s.name: s for s in cfg.slots}
+    assert by_name["main"].port == 8081
+    assert by_name["batch"].port == 8083
+
+
+def test_test_config_fixture_slots_match_its_own_ports_and_env_files(test_config):
+    """test_config populates slots consistent with the legacy fields it also
+    sets, so ServerState(test_config) has a real main/batch pair to build
+    from -- not just an empty tuple that happens to type-check."""
+    assert [s.name for s in test_config.slots] == ["main", "batch"]
+    by_name = {s.name: s for s in test_config.slots}
+    assert by_name["main"].port == test_config.llama_server_port
+    assert by_name["main"].env_file == test_config.llama_server_env
+    assert by_name["batch"].port == test_config.batch_server_port
+    assert by_name["batch"].env_file == test_config.batch_server_env
+
+

@@ -1,0 +1,94 @@
+# systemd/llama-server-re.service
+#
+# Systemd unit for the llama.cpp inference backend -- re slot (P40 eGPU).
+#
+# Runs llama-server as the _llama user, bound to localhost only. Mirrors
+# systemd/llama-server.service (the main slot) in structure; see that file
+# for the rationale behind flags not re-explained here.
+#
+# Configuration is in /etc/llama/llama-server-re.env. The model manager
+# updates MODEL_PATH in that file when swapping models on this slot, then
+# restarts this service via sudo systemctl restart.
+#
+# NOT YET DEPLOYED: the P40 is not installed on this host. This unit exists
+# ahead of the hardware so the wiring is ready when it arrives (see
+# docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md Phase 4).
+# Until then, do not install or enable this unit, and `re` is deliberately
+# left out of SLOTS in config/manager.env -- fronting a slot with no
+# running backend would make the manager report it as permanently unhealthy.
+#
+# Install (once the P40 is installed):
+#   1. Get its UUID: nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv
+#   2. sudo cp systemd/llama-server-re.service /etc/systemd/system/
+#   3. sudo cp config/llama-server-re.env /etc/llama/llama-server-re.env
+#      then edit the deployed copy: set CUDA_VISIBLE_DEVICES to the P40's
+#      real UUID from step 1 (see that file's comment).
+#   4. sudo systemctl daemon-reload && sudo systemctl enable llama-server-re
+#   5. Add ",re" to SLOTS in /etc/llama/manager.env, then restart the manager.
+
+[Unit]
+Description=llama.cpp Inference Server (re slot, P40 eGPU)
+Documentation=https://github.com/ggerganov/llama.cpp
+
+# Wait for NVIDIA drivers before starting.
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged user — no shell, no home directory.
+User=_llama
+Group=_llama
+
+# Unit-level default for DEVICE — overridden by any DEVICE= in the env file.
+# MUST come before EnvironmentFile= below: systemd applies
+# Environment=/EnvironmentFile= in file order and later assignments win, so
+# if this line came after EnvironmentFile= it would always override the env
+# file's DEVICE= instead of being overridden by it. Mirrors
+# systemd/llama-server.service's DEVICE ordering exactly.
+#
+# CUDA_VISIBLE_DEVICES has no unit-level default here, deliberately: unlike
+# DEVICE=CUDA0 (a stable convention any CUDA slot can share), the UUID it
+# must hold is specific to one physical card in one machine, so it belongs
+# only in the host-local env file below — never in this repo-committed
+# unit. See config/llama-server-re.env's CUDA_VISIBLE_DEVICES comment.
+Environment=DEVICE=CUDA0
+
+# Load runtime configuration.
+EnvironmentFile=/etc/llama/llama-server-re.env
+
+# Start llama-server with config from env file. Same flag set as
+# systemd/llama-server.service (see that file for per-flag rationale) so
+# the two CUDA slots behave identically.
+# --parallel: 1, not 2. It DIVIDES --ctx-size across slots -- verified on
+#   b11136 that --ctx-size 8192 --parallel 2 yields "n_slots = 2,
+#   n_ctx_slot = 4096". This slot serves PARE, one conversation at a time,
+#   and wants the whole window.
+# $SAMPLING_ARGS: sampling comes from the env file, beside MODEL_PATH, because
+#   this slot is swappable too and sampling tuned for one model is wrong for
+#   the next. MUST stay unbraced: systemd word-splits $VAR but passes ${VAR}
+#   as a single argument, which llama-server rejects. Empty expands to nothing.
+ExecStart=/opt/llama/bin/llama-server \
+    --host ${HOST} \
+    --port ${PORT} \
+    --model ${MODEL_PATH} \
+    --device ${DEVICE} \
+    --n-gpu-layers ${N_GPU_LAYERS} \
+    --ctx-size ${CTX_SIZE} \
+    --ctx-checkpoints 4 \
+    --parallel 1 \
+    --cache-ram 0 \
+    --jinja \
+    $SAMPLING_ARGS
+
+# Auto-restart on crash with delay to prevent loops.
+Restart=on-failure
+RestartSec=5
+
+# Persistent file logs (also in journal via journalctl -u llama-server-re)
+StandardOutput=append:/var/log/llama/llama-server-re.log
+StandardError=append:/var/log/llama/llama-server-re.err
+
+[Install]
+WantedBy=multi-user.target

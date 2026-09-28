@@ -57,8 +57,13 @@ EnvironmentFile=/etc/llama/llama-server.env
 # --ctx-checkpoints: cap GPU-side context-checkpoint accumulation (default 32 is
 #   too high for this card — see ggml-org/llama.cpp#23181, --cache-ram 0 does not
 #   disable checkpoint creation, and unbounded growth can OOM the P40's VRAM).
-# --parallel: explicit slot count (was "auto" -> 4, then briefly 1); bounds how
-#   many concurrent conversations can each grow their own checkpoint stack at once.
+# --parallel: explicit slot count. NOTE it DIVIDES the context: --ctx-size is
+#   the total, split evenly across slots, so --parallel 2 halves what any single
+#   conversation can use. Verified on b11136: --ctx-size 8192 --parallel 2 gives
+#   "n_slots = 2, n_ctx_slot = 4096". This slot serves one agent at a time and
+#   wants the whole window, so it is 1. Raising it silently shrinks the usable
+#   context unless --ctx-size is raised to match. It also bounds how many
+#   concurrent conversations can each grow their own checkpoint stack at once.
 # --cache-ram 0: DISABLE llama-server's default host-memory KV/prompt cache.
 #   That cache (default ~8GB, llama.cpp PR #16391) accumulates KV across
 #   conversations and never releases, and its size cap is ineffective on Linux
@@ -67,6 +72,19 @@ EnvironmentFile=/etc/llama/llama-server.env
 #   and makes memory grow-under-load / release-on-idle instead of leaking.
 #   Trade-off: no cross-conversation prompt reuse (minor prefill cost).
 # --jinja: enable Jinja2 chat-template parsing (required for tool-calling).
+# $SAMPLING_ARGS: sampling flags, supplied by the env file. Deliberately NOT
+#   hardcoded here: this is the SWAPPABLE slot -- the manager rewrites
+#   MODEL_PATH in the env file on every /swap -- so sampling tuned for one
+#   model must travel with the model, not with the service definition. A
+#   hardcoded "--temp 0.2" set for gemma-4-26b outlived it and was silently
+#   applied to Qwen3.8-27B, which asks for 1.0.
+#
+#   IT MUST STAY UNBRACED. systemd word-splits $VAR but NOT ${VAR}: the braced
+#   form passes the whole string as ONE argument and llama-server rejects it.
+#   Verified on this host:
+#     $SA   -> [--temp] [1.0] [--top-k] [20]
+#     ${SA} -> [--temp 1.0 --top-k 20]        (single arg, wrong)
+#   Empty or unset expands to no arguments at all, which is the safe default.
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
@@ -75,9 +93,10 @@ ExecStart=/opt/llama/bin/llama-server \
     --n-gpu-layers ${N_GPU_LAYERS} \
     --ctx-size ${CTX_SIZE} \
     --ctx-checkpoints 4 \
-    --parallel 2 \
+    --parallel 1 \
     --cache-ram 0 \
-    --jinja
+    --jinja \
+    $SAMPLING_ARGS
 
 # Auto-restart on crash with delay to prevent loops.
 Restart=on-failure

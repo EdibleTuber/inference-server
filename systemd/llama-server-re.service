@@ -61,6 +61,14 @@ EnvironmentFile=/etc/llama/llama-server-re.env
 # Start llama-server with config from env file. Same flag set as
 # systemd/llama-server.service (see that file for per-flag rationale) so
 # the two CUDA slots behave identically.
+# --parallel: 1, not 2. It DIVIDES --ctx-size across slots -- verified on
+#   b11136 that --ctx-size 8192 --parallel 2 yields "n_slots = 2,
+#   n_ctx_slot = 4096". This slot serves PARE, one conversation at a time,
+#   and wants the whole window.
+# $SAMPLING_ARGS: sampling comes from the env file, beside MODEL_PATH, because
+#   this slot is swappable too and sampling tuned for one model is wrong for
+#   the next. MUST stay unbraced: systemd word-splits $VAR but passes ${VAR}
+#   as a single argument, which llama-server rejects. Empty expands to nothing.
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
@@ -69,9 +77,10 @@ ExecStart=/opt/llama/bin/llama-server \
     --n-gpu-layers ${N_GPU_LAYERS} \
     --ctx-size ${CTX_SIZE} \
     --ctx-checkpoints 4 \
-    --parallel 2 \
+    --parallel 1 \
     --cache-ram 0 \
-    --jinja
+    --jinja \
+    $SAMPLING_ARGS
 
 # Auto-restart on crash with delay to prevent loops.
 Restart=on-failure

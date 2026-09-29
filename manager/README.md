@@ -12,6 +12,8 @@ The manager is an OpenAI-compatible HTTP proxy. Clients send standard `POST /v1/
 
 Why proxy instead of clients talking directly to llama-server? The manager needs to intercept each request to check the `model` field and trigger a swap if needed. It also needs to queue requests so llama-server processes them one at a time. A transparent proxy layer makes both of those things possible without requiring any changes to existing clients.
 
+The manager also exposes the Anthropic API — `POST /v1/messages` and `POST /v1/messages/count_tokens` — so Anthropic-dialect clients (e.g. Claude Code) can point at the same endpoint. These are a byte passthrough: llama-server speaks the Anthropic protocol natively, so the manager never re-translates the body. The Anthropic routes get the same model validation, slot routing, FIFO queueing and serial-GPU semantics as the OpenAI routes; `count_tokens` skips the queue, since it is cheap local tokenization on the backend. Manager-level errors on the Anthropic routes use the Anthropic error envelope: `{"type": "error", "error": {"type": ..., "message": ...}}`.
+
 ### 2. Model switching
 
 The manager watches the `model` field on every chat completions request. If the requested model differs from the currently loaded model, it orchestrates a hot-swap: updates llama-server's config file, restarts the process via systemd, and waits for it to become healthy before proceeding.
@@ -148,6 +150,12 @@ The `--factory` flag tells uvicorn to call `create_app()` to get the FastAPI app
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/status
 curl http://127.0.0.1:8080/v1/models
+
+# Anthropic-dialect endpoints (byte passthrough to llama-server)
+curl http://127.0.0.1:8080/v1/messages -X POST -H 'content-type: application/json' \
+  -d '{"model": "<loaded-model>", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}'
+curl http://127.0.0.1:8080/v1/messages/count_tokens -X POST -H 'content-type: application/json' \
+  -d '{"model": "<loaded-model>", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
 With no llama-server running, each slot in `/status` reports `"healthy": false` (and `"loaded_model": null` if nothing has ever loaded successfully). Chat completions will fail with a 503 (no server to forward to). This is expected — everything up to the point of actually calling llama-server works.

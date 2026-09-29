@@ -1006,3 +1006,426 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     # wrong fix silently leaving batch's prior state untouched.
     assert batch.loaded_model == "batch-model-v2"
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Anthropic API: POST /v1/messages and POST /v1/messages/count_tokens
+# ---------------------------------------------------------------------------
+#
+# Slot-state fabrication note (applies to every test in this section):
+# TestClient runs the lifespan, so the startup probe has already reached the
+# fixture's 127.0.0.1:8081/8083 ports -- which on this machine is not a
+# fixture, it is production. Every test below that sets slot state by hand
+# therefore stubs SlotState.probe to a no-op, exactly as
+# test_chat_completions_409_when_not_loaded does above.
+#
+# Queue-consumer tests (passthrough, streaming, queue errors) build their own
+# app + `with TestClient(app)` so the per-slot background consumers exist, and
+# set slot state AFTER entering (the startup probe runs on enter). The
+# backend HTTP is mocked by patching manager.app.httpx.AsyncClient -- the same
+# precedent as test_embeddings_proxy in test_collection_endpoints.py -- so the
+# tests assert on the exact backend URL the consumer dials.
+
+def test_messages_non_streaming_passthrough(test_config, monkeypatch):
+    """POST /v1/messages is passed through, byte for byte, to the routed
+    slot's backend /v1/messages endpoint -- not re-translated to OpenAI."""
+    from manager.app import create_app
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        server = client.app.state.server
+        server.slots["main"].loaded_model = "test-model-q4"
+        server.slots["main"].healthy = True
+        server.slots["batch"].loaded_model = "test-model-q8"
+        server.slots["batch"].healthy = True
+
+        body = {
+            "model": "test-model-q4",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        backend_body = dict(body, id="msg_01", role="assistant")
+        with patch("manager.app.httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = json.dumps(backend_body).encode()
+            mock_resp.headers = {"content-type": "application/json"}
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            r = client.post("/v1/messages", json=body)
+
+        assert r.status_code == 200, r.text
+        assert r.json() == backend_body
+        mock_client.post.assert_awaited_once()
+        url = mock_client.post.await_args.args[0]
+        assert url == "http://127.0.0.1:8081/v1/messages"
+        assert mock_client.post.await_args.kwargs["json"] == body
+
+
+def test_messages_streaming_passthrough(test_config, monkeypatch):
+    """stream=true bodies take the consumer's SSE path: the backend's
+    /v1/messages is dialed (not /v1/chat/completions) and its bytes reach
+    the client unmodified."""
+    from manager.app import create_app
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    chunks = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_01"}}\n\n',
+        b'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    )
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        server = client.app.state.server
+        server.slots["main"].loaded_model = "test-model-q4"
+        server.slots["main"].healthy = True
+
+        body = {
+            "model": "test-model-q4",
+            "max_tokens": 64,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        async def fake_aiter_bytes():
+            for chunk in chunks:
+                yield chunk
+
+        mock_stream_resp = MagicMock()
+        mock_stream_resp.aiter_bytes = fake_aiter_bytes
+        stream_ctx = MagicMock()
+        stream_ctx.__aenter__ = AsyncMock(return_value=mock_stream_resp)
+        stream_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("manager.app.httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_client.stream = MagicMock(return_value=stream_ctx)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            r = client.post("/v1/messages", json=body)
+
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("text/event-stream")
+        assert r.content == b"".join(chunks)
+        method, url = mock_client.stream.call_args.args[:2]
+        assert method == "POST"
+        assert url == "http://127.0.0.1:8081/v1/messages"
+        assert mock_client.stream.call_args.kwargs["json"] == body
+
+
+def _anthropic_error_envelope(r):
+    """Assert r is an Anthropic-shaped error and return its error dict."""
+    body = r.json()
+    assert body["type"] == "error"
+    assert set(body.keys()) == {"type", "error"}
+    err = body["error"]
+    assert set(err.keys()) == {"type", "message"}
+    return err
+
+
+def test_messages_invalid_json_is_anthropic_400(client):
+    r = client.post(
+        "/v1/messages", content=b"not json",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 400
+    assert _anthropic_error_envelope(r)["type"] == "invalid_request_error"
+
+
+def test_messages_missing_model_is_anthropic_400(client):
+    r = client.post("/v1/messages", json={
+        "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 400
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "invalid_request_error"
+    assert err["message"] == "model field is required"
+
+
+def test_messages_unknown_model_is_anthropic_404(client):
+    r = client.post("/v1/messages", json={
+        "model": "nonexistent-model", "max_tokens": 1, "messages": [],
+    })
+    assert r.status_code == 404
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "not_found_error"
+    assert "nonexistent-model" in err["message"]
+
+
+def test_messages_not_loaded_is_anthropic_409(client, monkeypatch):
+    """Same reprobe-before-409 semantics as the chat path (see
+    test_chat_completions_409_when_not_loaded), Anthropic envelope."""
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = None
+    server.slots["batch"].healthy = False
+
+    r = client.post("/v1/messages", json={
+        "model": "test-model-q8",  # on disk, not loaded anywhere
+        "max_tokens": 1, "messages": [],
+    })
+    assert r.status_code == 409
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "model_not_loaded"
+    assert "test-model-q8" in err["message"]   # the requested (missing) model
+    assert "test-model-q4" in err["message"]   # what main actually has loaded
+
+
+def test_messages_unhealthy_slot_is_anthropic_503(client, monkeypatch):
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = False
+
+    r = client.post("/v1/messages", json={
+        "model": "test-model-q4", "max_tokens": 1, "messages": [],
+    })
+    assert r.status_code == 503
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "api_error"
+    assert r.headers.get("retry-after") == "5"
+
+
+def test_messages_queue_full_is_anthropic_503(test_config, monkeypatch):
+    from manager.app import create_app
+    from manager.queue import RequestQueue
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        server = client.app.state.server
+        server.slots["main"].loaded_model = "test-model-q4"
+        server.slots["main"].healthy = True
+
+        async def full(item):
+            raise RequestQueue.QueueFullError()
+
+        server.slots["main"].queue.enqueue = full
+
+        r = client.post("/v1/messages", json={
+            "model": "test-model-q4", "max_tokens": 1, "messages": [],
+        })
+
+    assert r.status_code == 503
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "overloaded_error"
+    assert r.headers.get("retry-after") == "5"
+
+
+def test_messages_queue_error_is_anthropic_503(test_config, monkeypatch):
+    """A queued request that fails inside the consumer (swap failure drains
+    the queue with an error) surfaces as the Anthropic 503 shape."""
+    from manager.app import create_app
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        server = client.app.state.server
+        server.slots["main"].loaded_model = "test-model-q4"
+        server.slots["main"].healthy = True
+        server.ensure_model_on_slot = AsyncMock(return_value=False)
+
+        r = client.post("/v1/messages", json={
+            "model": "test-model-q4", "max_tokens": 1, "messages": [],
+        })
+
+    assert r.status_code == 503
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "api_error"
+    assert "Model swap failed" in err["message"]
+    assert r.headers.get("retry-after") == "5"
+
+
+def test_chat_completions_still_targets_openai_backend_path(test_config, monkeypatch):
+    """Refactor guard: now that the queue consumer is path-aware for the
+    Anthropic passthrough, /v1/chat/completions items must still be proxied
+    to the backend's OpenAI endpoint, not /v1/messages."""
+    from manager.app import create_app
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        server = client.app.state.server
+        server.slots["main"].loaded_model = "test-model-q4"
+        server.slots["main"].healthy = True
+
+        body = {
+            "model": "test-model-q4",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        with patch("manager.app.httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = json.dumps({"id": "chatcmpl_01", "choices": []}).encode()
+            mock_resp.headers = {"content-type": "application/json"}
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            r = client.post("/v1/chat/completions", json=body)
+
+        assert r.status_code == 200, r.text
+        url = mock_client.post.await_args.args[0]
+        assert url == "http://127.0.0.1:8081/v1/chat/completions"
+        assert mock_client.post.await_args.kwargs["json"] == body
+
+
+def test_count_tokens_passthrough(test_config, monkeypatch):
+    """POST /v1/messages/count_tokens is passed straight through to the
+    routed slot's backend -- no queue, no swap -- and the response is
+    byte-for-byte the backend's."""
+    from manager.app import create_app
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        server = client.app.state.server
+        server.slots["main"].loaded_model = "test-model-q4"
+        server.slots["main"].healthy = True
+        server.slots["batch"].loaded_model = "test-model-q8"
+        server.slots["batch"].healthy = True
+
+        body = {
+            "model": "test-model-q4",
+            "system": "be brief",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        with patch("manager.app.httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = json.dumps({"input_tokens": 42}).encode()
+            mock_resp.headers = {"content-type": "application/json"}
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            r = client.post("/v1/messages/count_tokens", json=body)
+
+        assert r.status_code == 200, r.text
+        assert r.json() == {"input_tokens": 42}
+        mock_client.post.assert_awaited_once()
+        url = mock_client.post.await_args.args[0]
+        assert url == "http://127.0.0.1:8081/v1/messages/count_tokens"
+        assert mock_client.post.await_args.kwargs["json"] == body
+        # Counting is direct passthrough: it never touches the GPU queue.
+        assert server.slots["main"].queue.depth == 0
+
+
+def test_count_tokens_missing_model_is_anthropic_400(client):
+    r = client.post("/v1/messages/count_tokens", json={"messages": []})
+    assert r.status_code == 400
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "invalid_request_error"
+    assert err["message"] == "model field is required"
+
+
+def test_count_tokens_unknown_model_is_anthropic_404(client):
+    r = client.post("/v1/messages/count_tokens", json={
+        "model": "nonexistent-model", "messages": [],
+    })
+    assert r.status_code == 404
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "not_found_error"
+    assert "nonexistent-model" in err["message"]
+
+
+def test_count_tokens_not_loaded_is_anthropic_409(client, monkeypatch):
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = True
+    server.slots["batch"].loaded_model = None
+    server.slots["batch"].healthy = False
+
+    r = client.post("/v1/messages/count_tokens", json={
+        "model": "test-model-q8", "messages": [],
+    })
+    assert r.status_code == 409
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "model_not_loaded"
+    assert "test-model-q8" in err["message"]
+    assert "test-model-q4" in err["message"]
+
+
+def test_count_tokens_unhealthy_slot_is_anthropic_503(client, monkeypatch):
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+
+    server = client.app.state.server
+    server.slots["main"].loaded_model = "test-model-q4"
+    server.slots["main"].healthy = False
+
+    r = client.post("/v1/messages/count_tokens", json={
+        "model": "test-model-q4", "messages": [],
+    })
+    assert r.status_code == 503
+    err = _anthropic_error_envelope(r)
+    assert err["type"] == "api_error"
+    assert r.headers.get("retry-after") == "5"

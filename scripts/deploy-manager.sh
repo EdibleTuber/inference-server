@@ -45,7 +45,11 @@ HEALTH="$BASE/health"
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
-if [ ! -d "$REPO/.git" ]; then
+# -d "$REPO/.git" is NOT the right test: in a git worktree, .git is a file
+# (a pointer into the main repo's .git/worktrees/), so a perfectly valid
+# worktree checkout was rejected. Ask git itself instead -- this passes for
+# both regular checkouts and worktrees, and still fails for plain copies.
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
   echo "ERROR: $REPO is not a git checkout. Deploying from a copy is how the"
   echo "drift this script exists to end got started."
   exit 2

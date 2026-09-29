@@ -10,6 +10,8 @@ Endpoints:
     GET  /status                              - Server state, model, GPU, queue info
     GET  /v1/models                           - List available GGUFs in OpenAI format
     POST /v1/chat/completions                 - Proxy to llama-server (with model swap)
+    POST /v1/messages                         - Anthropic API passthrough (same queue/swap semantics)
+    POST /v1/messages/count_tokens            - Anthropic token counting passthrough
     POST /v1/embeddings                       - Proxy to embeddings server
     GET  /collections                         - List registered collections
     POST /collections/{collection_id}/search  - Semantic search within a collection
@@ -22,6 +24,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -328,9 +331,13 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
 
     Waits on the slot's queue_event, dispatches items one-by-one through
     ensure_model_on_slot + proxy to the slot's backend URL.
+
+    The backend PATH is per-item: each endpoint stamps its own
+    item["backend_path"] when enqueuing, since OpenAI chat and Anthropic
+    messages are proxied by the same consumer to different backend
+    endpoints. The default keeps any un-stamped item on the OpenAI path.
     """
     slot = server.slots[slot_name]
-    backend_url = f"{slot.url}/v1/chat/completions"
 
     while True:
         await slot.queue_event.wait()
@@ -341,6 +348,7 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
             body: dict = item["body"]
             event: asyncio.Event = item["event"]
             model_name: str = body.get("model", "")
+            backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
 
             ok = await server.ensure_model_on_slot(slot_name, model_name)
             if not ok:
@@ -383,6 +391,167 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 asyncio.create_task(_reprobe_for(slot))
 
             event.set()
+
+
+# ---------------------------------------------------------------------------
+# Shared routing/enqueue core for the inference endpoints
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RouteDecision:
+    """Outcome of validating, routing and (for queued endpoints) waiting on a
+    request.
+
+    On success `response` holds the backend response built by the queue
+    consumer and `status` is None. On failure `status`/`code`/`message`
+    describe the error dialect-neutrally and the calling endpoint renders it
+    in its own API's error shape (see the two error shapers below), so the
+    OpenAI and Anthropic paths reject the same requests for the same reasons.
+    """
+    status: int | None = None
+    code: str | None = None
+    message: str = ""
+    slot_name: str | None = None
+    response: Response | None = None
+
+
+async def _validate_and_route(
+    server: "ServerState", body: dict,
+) -> tuple[_RouteDecision | None, str | None]:
+    """Validate the body and resolve the target slot, dialect-neutrally.
+
+    Shared by every inference endpoint (queued or not). Returns
+    (decision, None) on failure or (None, slot_name) on success.
+    """
+    model_name = body.get("model")
+    if not model_name:
+        return _RouteDecision(
+            status=400, code="missing_model", message="model field is required"
+        ), None
+
+    # Validate model exists.
+    if server.model_path(model_name) is None:
+        return _RouteDecision(
+            status=404, code="model_not_found",
+            message=f"Model not found: {model_name}",
+        ), None
+
+    slot_name = resolve_slot(model_name, server.slots)
+    if slot_name is None:
+        # Our view of the slots may simply be stale -- see
+        # reprobe_all_slots. Ask the backends before telling the caller to
+        # load something that may already be loaded.
+        await server.reprobe_all_slots()
+        slot_name = resolve_slot(model_name, server.slots)
+    if slot_name is None:
+        # Loaded on neither slot. Do NOT implicitly restart main; tell the
+        # caller WHAT IS loaded so the mismatch is self-evident, not just
+        # "not loaded". (Implicit swaps live only on POST /swap.)
+        loaded_desc = ", ".join(
+            f"{name}='{s.loaded_model or 'none'}'"
+            for name, s in server.slots.items()
+        )
+        return _RouteDecision(
+            status=409,
+            code="model_not_loaded",
+            message=(
+                f"model '{model_name}' not loaded on any slot "
+                f"(loaded: {loaded_desc}); POST /swap to load it, "
+                f"or request the model that is already loaded"
+            ),
+        ), None
+
+    slot = server.slots[slot_name]
+    if not slot.healthy and same_model(model_name, slot.loaded_model):
+        # Model IS loaded on this slot but the slot is unhealthy: typed 503.
+        return _RouteDecision(
+            status=503, code="slot_unavailable",
+            message=f"{slot_name} slot not ready", slot_name=slot_name,
+        ), None
+
+    return None, slot_name
+
+
+async def _route_and_wait(
+    server: "ServerState", body: dict, backend_path: str,
+) -> _RouteDecision:
+    """Validate, route, enqueue and wait -- the core of the queued endpoints.
+
+    `backend_path` is stamped on the queued item so the slot's consumer
+    proxies it to the right backend endpoint (see _queue_consumer).
+    """
+    decision, slot_name = await _validate_and_route(server, body)
+    if decision is not None:
+        return decision
+
+    event = asyncio.Event()
+    item: dict = {
+        "body": body, "event": event, "response": None, "error": None,
+        "backend_path": backend_path,
+    }
+    slot = server.slots[slot_name]
+
+    try:
+        await slot.queue.enqueue(item)
+    except RequestQueue.QueueFullError:
+        return _RouteDecision(
+            status=503, code="queue_full", message="Server busy",
+            slot_name=slot_name,
+        )
+
+    slot.queue_event.set()
+    await event.wait()
+
+    if item["error"]:
+        return _RouteDecision(
+            status=503, code="queue_error", message=item["error"],
+            slot_name=slot_name,
+        )
+    return _RouteDecision(response=item["response"])
+
+
+def _openai_error_response(decision: _RouteDecision) -> JSONResponse:
+    """Render a _RouteDecision failure in /v1/chat/completions's error shape
+    (pre-existing, unchanged)."""
+    if decision.code == "slot_unavailable":
+        err = {"type": f"{decision.slot_name}_unavailable", "message": decision.message}
+    elif decision.code in ("queue_full", "queue_error"):
+        err = {"message": decision.message, "type": "server_error"}
+    elif decision.code == "model_not_loaded":
+        err = {"type": "model_not_loaded", "message": decision.message}
+    else:  # missing_model, model_not_found
+        err = {"message": decision.message, "type": "invalid_request_error"}
+    headers = {"Retry-After": "5"} if decision.status == 503 else None
+    return JSONResponse({"error": err}, status_code=decision.status, headers=headers)
+
+
+def _anthropic_error_response(decision: _RouteDecision) -> JSONResponse:
+    """Render a _RouteDecision failure in the Anthropic error shape:
+    {"type": "error", "error": {"type": ..., "message": ...}}, with the inner
+    type taken from Anthropic's error taxonomy where one exists (409 "not
+    loaded on any slot" has no Anthropic analog and keeps its manager type).
+    """
+    type_by_code = {
+        "invalid_body": "invalid_request_error",
+        "missing_model": "invalid_request_error",
+        "model_not_found": "not_found_error",
+        "model_not_loaded": "model_not_loaded",
+        "slot_unavailable": "api_error",
+        "queue_full": "overloaded_error",
+        "queue_error": "api_error",
+    }
+    headers = {"Retry-After": "5"} if decision.status == 503 else None
+    return JSONResponse(
+        {
+            "type": "error",
+            "error": {
+                "type": type_by_code[decision.code],
+                "message": decision.message,
+            },
+        },
+        status_code=decision.status,
+        headers=headers,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -534,86 +703,76 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 {"error": "Invalid JSON body"}, status_code=400
             )
 
-        model_name = body.get("model")
-        if not model_name:
-            return JSONResponse(
-                {"error": {"message": "model field is required", "type": "invalid_request_error"}},
-                status_code=400,
-            )
+        decision = await _route_and_wait(
+            server, body, backend_path="v1/chat/completions"
+        )
+        if decision.response is not None:
+            return decision.response
+        return _openai_error_response(decision)
 
-        # Validate model exists.
-        if server.model_path(model_name) is None:
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": f"Model not found: {model_name}",
-                        "type": "invalid_request_error",
-                    }
-                },
-                status_code=404,
-            )
+    # ------------------------------------------------------------------
+    # POST /v1/messages
+    # ------------------------------------------------------------------
 
-        event = asyncio.Event()
-        item: dict = {"body": body, "event": event, "response": None, "error": None}
+    @app.post("/v1/messages")
+    async def messages(request: Request):
+        """Anthropic API passthrough.
 
-        slot_name = resolve_slot(model_name, server.slots)
-        if slot_name is None:
-            # Our view of the slots may simply be stale -- see
-            # reprobe_all_slots. Ask the backends before telling the caller to
-            # load something that may already be loaded.
-            await server.reprobe_all_slots()
-            slot_name = resolve_slot(model_name, server.slots)
-        if slot_name is None:
-            # Loaded on neither slot. Do NOT implicitly restart main; tell the
-            # caller WHAT IS loaded so the mismatch is self-evident, not just
-            # "not loaded". (Implicit swaps live only on POST /swap.)
-            loaded_desc = ", ".join(
-                f"{name}='{s.loaded_model or 'none'}'"
-                for name, s in server.slots.items()
-            )
-            return JSONResponse(
-                {"error": {
-                    "type": "model_not_loaded",
-                    "message": (
-                        f"model '{model_name}' not loaded on any slot "
-                        f"(loaded: {loaded_desc}); POST /swap to load it, "
-                        f"or request the model that is already loaded"
-                    ),
-                }},
-                status_code=409,
-            )
-        slot = server.slots[slot_name]
-
-        if not slot.healthy and same_model(model_name, slot.loaded_model):
-            # Model IS loaded on this slot but the slot is unhealthy: typed 503.
-            return JSONResponse(
-                {"error": {
-                    "type": f"{slot_name}_unavailable",
-                    "message": f"{slot_name} slot not ready",
-                }},
-                status_code=503,
-                headers={"Retry-After": "5"},
-            )
-
+        Same validation, routing, queueing and serial-GPU semantics as
+        /v1/chat/completions, but the body is proxied to the backend's native
+        /v1/messages endpoint (llama-server speaks Anthropic directly) and
+        manager-level errors use the Anthropic error shape.
+        """
         try:
-            await slot.queue.enqueue(item)
-        except RequestQueue.QueueFullError:
-            return JSONResponse(
-                {"error": {"message": "Server busy", "type": "server_error"}},
-                status_code=503,
-                headers={"Retry-After": "5"},
+            body = await request.json()
+        except Exception:
+            return _anthropic_error_response(
+                _RouteDecision(status=400, code="invalid_body",
+                               message="Invalid JSON body")
             )
 
-        slot.queue_event.set()
-        await event.wait()
+        decision = await _route_and_wait(server, body, backend_path="v1/messages")
+        if decision.response is not None:
+            return decision.response
+        return _anthropic_error_response(decision)
 
-        if item["error"]:
-            return JSONResponse(
-                {"error": {"message": item["error"], "type": "server_error"}},
-                status_code=503,
-                headers={"Retry-After": "5"},
+    # ------------------------------------------------------------------
+    # POST /v1/messages/count_tokens
+    # ------------------------------------------------------------------
+
+    @app.post("/v1/messages/count_tokens")
+    async def count_tokens(request: Request):
+        """Anthropic token counting, direct passthrough.
+
+        Same validation and slot routing as /v1/messages (counting a prompt
+        requires the tokenizer of the model that would serve it), but it
+        bypasses the GPU queue entirely: it is a cheap local computation on
+        the backend, so it never queues, swaps, or blocks behind completions.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _anthropic_error_response(
+                _RouteDecision(status=400, code="invalid_body",
+                               message="Invalid JSON body")
             )
-        return item["response"]
+
+        decision, slot_name = await _validate_and_route(server, body)
+        if decision is not None:
+            return _anthropic_error_response(decision)
+
+        slot = server.slots[slot_name]
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{slot.url}/v1/messages/count_tokens",
+                json=body,
+                timeout=30,
+            )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
 
     # ------------------------------------------------------------------
     # POST /v1/embeddings

@@ -7,5 +7,12 @@
     delaycompress
     missingok
     notifempty
-    create 644 root llama
+    # copytruncate, not create: the units log via StandardError=append:, so
+    # systemd holds the file open for the life of the process. With `create`
+    # the old file is renamed and a fresh one made, but every llama-server
+    # keeps writing into the renamed *.err.1 until it restarts -- observed
+    # 2026-10-04, when all live logs sat in *.err.1 and *.err stayed empty.
+    # Truncating in place keeps the open handle valid (append mode). The cost
+    # is that lines written between the copy and the truncate are lost.
+    copytruncate
 }

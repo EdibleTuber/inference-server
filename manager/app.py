@@ -41,7 +41,7 @@ from manager.slots import SlotState
 from manager.swap import ModelSwapper
 from manager.vectordb import VectorDB
 from manager.collections import index_all_collections, index_collection, get_children
-from manager.routing import resolve_slot
+from manager.routing import home_slot, resolve_slot
 
 logger = logging.getLogger(__name__)
 
@@ -573,6 +573,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     _setup_logging(config)
 
     server = ServerState(config)
+    # Each slot's SLOT_<NAME>_MODELS list, for /status. Static: config is frozen.
+    home_models = {sc.name: list(sc.models) for sc in config.slots}
 
     # ------------------------------------------------------------------
     # Lifespan
@@ -662,7 +664,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         gpu = await get_gpu_info_async()
         return {
             "slots": {
-                name: slot.to_status_dict()
+                name: {**slot.to_status_dict(), "models": home_models.get(name, [])}
                 for name, slot in server.slots.items()
             },
             "gpu": gpu,
@@ -968,8 +970,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     async def swap_slot(request: Request):
         """Admin endpoint: swap a slot to a different model.
 
-        Body: {"model": str, "target": <slot name> (optional, default is
-        the first configured slot)}.
+        Body: {"model": str, "target": <slot name> (optional)}.
+        Without a target (absent or null) the model goes to its home slot from
+        SLOT_<NAME>_MODELS; a model with no home slot is refused with 400.
         No auth; LAN-only is the trust boundary.
         """
         try:
@@ -987,9 +990,23 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=400,
             )
 
-        target = body.get("target", next(iter(server.slots)))
-        if not isinstance(target, str) or target not in server.slots:
-            valid = ", ".join(repr(n) for n in server.slots)
+        valid = ", ".join(repr(n) for n in server.slots)
+        target = body.get("target")
+        if target is None:
+            # Untargeted: the operator's map decides, never "the first slot".
+            # agent_core clients send exactly this after a model_not_loaded
+            # 409; guessing a slot here is what used to evict main.
+            target = home_slot(model_name, config.slots)
+            if target is None:
+                return JSONResponse(
+                    {"error": {"type": "no_home_slot",
+                               "message": (
+                                   f"model '{model_name}' has no home slot; pass "
+                                   f"'target' (one of: {valid}) or list it in "
+                                   f"SLOT_<NAME>_MODELS")}},
+                    status_code=400,
+                )
+        elif not isinstance(target, str) or target not in server.slots:
             return JSONResponse(
                 {"error": {"type": "invalid_target",
                            "message": f"'target' must be one of: {valid}"}},

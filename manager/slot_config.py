@@ -11,11 +11,17 @@ The legacy LLAMA_SERVER_* / BATCH_SERVER_* variables remain the source for the
 'main' and 'batch' slots, so a manager.env written before slots were
 configurable produces exactly the behaviour it always did. A SLOT_<NAME>_*
 variable, when set, wins over the legacy name for that field.
+
+SLOT_<NAME>_MODELS lists the models whose home is that slot: an untargeted
+POST /swap loads a model onto its home slot (see routing.home_slot). It has no
+legacy alias, and a model listed on two slots is a startup error.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+from manager.names import match_key
 
 DEFAULT_SLOTS = ("main", "batch")
 
@@ -60,6 +66,7 @@ class SlotConfig:
     systemd_unit: str
     queue_limit: int
     device: str | None = None
+    models: tuple[str, ...] = ()   # models whose home is this slot (SLOT_<NAME>_MODELS)
 
 
 def _lookup(getenv, name: str, field: str, default):
@@ -93,6 +100,29 @@ def _as_int(raw, source: str):
         ) from None
 
 
+def _parse_models(raw: str | None) -> tuple[str, ...]:
+    """SLOT_<NAME>_MODELS -> tuple of names. Whitespace and empty entries dropped."""
+    if not raw:
+        return ()
+    return tuple(m.strip() for m in raw.split(",") if m.strip())
+
+
+def _check_one_home_per_model(slots) -> None:
+    """A model may call at most one slot home; compared via names.match_key."""
+    home: dict[str, str] = {}
+    for s in slots:
+        for m in s.models:
+            key = match_key(m)
+            other = home.get(key)
+            if other is not None and other != s.name:
+                raise ValueError(
+                    f"Configuration error: model {m!r} is listed in both "
+                    f"SLOT_{other.upper()}_MODELS and SLOT_{s.name.upper()}_MODELS; "
+                    f"a model has one home slot"
+                )
+            home[key] = s.name
+
+
 def build_slots(getenv=os.getenv) -> tuple[SlotConfig, ...]:
     """Build the ordered slot list. getenv is injectable so tests need no monkeypatching."""
     raw_names = getenv("SLOTS") or ",".join(DEFAULT_SLOTS)
@@ -120,5 +150,7 @@ def build_slots(getenv=os.getenv) -> tuple[SlotConfig, ...]:
             systemd_unit=unit or f"llama-server-{name}.service",
             queue_limit=_as_int(ql_raw, ql_src),
             device=getenv(f"SLOT_{name.upper()}_DEVICE"),
+            models=_parse_models(getenv(f"SLOT_{name.upper()}_MODELS")),
         ))
+    _check_one_home_per_model(slots)
     return tuple(slots)

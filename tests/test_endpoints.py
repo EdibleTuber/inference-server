@@ -39,7 +39,7 @@ def test_status_endpoint_has_slots(client):
         slot = data["slots"][slot_name]
         assert set(slot.keys()) == {
             "host", "port", "loaded_model", "healthy",
-            "last_swap_utc", "queue_depth", "queue_limit",
+            "last_swap_utc", "queue_depth", "queue_limit", "models",
         }
         assert isinstance(slot["healthy"], bool)
         assert isinstance(slot["queue_depth"], int)
@@ -452,6 +452,14 @@ def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
     assert r.status_code == 200, r.text
     assert swapped == ["main"]
+
+
+def test_status_reports_each_slots_home_models(three_slot_config):
+    from manager.app import create_app
+    client = TestClient(create_app(_with_homes(three_slot_config, re=["test-model-q8"])))
+    slots = client.get("/status").json()["slots"]
+    assert slots["re"]["models"] == ["test-model-q8"]
+    assert slots["main"]["models"] == []
 
 
 def test_swap_invalid_target(client):

@@ -573,6 +573,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     _setup_logging(config)
 
     server = ServerState(config)
+    # Each slot's SLOT_<NAME>_MODELS list, for /status. Static: config is frozen.
+    home_models = {sc.name: list(sc.models) for sc in config.slots}
 
     # ------------------------------------------------------------------
     # Lifespan
@@ -662,7 +664,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         gpu = await get_gpu_info_async()
         return {
             "slots": {
-                name: slot.to_status_dict()
+                name: {**slot.to_status_dict(), "models": home_models.get(name, [])}
                 for name, slot in server.slots.items()
             },
             "gpu": gpu,

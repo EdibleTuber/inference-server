@@ -175,7 +175,7 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 
 ### Switch to a different model
 
-Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target` (default: the first slot in `SLOTS`). The call returns once the slot is healthy on the new model — 30 seconds to several minutes for a large cold load — so give it a long client timeout.
+Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, and a model with no home slot is refused with 400. The call returns once the slot is healthy on the new model — 30 seconds to several minutes for a large cold load — so give it a long client timeout.
 
 ```bash
 curl -m 900 http://YOUR_LAN_IP:11434/swap \
@@ -184,7 +184,7 @@ curl -m 900 http://YOUR_LAN_IP:11434/swap \
 # → {"slot": "main", "model": "llama-3-8b-instruct-q5_k_m", "status": "ok"}
 ```
 
-Errors: 400 for a missing `model` or unknown `target`, 404 if no such GGUF exists, 503 if the swap fails.
+Errors: 400 for a missing `model` or unknown `target`, 400 `no_home_slot` for an untargeted swap of a model no slot lists in `SLOT_<NAME>_MODELS`, 404 if no such GGUF exists, 503 if the swap fails.
 
 ### Anthropic Messages API
 
@@ -224,7 +224,8 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "healthy": true,
       "last_swap_utc": "2026-09-23T14:02:11+00:00",
       "queue_depth": 0,
-      "queue_limit": 20
+      "queue_limit": 20,
+      "models": ["qwen2.5-7b-instruct-q4_k_m"]
     },
     "batch": {
       "host": "127.0.0.1",
@@ -233,7 +234,8 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "healthy": false,
       "last_swap_utc": null,
       "queue_depth": 0,
-      "queue_limit": 20
+      "queue_limit": 20,
+      "models": []
     },
     "re": {
       "host": "127.0.0.1",
@@ -242,7 +244,8 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "healthy": true,
       "last_swap_utc": "2026-10-04T09:12:40+00:00",
       "queue_depth": 1,
-      "queue_limit": 20
+      "queue_limit": 20,
+      "models": ["Qwen3.6-35B-A3B-UD-IQ4_NL_XL"]
     }
   },
   "gpu": {
@@ -385,6 +388,7 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
 | `SLOTS` | `main,batch` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,batch,re`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
 | `SLOT_<NAME>_HOST` / `_PORT` / `_ENV` / `_UNIT` / `_QUEUE_LIMIT` / `_DEVICE` | `127.0.0.1` / _(required)_ / `/etc/llama/llama-server-<name>.env` / `llama-server-<name>.service` / `20` / _(unset)_ | Per-slot configuration, read by `manager/slot_config.py`. For `main` and `batch` a `SLOT_*` variable overrides the legacy `LLAMA_SERVER_*` / `BATCH_*` name; any other slot (e.g. `re`) must set at least `SLOT_<NAME>_PORT` or the manager refuses to start. The template sets `SLOT_RE_PORT=8084`. `SLOT_RE_DEVICE` mirrors the P40's UUID from `CUDA_VISIBLE_DEVICES` in `llama-server-re.env`; `_DEVICE` is not yet read by any code. |
+| `SLOT_<NAME>_MODELS` | _(unset)_ | Comma-separated models whose home is this slot. An untargeted `POST /swap` loads a model onto its home slot; a model listed on no slot is refused with 400 instead of landing on the first slot. A model may appear in only one slot's list, or the manager refuses to start. The template sets `SLOT_MAIN_MODELS` and `SLOT_RE_MODELS`. |
 
 ---
 
@@ -397,7 +401,7 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/chat/completions` | OpenAI chat completions. Routes by the `model` field to the slot that has it loaded and queues there. 404 if no such GGUF, 409 if it is not loaded on any slot. Supports streaming (`"stream": true`). |
 | `POST` | `/v1/messages` | Anthropic Messages API. Byte passthrough to the slot's llama-server, with the same routing, queueing and status codes as chat completions; errors use the Anthropic error envelope. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
-| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; `target` defaults to the first slot in `SLOTS`. Returns when the slot is healthy. |
+| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; without `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, else 400. Returns when the slot is healthy. |
 | `POST` | `/v1/embeddings` | Proxy to llama-embeddings instance. OpenAI-compatible. |
 | `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
 | `GET` | `/status` | Per-slot health, loaded model, and queue depth; GPU VRAM usage; uptime. Re-probes every slot before answering. |
@@ -415,6 +419,7 @@ There is no single top-level readiness flag. Each entry under `/status`'s `slots
 
 - `healthy` (bool) — set from the outcome of the slot's most recent probe or swap attempt: `true` after a successful probe or swap, `false` at startup or after a failed one (backend unreachable, bad response, model file not found, or swap timeout). It is not updated while a swap is in progress — a slot that was healthy before a swap started still reports `healthy: true` until that swap resolves.
 - `loaded_model` — the model currently loaded on that slot, or `null` if none has loaded successfully yet. It generally lags behind a swap in progress, and is only cleared to `null` when a probe explicitly reports nothing loaded.
+- `models` — the slot's `SLOT_<NAME>_MODELS` list as configured (empty if unset): the models an untargeted `/swap` sends to this slot.
 
 A chat request for a model that isn't loaded on any slot returns **409** rather than triggering an implicit swap; load it first via `POST /swap`.
 

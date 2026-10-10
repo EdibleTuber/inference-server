@@ -19,16 +19,16 @@ A native llama.cpp inference server that fronts several llama-server backends ("
 │  │   Retrieval      POST /v1/embeddings, /collections/*           │  │
 │  │                                                                │  │
 │  │   routes by model → one FIFO queue per slot                    │  │
-│  └──────┬──────────────────┬──────────────────┬───────────┬───────┘  │
-│         │                  │                  │           │          │
-│  ┌──────┴───────┐  ┌───────┴──────┐  ┌────────┴─────┐  ┌──┴───────┐  │
-│  │ slot: main   │  │ slot: batch  │  │ slot: re     │  │embeddings│  │
-│  │ :8081        │  │ :8083        │  │ :8084        │  │ :8082    │  │
-│  │ V100 32GB    │  │ Vulkan iGPU  │  │ P40 24GB     │  │ CPU only │  │
-│  │ llama-server │  │ llama-server │  │ llama-server │  │          │  │
-│  │ .service     │  │ -batch       │  │ -re          │  │          │  │
-│  └──────┬───────┘  └───────┬──────┘  └────────┬─────┘  └──┬───────┘  │
-│         └──────────────────┴─────────┬────────┴───────────┘          │
+│  └──────┬─────────────────────────────────────┬───────────┬───────┘  │
+│         │                                     │           │          │
+│  ┌──────┴───────┐                    ┌────────┴─────┐  ┌──┴───────┐  │
+│  │ slot: main   │                    │ slot: re     │  │embeddings│  │
+│  │ :8081        │                    │ :8084        │  │ :8082    │  │
+│  │ V100 32GB    │                    │ P40 24GB     │  │ CPU only │  │
+│  │ llama-server │                    │ llama-server │  │          │  │
+│  │ .service     │                    │ -re          │  │          │  │
+│  └──────┬───────┘                    └────────┬─────┘  └──┬───────┘  │
+│         └────────────────────────────┬────────┴───────────┘          │
 │                     user: _llama     │  all bound to 127.0.0.1       │
 │  ┌───────────────────────────────────┴────────────────────────────┐  │
 │  │  /opt/llama/models/    (GGUF storage)                          │  │
@@ -40,7 +40,7 @@ Which slots exist, and in what routing order, is set by `SLOTS` in `/etc/llama/m
 
 ### Why this design?
 
-**Two-layer architecture.** Clients talk only to the model manager on port 11434. The manager talks to each slot's llama-server on localhost (`:8081` main, `:8083` batch, `:8084` re). No llama-server is directly exposed to the network. This separation means:
+**Two-layer architecture.** Clients talk only to the model manager on port 11434. The manager talks to each slot's llama-server on localhost (`:8081` main, `:8084` re). No llama-server is directly exposed to the network. This separation means:
 
 - The manager can restart a slot's llama-server for a model swap while other slots keep serving, and clients never need to know which backend holds which model.
 - Privilege separation: llama-server only needs to read model files and access its GPU. The manager only needs to restart the slot units and update their env files. Neither service needs broad system access.
@@ -77,7 +77,7 @@ This script creates:
 - A narrow sudoers entry so `_llama-mgr` can restart `llama-server.service`
 - The `llama-server`, `llama-manager` and `llama-embeddings` unit files (installed, not enabled — step 6 starts them)
 
-`setup.sh` covers the `main` slot only. The `batch` and `re` slots' units, env files and sudoers lines are installed by hand — see [Adding the batch and re slots](#adding-the-batch-and-re-slots). The template `config/manager.env` lists all three in `SLOTS`; drop the ones you have not installed, or the manager reports them as permanently unhealthy.
+`setup.sh` covers the `main` slot only. The `re` slot's unit, env file and sudoers line are installed by hand — see [Adding the re slot](#adding-the-re-slot). The template `config/manager.env` lists both in `SLOTS`; drop `re` if you have not installed it, or the manager reports them as permanently unhealthy.
 
 **2. Install the llama-server binary:**
 
@@ -227,16 +227,6 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "queue_limit": 20,
       "models": ["qwen2.5-7b-instruct-q4_k_m"]
     },
-    "batch": {
-      "host": "127.0.0.1",
-      "port": 8083,
-      "loaded_model": null,
-      "healthy": false,
-      "last_swap_utc": null,
-      "queue_depth": 0,
-      "queue_limit": 20,
-      "models": []
-    },
     "re": {
       "host": "127.0.0.1",
       "port": 8084,
@@ -364,10 +354,6 @@ Configuration for the llama-server inference backend. **The manager updates `MOD
 
 Configuration for the `re` slot's llama-server backend (Tesla P40). Same variables and semantics as `/etc/llama/llama-server.env` above, with `PORT=8084` and `CUDA_VISIBLE_DEVICES` set to the P40's UUID. See `config/llama-server-re.env` for the current model choice and how its `CTX_SIZE` was measured.
 
-### `/etc/llama/llama-server-batch.env`
-
-Configuration for the `batch` slot's llama-server backend (Vulkan, on the host's iGPU). `MODEL_PATH`, `CTX_SIZE`, `HOST` and `PORT` (`8083`) as above; `DEVICE` is a Vulkan selector (`Vulkan0`) rather than a CUDA one. See `config/llama-server-batch.env`.
-
 ### `/etc/llama/manager.env`
 
 Configuration for the model manager proxy service. The **Default** column is what `manager/config.py` and `manager/slot_config.py` use when a variable is unset; the shipped template `config/manager.env` sets several of these explicitly, and those values are what a `setup.sh` install gets.
@@ -377,8 +363,7 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `HOST` | `0.0.0.0` | Bind address for the manager. Set to your LAN IP to restrict access, or `0.0.0.0` for all interfaces. |
 | `PORT` | `8080` | Port the manager listens on. The template sets `11434`, which is what every example in this README assumes. |
 | `LLAMA_SERVER_HOST` / `LLAMA_SERVER_PORT` / `LLAMA_SERVER_ENV` / `LLAMA_SERVER_UNIT` | `127.0.0.1` / `8081` / `/etc/llama/llama-server.env` / `llama-server.service` | The `main` slot's backend address, env file (the manager writes `MODEL_PATH` here during swaps) and systemd unit. |
-| `BATCH_SERVER_HOST` / `BATCH_SERVER_PORT` / `BATCH_SERVER_ENV` / `BATCH_SERVER_UNIT` / `BATCH_QUEUE_LIMIT` | `127.0.0.1` / `8083` / `/etc/llama/llama-server-batch.env` / `llama-server-batch.service` / `20` | The same for the `batch` slot. |
-| `BATCH_MODEL_DEFAULT` | `gemma-4-E4B-it-Q4_K_M` | Loaded into `ManagerConfig` but not currently read by any other code; the batch slot's model is whatever its env file's `MODEL_PATH` says. |
+| `BATCH_SERVER_HOST` / `BATCH_SERVER_PORT` / `BATCH_SERVER_ENV` / `BATCH_SERVER_UNIT` / `BATCH_QUEUE_LIMIT` | `127.0.0.1` / `8083` / `/etc/llama/llama-server-batch.env` / `llama-server-batch.service` / `20` | Legacy names for a slot called `batch`, read only when `batch` is in `SLOTS` (it is in the code default, not the template). This host no longer runs a batch slot; the template does not set these. |
 | `MODELS_DIR` | `/opt/llama/models` | Directory containing GGUF model files. |
 | `QUEUE_LIMIT` | `20` | Maximum requests held in the `main` slot's FIFO queue (template: `50`). Requests beyond this get a 503. |
 | `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
@@ -386,7 +371,7 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `EMBEDDINGS_HOST` / `EMBEDDINGS_PORT` | `127.0.0.1` / `8082` | Where llama-embeddings listens. Always localhost. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
-| `SLOTS` | `main,batch` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,batch,re`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
+| `SLOTS` | `main,batch` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,re`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
 | `SLOT_<NAME>_HOST` / `_PORT` / `_ENV` / `_UNIT` / `_QUEUE_LIMIT` / `_DEVICE` | `127.0.0.1` / _(required)_ / `/etc/llama/llama-server-<name>.env` / `llama-server-<name>.service` / `20` / _(unset)_ | Per-slot configuration, read by `manager/slot_config.py`. For `main` and `batch` a `SLOT_*` variable overrides the legacy `LLAMA_SERVER_*` / `BATCH_*` name; any other slot (e.g. `re`) must set at least `SLOT_<NAME>_PORT` or the manager refuses to start. The template sets `SLOT_RE_PORT=8084`. `SLOT_RE_DEVICE` mirrors the P40's UUID from `CUDA_VISIBLE_DEVICES` in `llama-server-re.env`; `_DEVICE` is not yet read by any code. |
 | `SLOT_<NAME>_MODELS` | _(unset)_ | Comma-separated models whose home is this slot. An untargeted `POST /swap` loads a model onto its home slot; a model listed on no slot is refused with 400 instead of landing on the first slot. A model may appear in only one slot's list, or the manager refuses to start. The template sets `SLOT_MAIN_MODELS` and `SLOT_RE_MODELS`. |
 
@@ -541,14 +526,13 @@ Only new or modified files are re-embedded.
 | Unit | Slot / role |
 |---|---|
 | `llama-server` | `main` slot |
-| `llama-server-batch` | `batch` slot |
 | `llama-server-re` | `re` slot |
 | `llama-embeddings` | embeddings (CPU) |
 | `llama-manager` | the manager on `:11434` |
 
 ```bash
 # Start everything
-sudo systemctl start llama-server llama-server-batch llama-server-re llama-embeddings llama-manager
+sudo systemctl start llama-server llama-server-re llama-embeddings llama-manager
 
 # Restart just the manager (e.g., after config change)
 sudo systemctl restart llama-manager
@@ -560,7 +544,7 @@ sudo systemctl restart llama-server-re
 ### Check service status
 
 ```bash
-systemctl status llama-server llama-server-batch llama-server-re llama-embeddings llama-manager
+systemctl status llama-server llama-server-re llama-embeddings llama-manager
 ```
 
 ### View logs
@@ -584,7 +568,7 @@ Logs rotate weekly via `config/llama-logrotate` (installed to `/etc/logrotate.d/
 ### Enable on boot
 
 ```bash
-sudo systemctl enable llama-server llama-server-batch llama-server-re llama-embeddings llama-manager
+sudo systemctl enable llama-server llama-server-re llama-embeddings llama-manager
 ```
 
 ### Boot sequence
@@ -595,16 +579,16 @@ sudo systemctl enable llama-server llama-server-batch llama-server-re llama-embe
 
 If a slot's `MODEL_PATH` is empty or points to a nonexistent file on boot, that llama-server fails to start. The slot reports `"healthy": false` (with `"loaded_model": null`) in `/status`, and requests for it get 409 until you load a model with `POST /swap`.
 
-### Adding the batch and re slots
+### Adding the re slot
 
-`scripts/setup.sh` installs only the `main` slot. For each additional slot (`batch` shown; `re` is the same with `-re` names), and see the header comment of each unit file for host prerequisites:
+`scripts/setup.sh` installs only the `main` slot. For the `re` slot (any further slot is the same with its own names), and see the header comment of the unit file for host prerequisites:
 
 ```bash
-sudo cp systemd/llama-server-batch.service /etc/systemd/system/
-sudo cp config/llama-server-batch.env /etc/llama/llama-server-batch.env
-sudo chown _llama-mgr:_llama-mgr /etc/llama/llama-server-batch.env   # the manager rewrites MODEL_PATH on swap
+sudo cp systemd/llama-server-re.service /etc/systemd/system/
+sudo cp config/llama-server-re.env /etc/llama/llama-server-re.env
+sudo chown _llama-mgr:_llama-mgr /etc/llama/llama-server-re.env   # the manager rewrites MODEL_PATH on swap
 sudo systemctl daemon-reload
-sudo systemctl enable --now llama-server-batch
+sudo systemctl enable --now llama-server-re
 ```
 
 Then make sure the slot is in `SLOTS` in `/etc/llama/manager.env`, and that `/etc/sudoers.d/llama-manager` lets `_llama-mgr` restart that unit — `manager/swap.py` runs `sudo systemctl restart <unit>` for whichever slot it swaps, and the entry `setup.sh` writes covers `llama-server.service` only. Edit it with `sudo visudo -f /etc/sudoers.d/llama-manager`. For `re`, also set the P40's UUID in `CUDA_VISIBLE_DEVICES` (see the next section) before starting it.
@@ -684,7 +668,6 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 /etc/llama/
   ├── manager.env                   # runtime config for the model manager
   ├── llama-server.env              # main slot   (manager rewrites MODEL_PATH on swap)
-  ├── llama-server-batch.env        # batch slot  (installed by hand)
   ├── llama-server-re.env           # re slot     (installed by hand)
   └── collections.json              # collection definitions for document retrieval
 
@@ -693,7 +676,6 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 /etc/systemd/system/
   ├── llama-manager.service
   ├── llama-server.service          # main
-  ├── llama-server-batch.service    # batch (installed by hand)
   ├── llama-server-re.service       # re    (installed by hand)
   └── llama-embeddings.service
 ```
@@ -729,6 +711,6 @@ inference-server/
 - **No authentication.** This is intentional for an internal network. Use Tailscale for remote access (encrypted, authenticated at the network layer).
 - **Every llama-server is localhost-only.** No slot backend is exposed to the network. Only the manager can reach them.
 - **Dedicated system users.** `_llama` and `_llama-mgr` have no shell, no home directory, and minimal permissions. If a service were compromised, access is tightly scoped.
-- **Narrow sudoers.** `_llama-mgr` can only run `systemctl restart` on the slot units. `setup.sh` writes the entry for `llama-server.service`; each additional slot's unit is added by hand (see [Adding the batch and re slots](#adding-the-batch-and-re-slots)). Nothing else.
+- **Narrow sudoers.** `_llama-mgr` can only run `systemctl restart` on the slot units. `setup.sh` writes the entry for `llama-server.service`; each additional slot's unit is added by hand (see [Adding the re slot](#adding-the-re-slot)). Nothing else.
 - **llama-embeddings is localhost-only.** The embedding server on port 8082 is never exposed to the network.
 - **No TLS.** Acceptable on a trusted LAN or Tailscale tunnel. Do not expose port 11434 directly to the internet.

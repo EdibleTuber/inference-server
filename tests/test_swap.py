@@ -8,7 +8,7 @@ import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
-from manager.swap import ModelSwapper
+from manager.swap import ModelSwapper, sampling_args_for_model
 
 
 @pytest.fixture
@@ -44,6 +44,22 @@ def swapper(test_config, main_slot):
     return ModelSwapper(test_config, slot=main_slot)
 
 
+def test_sampling_args_for_model_reads_sidecar(tmp_path):
+    """Should read the .args sidecar when it exists."""
+    gguf = tmp_path / "MyModel.gguf"
+    gguf.touch()
+    args = tmp_path / "MyModel.args"
+    args.write_text("--temp 1.0 --spec-type draft-mtp\n")
+    assert sampling_args_for_model(str(gguf)) == "--temp 1.0 --spec-type draft-mtp"
+
+
+def test_sampling_args_for_model_returns_empty_when_no_sidecar(tmp_path):
+    """Should return empty string when no .args file exists."""
+    gguf = tmp_path / "bare-model.gguf"
+    gguf.touch()
+    assert sampling_args_for_model(str(gguf)) == ""
+
+
 def test_update_env_file(swapper, tmp_env_file):
     """Should replace MODEL_PATH with the new model."""
     swapper.update_env_file("/opt/llama/models/new-model.gguf")
@@ -61,6 +77,37 @@ def test_update_env_file_overwrites_existing(swapper, tmp_env_file):
     content = Path(tmp_env_file).read_text()
     assert "MODEL_PATH=/opt/llama/models/new-model.gguf" in content
     assert "old-model" not in content
+
+
+def test_update_env_file_writes_sampling_args(swapper, tmp_env_file):
+    """Should write SAMPLING_ARGS alongside MODEL_PATH."""
+    swapper.update_env_file(
+        "/opt/llama/models/new.gguf",
+        sampling_args="--temp 0.7 --spec-type draft-mtp",
+    )
+    content = Path(tmp_env_file).read_text()
+    assert "SAMPLING_ARGS=--temp 0.7 --spec-type draft-mtp" in content
+    assert "MODEL_PATH=/opt/llama/models/new.gguf" in content
+
+
+def test_update_env_file_clears_sampling_args(swapper, tmp_env_file):
+    """Swapping to a model with no .args file should clear SAMPLING_ARGS."""
+    swapper.update_env_file("/opt/llama/models/a.gguf", "--spec-type draft-mtp")
+    swapper.update_env_file("/opt/llama/models/b.gguf")
+    content = Path(tmp_env_file).read_text()
+    assert "SAMPLING_ARGS=\n" in content
+    assert "draft-mtp" not in content
+
+
+def test_update_env_file_inserts_sampling_args_when_missing(swapper, tmp_path):
+    """If env file has no SAMPLING_ARGS line, one is added after MODEL_PATH."""
+    env_file = tmp_path / "bare.env"
+    env_file.write_text("MODEL_PATH=\nHOST=127.0.0.1\n")
+    swapper._slot.env_file = str(env_file)
+
+    swapper.update_env_file("/opt/llama/models/m.gguf", "--temp 0.5")
+    content = env_file.read_text()
+    assert "MODEL_PATH=/opt/llama/models/m.gguf\nSAMPLING_ARGS=--temp 0.5\n" in content
 
 
 @pytest.mark.asyncio

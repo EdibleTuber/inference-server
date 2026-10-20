@@ -22,7 +22,7 @@ def tmp_env_file(tmp_path):
     """Create a temporary llama-server env file for testing model swaps."""
     env_file = tmp_path / "llama-server.env"
     env_file.write_text(
-        "MODEL_PATH=\nN_GPU_LAYERS=-1\nCTX_SIZE=4096\nHOST=127.0.0.1\nPORT=8081\n"
+        "MODEL_PATH=\nSAMPLING_ARGS=\nN_GPU_LAYERS=-1\nCTX_SIZE=4096\nHOST=127.0.0.1\nPORT=8081\n"
     )
     return str(env_file)
 
@@ -32,7 +32,7 @@ def tmp_batch_env_file(tmp_path):
     """Create a temporary llama-server-batch env file for testing batch swaps."""
     env_file = tmp_path / "llama-server-batch.env"
     env_file.write_text(
-        "MODEL_PATH=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=8083\n"
+        "MODEL_PATH=\nSAMPLING_ARGS=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=8083\n"
     )
     return str(env_file)
 

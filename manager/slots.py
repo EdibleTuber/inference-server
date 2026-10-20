@@ -168,6 +168,7 @@ class SlotState:
             "port": self.port,
             "loaded_model": self.loaded_model,
             "healthy": self.healthy,
+            "swapping": self.swap_lock.locked(),
             "last_swap_utc": self.last_swap_utc,
             "queue_depth": self.queue.depth,
             "queue_limit": self.queue.max_size,

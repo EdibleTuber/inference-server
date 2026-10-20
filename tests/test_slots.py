@@ -296,7 +296,7 @@ def test_mark_swapped_sets_all_three_fields():
 
 
 def test_to_status_dict_shape():
-    """to_status_dict returns exactly the 7 keys expected by the /status endpoint."""
+    """to_status_dict returns exactly the 8 keys expected by the /status endpoint."""
     slot = _make_slot(name="batch", port=8083)
     slot.loaded_model = "some-model"
     slot.healthy = True
@@ -305,13 +305,14 @@ def test_to_status_dict_shape():
     status = slot.to_status_dict()
 
     assert set(status.keys()) == {
-        "host", "port", "loaded_model", "healthy",
+        "host", "port", "loaded_model", "healthy", "swapping",
         "last_swap_utc", "queue_depth", "queue_limit",
     }
     assert status["host"] == "127.0.0.1"
     assert status["port"] == 8083
     assert status["loaded_model"] == "some-model"
     assert status["healthy"] is True
+    assert status["swapping"] is False
     assert status["last_swap_utc"] == "2026-04-19T14:00:00+00:00"
     assert status["queue_depth"] == 0
     assert status["queue_limit"] == 20

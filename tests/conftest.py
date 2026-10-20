@@ -119,7 +119,7 @@ def client_with_three_slots(three_slot_config, monkeypatch):
     """
     from manager.app import create_app
 
-    async def fake_swap_to(self, model_path):
+    async def fake_swap_to(self, model_path, sampling_args=""):
         return True
 
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap_to)

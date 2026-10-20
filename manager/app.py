@@ -38,7 +38,7 @@ from manager.names import display_name, match_key, same_model
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
-from manager.swap import ModelSwapper
+from manager.swap import ModelSwapper, sampling_args_for_model
 from manager.vectordb import VectorDB
 from manager.collections import index_all_collections, index_collection, get_children
 from manager.routing import home_slot, resolve_slot
@@ -254,8 +254,9 @@ class ServerState:
                 self._drain_slot_queue_with_error(slot_name, msg)
                 return False
 
+            sampling_args = sampling_args_for_model(path)
             logger.info("slot=%s swapping to %s", slot_name, model_name)
-            success = await slot.swapper.swap_to(path)
+            success = await slot.swapper.swap_to(path, sampling_args)
             if success:
                 slot.mark_swapped(display_name(path))   # store the real on-disk stem
                 return True

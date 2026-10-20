@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from manager.config import ManagerConfig
@@ -968,13 +968,17 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     # ------------------------------------------------------------------
 
     @app.post("/swap")
-    async def swap_slot(request: Request):
+    async def swap_slot(request: Request, background_tasks: BackgroundTasks):
         """Admin endpoint: swap a slot to a different model.
 
         Body: {"model": str, "target": <slot name> (optional)}.
         Without a target (absent or null) the model goes to its home slot from
         SLOT_<NAME>_MODELS; a model with no home slot is refused with 400.
         No auth; LAN-only is the trust boundary.
+
+        Returns 200 if the model is already loaded, 202 if a swap was started.
+        Callers poll GET /status (the slot's ``swapping`` and ``loaded_model``
+        fields) to know when the swap lands.
         """
         try:
             body = await request.json()
@@ -1021,15 +1025,21 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=404,
             )
 
-        ok = await server.ensure_model_on_slot(target, model_name)
-        if not ok:
-            return JSONResponse(
-                {"error": {"type": "swap_failed",
-                           "message": f"swap to {model_name} on {target} failed"}},
-                status_code=503,
-            )
+        slot = server.slots[target]
+        if slot.healthy and same_model(model_name, slot.loaded_model):
+            return {"slot": target, "model": slot.loaded_model, "status": "ok"}
 
-        return {"slot": target, "model": server.slots[target].loaded_model, "status": "ok"}
+        async def _do_swap():
+            ok = await server.ensure_model_on_slot(target, model_name)
+            if not ok:
+                logger.error("background swap failed: %s on slot %s",
+                             model_name, target)
+
+        background_tasks.add_task(_do_swap)
+        return JSONResponse(
+            {"slot": target, "model": model_name, "status": "swapping"},
+            status_code=202,
+        )
 
     # ------------------------------------------------------------------
     # GET /collections/{collection_id}/reindex/{job_id}

@@ -38,10 +38,11 @@ def test_status_endpoint_has_slots(client):
     for slot_name in ("main", "batch"):
         slot = data["slots"][slot_name]
         assert set(slot.keys()) == {
-            "host", "port", "loaded_model", "healthy",
+            "host", "port", "loaded_model", "healthy", "swapping",
             "last_swap_utc", "queue_depth", "queue_limit", "models",
         }
         assert isinstance(slot["healthy"], bool)
+        assert isinstance(slot["swapping"], bool)
         assert isinstance(slot["queue_depth"], int)
         assert isinstance(slot["queue_limit"], int)
 
@@ -354,26 +355,39 @@ def test_swap_valid_main(client, monkeypatch):
     app = client.app
     server = app.state.server
     # Short-circuit the actual swap; ensure_model_on_slot calls mark_swapped on success.
-    async def fake_swap(self, model):
+    async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
-    assert r.status_code == 200
+    assert r.status_code == 202
     body = r.json()
-    assert body == {"slot": "main", "model": "test-model-q4", "status": "ok"}
+    assert body == {"slot": "main", "model": "test-model-q4", "status": "swapping"}
+    # BackgroundTasks runs to completion in TestClient, so the swap has landed.
     assert server.slots["main"].loaded_model == "test-model-q4"
+
+
+def test_swap_already_loaded_returns_200(client, monkeypatch):
+    """If the model is already loaded and healthy, return 200 without re-swapping."""
+    server = client.app.state.server
+    slot = server.slots["main"]
+    slot.loaded_model = "test-model-q4"
+    slot.healthy = True
+
+    r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
+    assert r.status_code == 200
+    assert r.json() == {"slot": "main", "model": "test-model-q4", "status": "ok"}
 
 
 def test_swap_valid_batch(client, monkeypatch):
     app = client.app
     server = app.state.server
-    async def fake_swap(self, model):
+    async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
     r = client.post("/swap", json={"model": "test-model-q8", "target": "batch"})
-    assert r.status_code == 200
+    assert r.status_code == 202
     assert r.json()["slot"] == "batch"
     assert server.slots["batch"].loaded_model == "test-model-q8"
 
@@ -393,7 +407,7 @@ def _homes_client(config, monkeypatch, **homes):
     from manager.app import create_app
     swapped = []
 
-    async def fake_swap(self, model_path):
+    async def fake_swap(self, model_path, sampling_args=""):
         swapped.append(self._slot.name)
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
@@ -403,7 +417,7 @@ def _homes_client(config, monkeypatch, **homes):
 def test_untargeted_swap_goes_to_the_models_home_slot(three_slot_config, monkeypatch):
     client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q8"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert r.json()["slot"] == "re"
     assert swapped == ["re"]
 
@@ -413,14 +427,14 @@ def test_untargeted_swap_matches_home_case_and_suffix_insensitively(
     client, swapped = _homes_client(
         three_slot_config, monkeypatch, re=["TEST-MODEL-Q8.gguf"])
     r = client.post("/swap", json={"model": "test-model-q8"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert swapped == ["re"]
 
 
 def test_untargeted_swap_with_null_target_uses_the_map(three_slot_config, monkeypatch):
     client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q8", "target": None})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert swapped == ["re"]
 
 
@@ -450,7 +464,7 @@ def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
     # (pin) An explicit target is an operator override, even against the map.
     client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q4"])
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert swapped == ["main"]
 
 
@@ -498,21 +512,26 @@ def test_swap_nonexistent_model_file(client):
     assert r.status_code == 404
 
 
-def test_swap_fails_returns_503(client, monkeypatch):
-    async def fake_swap(self, model):
+def test_swap_failure_visible_via_slot_state(client, monkeypatch):
+    """A failed swap returns 202 (the swap runs in the background). The failure
+    is visible afterwards via the slot's healthy flag, not an HTTP error."""
+    server = client.app.state.server
+    async def fake_swap(self, model, sampling_args=""):
         return False  # health timeout
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
-    assert r.status_code == 503
-    assert r.json()["error"]["type"] == "swap_failed"
+    assert r.status_code == 202
+    assert r.json()["status"] == "swapping"
+    # BackgroundTasks completed: slot should be marked unhealthy.
+    assert not server.slots["main"].healthy
 
 
 def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
     """A slot beyond the legacy main/batch pair is a valid /swap target when configured."""
     resp = client_with_three_slots.post(
         "/swap", json={"model": "test-model-q4", "target": "re"})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     assert resp.json()["slot"] == "re"
 
 
@@ -532,20 +551,20 @@ def test_swap_rejects_an_unconfigured_target(client_with_three_slots):
         assert name in body, f"400 message should name configured slot {name!r}: {body}"
 
 
-def test_swap_echo_is_canonical(client, monkeypatch):
-    """A swap requested with odd casing/suffix echoes the canonical on-disk stem."""
+def test_swap_echo_is_canonical_after_completion(client, monkeypatch):
+    """After a swap, the slot's loaded_model is the canonical on-disk stem."""
     app = client.app
     server = app.state.server
 
-    async def fake_swap(self, model):
+    async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
     r = client.post("/swap", json={"model": "TEST-MODEL-Q4.gguf", "target": "main"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["model"] == "test-model-q4"                       # canonical
-    assert body["model"] == server.slots["main"].loaded_model     # agrees with /status
+    assert r.status_code == 202
+    # The 202 echoes the requested name; the canonical name lands after the swap.
+    # BackgroundTasks completed in TestClient, so loaded_model is set.
+    assert server.slots["main"].loaded_model == "test-model-q4"
 
 
 @pytest.mark.asyncio

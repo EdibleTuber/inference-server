@@ -12,6 +12,7 @@ pre-fix code and fail on their assertions rather than at import.
 """
 import asyncio
 import contextlib
+import json
 import socket
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -382,3 +383,294 @@ async def test_unhealthy_slot_mid_swap_is_not_probed(server, probes):
 
     assert probes.calls == []
     assert (decision.status, decision.code) == (503, "slot_unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Round 2, Task 2: proxy timeouts (audit F4)
+# ---------------------------------------------------------------------------
+
+def test_proxy_read_timeout_config(monkeypatch):
+    from manager.config import ManagerConfig
+    monkeypatch.delenv("PROXY_READ_TIMEOUT", raising=False)
+    assert ManagerConfig.from_env().proxy_read_timeout == 1800
+    monkeypatch.setenv("PROXY_READ_TIMEOUT", "60")
+    assert ManagerConfig.from_env().proxy_read_timeout == 60
+
+
+@pytest.mark.asyncio
+async def test_nonstream_request_uses_the_configured_read_timeout(server, backend):
+    load(server, "test-model-q4", healthy=True)
+    seen = []
+
+    def handler(request, n):
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"ok": True})
+    backend.handler = handler
+
+    item = make_item("test-model-q4")
+    async with consumer(server) as task:
+        await submit(server, item)
+        await answered(task, item)
+
+    assert seen[0]["read"] == 1800
+    assert seen[0]["connect"] is not None and seen[0]["connect"] <= 30
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_is_a_504_and_leaves_the_slot_healthy(server, probes, backend):
+    slot = load(server, "test-model-q4", healthy=True)
+
+    def handler(request, n):
+        raise httpx.ReadTimeout("timed out", request=request)
+    backend.handler = handler
+
+    item = make_item("test-model-q4")
+    async with consumer(server) as task:
+        await submit(server, item)
+        await answered(task, item)
+        await asyncio.sleep(0.05)            # let any fire-and-forget reprobe run
+
+    assert item["error_code"] == "upstream_timeout"
+    assert "1800s" in item["error"]
+    assert slot.healthy is True
+    assert probes.calls == []
+
+
+@pytest.mark.asyncio
+async def test_connect_error_still_marks_the_slot_unhealthy(server, backend):
+    slot = load(server, "test-model-q4", healthy=True)
+
+    def handler(request, n):
+        raise httpx.ConnectError("refused", request=request)
+    backend.handler = handler
+
+    item = make_item("test-model-q4")
+    async with consumer(server) as task:
+        await submit(server, item)
+        await answered(task, item)
+
+    assert "Proxy error" in item["error"]
+    assert item["error_code"] in (None, "queue_error")
+    assert slot.healthy is False
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_is_not_treated_as_a_busy_backend(server, backend):
+    """Only read/write timeouts mean "busy". A backend that won't accept a
+    connection is unhealthy, exactly like a refused connection."""
+    slot = load(server, "test-model-q4", healthy=True)
+
+    def handler(request, n):
+        raise httpx.ConnectTimeout("connect timed out", request=request)
+    backend.handler = handler
+
+    item = make_item("test-model-q4")
+    async with consumer(server) as task:
+        await submit(server, item)
+        await answered(task, item)
+
+    assert item["error_code"] != "upstream_timeout"
+    assert slot.healthy is False
+
+
+def test_upstream_timeout_maps_to_504():
+    d = app_mod._decision_from_item_error(
+        {"error": "main did not respond within 1800s", "error_code": "upstream_timeout"},
+        "main")
+    assert (d.status, d.code) == (504, "upstream_timeout")
+
+
+def test_upstream_timeout_error_shapes():
+    d = app_mod._RouteDecision(status=504, code="upstream_timeout",
+                               message="main did not respond within 1800s",
+                               slot_name="main")
+    oa = app_mod._openai_error_response(d)
+    an = app_mod._anthropic_error_response(d)
+    assert oa.status_code == an.status_code == 504
+    assert "retry-after" not in oa.headers and "retry-after" not in an.headers
+    assert json.loads(oa.body)["error"]["type"] == "upstream_timeout"
+    assert json.loads(an.body)["error"]["type"] == "api_error"
+
+
+# ---------------------------------------------------------------------------
+# Round 2, Task 3: streaming passes the backend status through (audit A2)
+# ---------------------------------------------------------------------------
+
+class TrackedStream(httpx.AsyncByteStream):
+    """Backend response body that records whether it was closed."""
+
+    def __init__(self, chunks=(), hold: asyncio.Event | None = None):
+        self.chunks = list(chunks)
+        self.hold = hold
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.hold is not None:
+            await self.hold.wait()
+
+    async def aclose(self):
+        self.closed = True
+
+
+def sse_backend(backend, *, chunks=(), hold=None, status=200):
+    """Make the backend answer with a tracked SSE stream; returns the list of
+    streams opened, so tests can assert every one was closed."""
+    opened: list[TrackedStream] = []
+
+    def handler(request, n):
+        stream = TrackedStream(chunks, hold)
+        opened.append(stream)
+        return httpx.Response(status, headers={"content-type": "text/event-stream"},
+                              stream=stream)
+    backend.handler = handler
+    return opened
+
+
+async def drive(response, *, disconnect: asyncio.Event | None = None,
+                slow_start: float = 0.0,
+                leave_after_first_chunk: bool = False) -> list[dict]:
+    """Run an ASGI response the way uvicorn does (ASGI spec 2.3, so Starlette
+    listens for http.disconnect alongside the stream)."""
+    sent: list[dict] = []
+    body_sent = asyncio.Event()
+
+    async def receive():
+        if leave_after_first_chunk:
+            await body_sent.wait()
+        else:
+            await (disconnect or asyncio.Event()).wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start" and slow_start:
+            await asyncio.sleep(slow_start)
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            body_sent.set()
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+             "method": "POST", "path": "/v1/chat/completions", "headers": []}
+    await asyncio.wait_for(response(scope, receive, send), 3)
+    return sent
+
+
+async def stream_item(server, model="test-model-q4"):
+    item = make_item(model, stream=True)
+    async with consumer(server) as task:
+        await submit(server, item)
+        await answered(task, item)
+    return item
+
+
+@pytest.mark.asyncio
+async def test_stream_backend_400_is_passed_through_as_json(server, backend):
+    load(server, "test-model-q4", healthy=True)
+    err = {"error": {"code": 400, "message": "Field 'temperature': type must be number",
+                     "type": "invalid_request_error"}}
+    opened: list = []
+
+    def handler(request, n):
+        stream = TrackedStream([json.dumps(err).encode()])
+        opened.append(stream)
+        return httpx.Response(400, headers={"content-type": "application/json"},
+                              stream=stream)
+    backend.handler = handler
+
+    item = await stream_item(server)
+
+    resp = item["response"]
+    assert not isinstance(resp, app_mod.StreamingResponse)
+    assert resp.status_code == 400
+    assert json.loads(resp.body) == err
+    assert len(opened) == 1 and opened[0].closed
+
+
+@pytest.mark.asyncio
+async def test_stream_success_relays_status_headers_and_chunks(server, backend):
+    load(server, "test-model-q4", healthy=True)
+    opened = sse_backend(backend, chunks=[b"data: a\n\n", b"data: [DONE]\n\n"])
+
+    item = await stream_item(server)
+    sent = await drive(item["response"])
+
+    start = sent[0]
+    assert start["status"] == 200
+    assert dict(start["headers"])[b"content-type"].startswith(b"text/event-stream")
+    assert b"".join(m.get("body", b"") for m in sent[1:]) == b"data: a\n\ndata: [DONE]\n\n"
+    assert len(opened) == 1 and opened[0].closed
+
+
+@pytest.mark.asyncio
+async def test_stream_is_closed_when_the_client_leaves_before_the_first_chunk(
+        server, backend):
+    load(server, "test-model-q4", healthy=True)
+    opened = sse_backend(backend, chunks=[b"data: a\n\n"], hold=asyncio.Event())
+
+    item = await stream_item(server)
+    gone = asyncio.Event()
+    gone.set()
+    await drive(item["response"], disconnect=gone, slow_start=0.05)
+
+    assert len(opened) == 1, "backend stream should be opened by the consumer"
+    assert opened[0].closed
+
+
+@pytest.mark.asyncio
+async def test_stream_is_closed_when_the_client_leaves_mid_stream(server, backend):
+    load(server, "test-model-q4", healthy=True)
+    opened = sse_backend(backend, chunks=[b"data: a\n\n"], hold=asyncio.Event())
+
+    item = await stream_item(server)
+    sent = await drive(item["response"], leave_after_first_chunk=True)
+
+    assert b"data: a\n\n" in [m.get("body") for m in sent]
+    assert len(opened) == 1 and opened[0].closed
+
+
+@pytest.mark.asyncio
+async def test_stream_connect_error_is_a_503_not_a_broken_stream(server, backend):
+    slot = load(server, "test-model-q4", healthy=True)
+
+    def handler(request, n):
+        raise httpx.ConnectError("refused", request=request)
+    backend.handler = handler
+
+    item = await stream_item(server)
+
+    assert item["response"] is None
+    assert "Proxy error" in item["error"]
+    assert slot.healthy is False
+
+
+@pytest.mark.asyncio
+async def test_stream_read_timeout_before_headers_is_a_504(server, backend):
+    slot = load(server, "test-model-q4", healthy=True)
+
+    def handler(request, n):
+        raise httpx.ReadTimeout("timed out", request=request)
+    backend.handler = handler
+
+    item = await stream_item(server)
+
+    assert item["response"] is None
+    assert item["error_code"] == "upstream_timeout"
+    assert slot.healthy is True
+
+
+@pytest.mark.asyncio
+async def test_stream_uses_the_configured_read_timeout(server, backend):
+    load(server, "test-model-q4", healthy=True)
+    seen = []
+
+    def handler(request, n):
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=TrackedStream([b"data: [DONE]\n\n"]))
+    backend.handler = handler
+
+    item = await stream_item(server)
+    await drive(item["response"])
+
+    assert seen and seen[0]["read"] == 1800

@@ -1,4 +1,12 @@
-# Audit findings (in progress)
+# Audit findings
+
+## Status
+
+- **Fixed in round 1** (PR #14, merge `a183d14`, deployed 2026-10-28): F1, F2, F3, F6, O1, O2, O3, A6, W3, W5.
+- **Fixed on the host** 2026-10-28: S8 (`_llama-mgr` added to group `llama`), S9 (`re` env file ownership and sudoers entry).
+- **Round 2** (`docs/superpowers/plans/2026-10-28-slot-lockup-round2.md`): S1, S2, S3, A2, A4, F4.
+- **Deferred to the design review:** A1, F5, W2 (whether a slot is busy until its response completes); O4, Q1 (slot state machine); Q2 (supervisor and hung-backend restart).
+- **Not yet scheduled:** A3, A5, S4–S7, D1–D5, W1, W4, X1, and the rest of Q3–Q14.
 
 Inputs: Qwen inventory passes p1–p6 (`docs/audit/qwen/out/`), each lead then
 read in source. Code cited is branch HEAD `2fbefeb`; deployed is `7b8ea97`,

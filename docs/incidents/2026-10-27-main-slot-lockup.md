@@ -1,7 +1,11 @@
 # Incident: main slot locked out, 2026-10-27 23:07–23:47 UTC
 
-Status: root-caused, **not fixed**. All defects below are pre-existing in the
-deployed code; none was introduced by a proposed change.
+Status: root-caused. F1, F2, F3 and F6 were fixed in round 1 (PR #14, merge
+`a183d14`, deployed 2026-10-28). F4 is in round 2
+(`docs/superpowers/plans/2026-10-28-slot-lockup-round2.md`); F5 is deferred to
+the design review. F7 was fixed on the host (group membership); F8 is in round
+2 as S1. All defects below were pre-existing in the deployed code; none was
+introduced by a proposed change.
 
 ## Provenance
 

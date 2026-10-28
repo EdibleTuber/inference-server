@@ -443,7 +443,12 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                         )
                     else:
                         async with httpx.AsyncClient() as client:
-                            resp = await client.post(backend_url, json=body, timeout=120)
+                            resp = await client.post(
+                                backend_url, json=body,
+                                timeout=httpx.Timeout(
+                                    config.proxy_read_timeout, connect=10.0,
+                                ),
+                            )
                         if resp.status_code >= 500:
                             slot.mark_unhealthy()
                             asyncio.create_task(_reprobe_for(slot))
@@ -452,6 +457,17 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                             status_code=resp.status_code,
                             media_type=resp.headers.get("content-type", "application/json"),
                         )
+                except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+                    # A slow but healthy backend: 504 upstream_timeout, the
+                    # slot stays healthy and no reprobe is scheduled (F4).
+                    # ConnectTimeout is deliberately NOT caught here: a
+                    # backend that won't accept connections is unhealthy.
+                    logger.exception("slot=%s upstream timeout: %s", slot_name, exc)
+                    item["error"] = (
+                        f"{slot_name} did not respond within "
+                        f"{config.proxy_read_timeout}s"
+                    )
+                    item["error_code"] = "upstream_timeout"
                 except Exception as exc:
                     logger.exception("slot=%s proxy error: %s", slot_name, exc)
                     item["error"] = f"Proxy error: {exc}"
@@ -515,6 +531,7 @@ def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
 
     `error_code` None or "queue_error" (e.g. items drained by a failed
     swap) is a 503 queue_error; "slot_unavailable" is the typed 503;
+    "upstream_timeout" is the 504 for a slow-but-healthy backend (F4);
     "model_not_loaded" is the 409 for a request whose model was swapped
     out while it was queued. The error shapers render these unchanged.
     """
@@ -523,6 +540,8 @@ def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
         status, code = 409, "model_not_loaded"
     elif code == "slot_unavailable":
         status, code = 503, "slot_unavailable"
+    elif code == "upstream_timeout":
+        status, code = 504, "upstream_timeout"
     else:  # None or "queue_error"
         status, code = 503, "queue_error"
     return _RouteDecision(
@@ -641,6 +660,8 @@ def _openai_error_response(decision: _RouteDecision) -> JSONResponse:
         err = {"message": decision.message, "type": "server_error"}
     elif decision.code == "model_not_loaded":
         err = {"type": "model_not_loaded", "message": decision.message}
+    elif decision.code == "upstream_timeout":
+        err = {"type": "upstream_timeout", "message": decision.message}
     else:  # missing_model, model_not_found
         err = {"message": decision.message, "type": "invalid_request_error"}
     headers = {"Retry-After": "5"} if decision.status == 503 else None
@@ -661,6 +682,7 @@ def _anthropic_error_response(decision: _RouteDecision) -> JSONResponse:
         "slot_unavailable": "api_error",
         "queue_full": "overloaded_error",
         "queue_error": "api_error",
+        "upstream_timeout": "api_error",
     }
     headers = {"Retry-After": "5"} if decision.status == 503 else None
     return JSONResponse(

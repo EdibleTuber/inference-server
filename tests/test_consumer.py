@@ -279,7 +279,7 @@ async def test_consumer_recovers_from_a_proxy_timeout_without_restarting(
         await answered(task, first, second)
         assert not task.done()
 
-    assert "Proxy error" in first["error"]
+    assert first["error_code"] == "upstream_timeout"
     assert second["response"] is not None and second["response"].status_code == 200
     assert swapped(slot) == []
 

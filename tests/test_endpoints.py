@@ -1354,7 +1354,7 @@ def test_messages_queue_error_is_anthropic_503(test_config, monkeypatch):
         server = client.app.state.server
         server.slots["main"].loaded_model = "test-model-q4"
         server.slots["main"].healthy = True
-        server.ensure_model_on_slot = AsyncMock(return_value=False)
+        server.ready_for = AsyncMock(return_value="unavailable")
 
         r = client.post("/v1/messages", json={
             "model": "test-model-q4", "max_tokens": 1, "messages": [],
@@ -1363,7 +1363,7 @@ def test_messages_queue_error_is_anthropic_503(test_config, monkeypatch):
     assert r.status_code == 503
     err = _anthropic_error_envelope(r)
     assert err["type"] == "api_error"
-    assert "Model swap failed" in err["message"]
+    assert "main slot not ready" in err["message"]
     assert r.headers.get("retry-after") == "5"
 
 

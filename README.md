@@ -178,10 +178,11 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, and a model with no home slot is refused with 400. The call returns **202** as soon as the swap has started — the swap itself runs in the background and takes 30 seconds to several minutes for a large cold load. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up).
 
 ```bash
-curl -m 900 http://YOUR_LAN_IP:11434/swap \
+curl http://YOUR_LAN_IP:11434/swap \
   -H "Content-Type: application/json" \
   -d '{"model": "llama-3-8b-instruct-q5_k_m", "target": "main"}'
-# → {"slot": "main", "model": "llama-3-8b-instruct-q5_k_m", "status": "ok"}
+# → 202, {"slot": "main", "model": "llama-3-8b-instruct-q5_k_m", "status": "swapping"}
+#   (or 200 with "status": "ok" if the model is already loaded)
 ```
 
 Errors: 400 for a missing `model` or unknown `target`, 400 `no_home_slot` for an untargeted swap of a model no slot lists in `SLOT_<NAME>_MODELS`, 404 if no such GGUF exists. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error; it leaves the slot `healthy: false` in `GET /status`.
@@ -407,7 +408,7 @@ There is no single top-level readiness flag. Each entry under `/status`'s `slots
 - `loaded_model` — the model currently loaded on that slot, or `null` if none has loaded successfully yet. It generally lags behind a swap in progress, and is only cleared to `null` when a probe explicitly reports nothing loaded.
 - `models` — the slot's `SLOT_<NAME>_MODELS` list as configured (empty if unset): the models an untargeted `/swap` sends to this slot.
 
-A chat request for a model that isn't loaded on any slot returns **409** rather than triggering an implicit swap; load it first via `POST /swap`.
+A chat request for a model that isn't loaded on any slot returns **409** rather than triggering an implicit swap; load it first via `POST /swap`. A request already queued when its model is swapped out gets the same 409, never a swap.
 
 ### Client timeout guidance
 

@@ -26,6 +26,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request, Response
@@ -46,6 +47,11 @@ from manager.routing import home_slot, resolve_slot
 logger = logging.getLogger(__name__)
 
 _start_time = time.time()
+
+# What ServerState.ready_for can answer. The consumer is the only caller, and
+# the only thing it is allowed to do with the answer is proxy (ready) or
+# answer an error (wrong_model, unavailable) -- never swap.
+Readiness = Literal["ready", "wrong_model", "unavailable"]
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +127,41 @@ class ServerState:
         if not models_dir.exists():
             return []
         return sorted(p.stem for p in models_dir.glob("*.gguf"))
+
+    # ------------------------------------------------------------------
+    # Readiness (read-only; the queue consumer's only gate)
+    # ------------------------------------------------------------------
+
+    async def ready_for(self, slot_name: str, model_name: str) -> Readiness:
+        """Whether the named slot can serve model_name right now.
+
+        Read-only with respect to the backend: never swaps, restarts or
+        rewrites anything -- that is ensure_model_on_slot's job, reachable
+        only from POST /swap. A chat request must not be able to restart a
+        slot out from under another request (O1, incident 2026-10-27).
+
+        Holds the slot's swap_lock for the whole body so the
+        same_model/healthy decision cannot race an in-flight swap.
+        """
+        slot = self.slots[slot_name]
+        async with slot.swap_lock:
+            if not same_model(model_name, slot.loaded_model):
+                return "wrong_model"
+            if slot.healthy:
+                return "ready"
+            # Same model but unhealthy: exactly one probe, on a client we own
+            # (the lock is ours, so the client never outlives this method).
+            try:
+                async with httpx.AsyncClient() as probe_client:
+                    await slot.probe(probe_client)
+            except Exception:
+                # The probe contract says it never raises; if it somehow
+                # does, this method's swap_lock context releases the lock and
+                # the answer is unavailable -- never a wedged slot.
+                logger.exception("slot=%s readiness probe raised", slot_name)
+            if slot.healthy and same_model(model_name, slot.loaded_model):
+                return "ready"
+            return "unavailable"
 
     # ------------------------------------------------------------------
     # Model swap
@@ -341,7 +382,10 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
     """Background task: process one slot's queue serially.
 
     Waits on the slot's queue_event, dispatches items one-by-one through
-    ensure_model_on_slot + proxy to the slot's backend URL.
+    a readiness check (ready_for -- read-only, never swaps or restarts)
+    + proxy to the slot's backend URL. A request whose model was swapped
+    out while it sat in the queue gets the 409 a fresh request would
+    (O1: chat requests never swap a slot).
 
     The backend PATH is per-item: each endpoint stamps its own
     item["backend_path"] when enqueuing, since OpenAI chat and Anthropic
@@ -361,10 +405,17 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
             model_name: str = body.get("model", "")
             backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
 
-            ok = await server.ensure_model_on_slot(slot_name, model_name)
-            if not ok:
+            readiness = await server.ready_for(slot_name, model_name)
+            if readiness == "wrong_model":
                 if item["error"] is None:
-                    item["error"] = f"Model swap failed on slot {slot_name}"
+                    item["error"] = _not_loaded_message(model_name, server.slots)
+                    item["error_code"] = "model_not_loaded"
+                    event.set()
+                continue
+            if readiness == "unavailable":
+                if item["error"] is None:
+                    item["error"] = f"{slot_name} slot not ready"
+                    item["error_code"] = "slot_unavailable"
                     event.set()
                 continue
 
@@ -426,6 +477,42 @@ class _RouteDecision:
     response: Response | None = None
 
 
+def _not_loaded_message(model_name: str, slots: dict[str, SlotState]) -> str:
+    """The 409 'not loaded on any slot' message, shared by the routing path
+    (a fresh request) and the queue consumer (a request routed before its
+    model was swapped out): WHAT IS loaded where, so the mismatch is
+    self-evident, not just 'not loaded', plus the remedy."""
+    loaded_desc = ", ".join(
+        f"{name}='{s.loaded_model or 'none'}'"
+        for name, s in slots.items()
+    )
+    return (
+        f"model '{model_name}' not loaded on any slot "
+        f"(loaded: {loaded_desc}); POST /swap to load it, "
+        f"or request the model that is already loaded"
+    )
+
+
+def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
+    """Map a queued item's error onto a _RouteDecision.
+
+    `error_code` None or "queue_error" (e.g. items drained by a failed
+    swap) is a 503 queue_error; "slot_unavailable" is the typed 503;
+    "model_not_loaded" is the 409 for a request whose model was swapped
+    out while it was queued. The error shapers render these unchanged.
+    """
+    code = item.get("error_code")
+    if code == "model_not_loaded":
+        status, code = 409, "model_not_loaded"
+    elif code == "slot_unavailable":
+        status, code = 503, "slot_unavailable"
+    else:  # None or "queue_error"
+        status, code = 503, "queue_error"
+    return _RouteDecision(
+        status=status, code=code, message=item["error"], slot_name=slot_name,
+    )
+
+
 async def _validate_and_route(
     server: "ServerState", body: dict,
 ) -> tuple[_RouteDecision | None, str | None]:
@@ -458,18 +545,10 @@ async def _validate_and_route(
         # Loaded on neither slot. Do NOT implicitly restart main; tell the
         # caller WHAT IS loaded so the mismatch is self-evident, not just
         # "not loaded". (Implicit swaps live only on POST /swap.)
-        loaded_desc = ", ".join(
-            f"{name}='{s.loaded_model or 'none'}'"
-            for name, s in server.slots.items()
-        )
         return _RouteDecision(
             status=409,
             code="model_not_loaded",
-            message=(
-                f"model '{model_name}' not loaded on any slot "
-                f"(loaded: {loaded_desc}); POST /swap to load it, "
-                f"or request the model that is already loaded"
-            ),
+            message=_not_loaded_message(model_name, server.slots),
         ), None
 
     slot = server.slots[slot_name]
@@ -498,7 +577,7 @@ async def _route_and_wait(
     event = asyncio.Event()
     item: dict = {
         "body": body, "event": event, "response": None, "error": None,
-        "backend_path": backend_path,
+        "error_code": None, "backend_path": backend_path,
     }
     slot = server.slots[slot_name]
 
@@ -514,10 +593,7 @@ async def _route_and_wait(
     await event.wait()
 
     if item["error"]:
-        return _RouteDecision(
-            status=503, code="queue_error", message=item["error"],
-            slot_name=slot_name,
-        )
+        return _decision_from_item_error(item, slot_name)
     return _RouteDecision(response=item["response"])
 
 

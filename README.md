@@ -369,6 +369,7 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `QUEUE_LIMIT` | `20` | Maximum requests held in the `main` slot's FIFO queue (template: `50`). Requests beyond this get a 503. |
 | `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
 | `RESTART_TIMEOUT` | `150` | Upper bound, in seconds, on a `systemctl restart` of a slot's unit during a swap. Both slot units have `TimeoutStopUSec=1min 30s`, so a restart can legitimately take ~90s before the new process starts; 150s covers that. Exceeding it fails the swap. |
+| `PROXY_READ_TIMEOUT` | `1800` | The longest, in seconds, the manager waits for the next bytes from the backend. For a non-streaming request that is effectively the whole generation; for a stream it is the longest silence, such as prefill before the first token. A read or write timeout answers 504 `upstream_timeout` and leaves the slot healthy. |
 | `LOG_FILE` | `/var/log/llama/manager.log` | Log file path for the model manager. |
 | `EMBEDDINGS_HOST` / `EMBEDDINGS_PORT` | `127.0.0.1` / `8082` | Where llama-embeddings listens. Always localhost. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
@@ -458,7 +459,7 @@ COLLECTIONS_CONFIG=/etc/llama/collections.json
 SKILLS_DB_PATH=/opt/llama/data/skills.db
 ```
 
-5. **Restart the manager** — indexing runs automatically on startup.
+5. **Restart the manager** — indexing starts automatically in the background, so a restart never blocks inference; `GET /collections/{id}/reindex/status` shows the startup job.
 
 ### API
 
@@ -516,8 +517,8 @@ Manager (:11434)
 └── /collections/*/docs/* → SQLite-vec (in-process)
 ```
 
-Documents are indexed on startup with SHA-256 hash-based change detection.
-Only new or modified files are re-embedded.
+Documents are indexed in the background on startup, with SHA-256 hash-based
+change detection. Only new or modified files are re-embedded.
 
 ---
 

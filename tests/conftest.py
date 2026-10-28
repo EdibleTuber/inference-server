@@ -188,4 +188,5 @@ def collection_app(collection_config):
 @pytest.fixture
 def collection_client(collection_app):
     with TestClient(collection_app) as client:
+        client.portal.call(client.app.state.server.reindex_registry.wait_idle)
         yield client

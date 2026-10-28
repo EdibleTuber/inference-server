@@ -31,6 +31,7 @@ from typing import Literal
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
@@ -41,7 +42,7 @@ from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
 from manager.swap import ModelSwapper, sampling_args_for_model
 from manager.vectordb import VectorDB
-from manager.collections import index_all_collections, index_collection, get_children
+from manager.collections import index_collection, load_collections_config, get_children
 from manager.routing import home_slot, resolve_slot
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,72 @@ async def _reprobe_for(slot) -> None:
             await slot.reconcile_on_error(probe_client)
 
 
+def _stream_close(ctx, client):
+    """Build the single idempotent closer for an opened backend stream.
+
+    Exits the stream context (closes the backend stream), then closes the
+    client that owns it. Idempotent because the relay calls it from BOTH the
+    generator's finally and its background task.
+    """
+    state = {"closed": False}
+
+    async def close() -> None:
+        if state["closed"]:
+            return
+        state["closed"] = True
+        try:
+            await ctx.__aexit__(None, None, None)
+        finally:
+            await client.aclose()
+
+    return close
+
+
+def _relay_stream(resp, close) -> StreamingResponse:
+    """Relay an already-opened backend stream (status < 400) to the client.
+
+    `close` runs from the generator's finally and again from the background
+    task; it is idempotent, so every path closes the backend stream: normal
+    end, client gone mid-stream (generator aborted -> finally), and client
+    gone before the first chunk (the generator never starts, so the
+    background task is the only closer).
+    """
+
+    async def gen():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await close()
+
+    return StreamingResponse(
+        gen(),
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "text/event-stream"),
+        background=BackgroundTask(close),
+    )
+
+
+def _collection_indexer(server, entry: dict):
+    """Build the `async (paths) -> stats` indexer for one collection entry.
+
+    Used by both startup (lifespan) and the POST /reindex endpoint, so the
+    two paths share one definition.
+    """
+
+    async def indexer(paths):
+        return await index_collection(
+            collection_id=entry["id"],
+            source_dir=entry["source_dir"],
+            doc_type=entry["doc_type"],
+            db=server.db,
+            embeddings=server.embeddings_client,
+            paths=paths,
+        )
+
+    return indexer
+
+
 # ---------------------------------------------------------------------------
 # Background queue consumer
 # ---------------------------------------------------------------------------
@@ -428,22 +495,49 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 is_streaming = body.get("stream", False)
                 try:
                     if is_streaming:
-                        # Note: streaming errors are out of scope for reconcile;
-                        # stream failures have too many non-health-related causes.
-                        async def _stream_gen(request_body=body, url=backend_url):
-                            async with httpx.AsyncClient() as client:
-                                async with client.stream(
-                                    "POST", url, json=request_body, timeout=None,
-                                ) as resp:
-                                    async for chunk in resp.aiter_bytes():
-                                        yield chunk
-                        item["response"] = StreamingResponse(
-                            _stream_gen(),
-                            media_type="text/event-stream",
-                        )
+                        # The consumer opens the backend stream itself so it
+                        # can see the status before the first byte: a 4xx/5xx
+                        # is passed through as a plain error response, only a
+                        # <400 is relayed (A2). Streaming errors stay out of
+                        # scope for reconcile, except 5xx like non-streaming.
+                        client = httpx.AsyncClient()
+                        try:
+                            ctx = client.stream(
+                                "POST", backend_url, json=body,
+                                timeout=httpx.Timeout(
+                                    config.proxy_read_timeout, connect=10.0,
+                                ),
+                            )
+                            resp = await ctx.__aenter__()
+                        except Exception:
+                            await client.aclose()
+                            raise
+                        close = _stream_close(ctx, client)
+                        if resp.status_code >= 400:
+                            try:
+                                content = await resp.aread()
+                            finally:
+                                await close()
+                            if resp.status_code >= 500:
+                                slot.mark_unhealthy()
+                                asyncio.create_task(_reprobe_for(slot))
+                            item["response"] = Response(
+                                content=content,
+                                status_code=resp.status_code,
+                                media_type=resp.headers.get(
+                                    "content-type", "application/json",
+                                ),
+                            )
+                        else:
+                            item["response"] = _relay_stream(resp, close)
                     else:
                         async with httpx.AsyncClient() as client:
-                            resp = await client.post(backend_url, json=body, timeout=120)
+                            resp = await client.post(
+                                backend_url, json=body,
+                                timeout=httpx.Timeout(
+                                    config.proxy_read_timeout, connect=10.0,
+                                ),
+                            )
                         if resp.status_code >= 500:
                             slot.mark_unhealthy()
                             asyncio.create_task(_reprobe_for(slot))
@@ -452,6 +546,17 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                             status_code=resp.status_code,
                             media_type=resp.headers.get("content-type", "application/json"),
                         )
+                except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+                    # A slow but healthy backend: 504 upstream_timeout, the
+                    # slot stays healthy and no reprobe is scheduled (F4).
+                    # ConnectTimeout is deliberately NOT caught here: a
+                    # backend that won't accept connections is unhealthy.
+                    logger.warning("slot=%s upstream timeout: %s", slot_name, exc)
+                    item["error"] = (
+                        f"{slot_name} did not respond within "
+                        f"{config.proxy_read_timeout}s"
+                    )
+                    item["error_code"] = "upstream_timeout"
                 except Exception as exc:
                     logger.exception("slot=%s proxy error: %s", slot_name, exc)
                     item["error"] = f"Proxy error: {exc}"
@@ -515,6 +620,7 @@ def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
 
     `error_code` None or "queue_error" (e.g. items drained by a failed
     swap) is a 503 queue_error; "slot_unavailable" is the typed 503;
+    "upstream_timeout" is the 504 for a slow-but-healthy backend (F4);
     "model_not_loaded" is the 409 for a request whose model was swapped
     out while it was queued. The error shapers render these unchanged.
     """
@@ -523,6 +629,8 @@ def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
         status, code = 409, "model_not_loaded"
     elif code == "slot_unavailable":
         status, code = 503, "slot_unavailable"
+    elif code == "upstream_timeout":
+        status, code = 504, "upstream_timeout"
     else:  # None or "queue_error"
         status, code = 503, "queue_error"
     return _RouteDecision(
@@ -641,6 +749,8 @@ def _openai_error_response(decision: _RouteDecision) -> JSONResponse:
         err = {"message": decision.message, "type": "server_error"}
     elif decision.code == "model_not_loaded":
         err = {"type": "model_not_loaded", "message": decision.message}
+    elif decision.code == "upstream_timeout":
+        err = {"type": "upstream_timeout", "message": decision.message}
     else:  # missing_model, model_not_found
         err = {"message": decision.message, "type": "invalid_request_error"}
     headers = {"Retry-After": "5"} if decision.status == 503 else None
@@ -661,6 +771,7 @@ def _anthropic_error_response(decision: _RouteDecision) -> JSONResponse:
         "slot_unavailable": "api_error",
         "queue_full": "overloaded_error",
         "queue_error": "api_error",
+        "upstream_timeout": "api_error",
     }
     headers = {"Retry-After": "5"} if decision.status == 503 else None
     return JSONResponse(
@@ -725,21 +836,52 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             for name in server.slots
         ]
 
-        # Initialize collection retrieval if configured.
+        # Initialize collection retrieval if configured. Indexing runs in the
+        # background so a restart never blocks inference startup (S3); the
+        # startup job shows up in GET /collections/{id}/reindex/status.
         if config.skills_db_path:
             try:
                 server.db = VectorDB(config.skills_db_path)
                 server.db.init_schema()
                 server.embeddings_client = EmbeddingsClient(config.embeddings_url)
-                await index_all_collections(
-                    config.collections_config, server.db, server.embeddings_client,
-                )
-                logger.info("Collection indexing complete")
             except Exception:
-                logger.exception("Collection indexing failed — endpoints will return 503")
+                server.db = None
+                logger.exception(
+                    "Collection retrieval initialization failed — "
+                    "collection endpoints will return 503"
+                )
+            if server.db is not None:
+                try:
+                    entries = load_collections_config(config.collections_config)
+                except Exception:
+                    logger.exception(
+                        "Could not read the collections config — "
+                        "serving the existing index"
+                    )
+                    entries = []
+                for entry in entries:
+                    try:
+                        # Register the collection first so the endpoints
+                        # recognize it immediately, even before indexing
+                        # finishes.
+                        server.db.upsert_collection(
+                            entry["id"], entry["source_dir"], entry["doc_type"],
+                        )
+                        await server.reindex_registry.start(
+                            collection_id=entry["id"],
+                            indexer=_collection_indexer(server, entry),
+                            paths=None,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not start indexing collection '%s' — "
+                            "serving the existing index", entry["id"],
+                        )
 
         yield
 
+        # Cancel any running reindex jobs before closing what they use.
+        await server.reindex_registry.shutdown()
         if server.embeddings_client:
             await server.embeddings_client.close()
         if server.db:
@@ -1044,19 +1186,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                     )
                 paths = list(raw_paths)
 
-        async def _indexer(job_paths):
-            return await index_collection(
-                collection_id=entry["id"],
-                source_dir=entry["source_dir"],
-                doc_type=entry["doc_type"],
-                db=server.db,
-                embeddings=server.embeddings_client,
-                paths=job_paths,
-            )
-
         job = await server.reindex_registry.start(
             collection_id=collection_id,
-            indexer=_indexer,
+            indexer=_collection_indexer(server, entry),
             paths=paths,
         )
         return JSONResponse(job.to_dict(), status_code=202)

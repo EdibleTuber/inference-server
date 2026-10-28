@@ -53,6 +53,8 @@ class ManagerConfig:
         batch_model_default: Default model name for the batch slot.
         slots: Ordered slot list built from SLOTS and SLOT_<NAME>_* (or legacy) env vars.
         restart_timeout: Seconds to allow a systemctl restart before it fails.
+        proxy_read_timeout: Seconds a proxied request may run before the
+            manager answers 504 upstream_timeout (audit F4).
     """
     host: str
     port: int
@@ -76,6 +78,7 @@ class ManagerConfig:
     batch_model_default: str
     slots: tuple[SlotConfig, ...] = ()
     restart_timeout: int = 150
+    proxy_read_timeout: int = 1800
 
     @property
     def llama_server_url(self) -> str:
@@ -118,4 +121,5 @@ class ManagerConfig:
             batch_model_default=os.getenv("BATCH_MODEL_DEFAULT", "gemma-4-E4B-it-Q4_K_M"),
             slots=build_slots(),
             restart_timeout=_int_env("RESTART_TIMEOUT", 150),
+            proxy_read_timeout=_int_env("PROXY_READ_TIMEOUT", 1800),
         )

@@ -1204,6 +1204,8 @@ def test_messages_streaming_passthrough(test_config, monkeypatch):
 
         mock_stream_resp = MagicMock()
         mock_stream_resp.aiter_bytes = fake_aiter_bytes
+        mock_stream_resp.status_code = 200
+        mock_stream_resp.headers = {"content-type": "text/event-stream"}
         stream_ctx = MagicMock()
         stream_ctx.__aenter__ = AsyncMock(return_value=mock_stream_resp)
         stream_ctx.__aexit__ = AsyncMock(return_value=False)

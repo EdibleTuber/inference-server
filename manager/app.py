@@ -31,6 +31,7 @@ from typing import Literal
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from manager.config import ManagerConfig
 from manager.embeddings import EmbeddingsClient
@@ -374,6 +375,52 @@ async def _reprobe_for(slot) -> None:
             await slot.reconcile_on_error(probe_client)
 
 
+def _stream_close(ctx, client):
+    """Build the single idempotent closer for an opened backend stream.
+
+    Exits the stream context (closes the backend stream), then closes the
+    client that owns it. Idempotent because the relay calls it from BOTH the
+    generator's finally and its background task.
+    """
+    state = {"closed": False}
+
+    async def close() -> None:
+        if state["closed"]:
+            return
+        state["closed"] = True
+        try:
+            await ctx.__aexit__(None, None, None)
+        finally:
+            await client.aclose()
+
+    return close
+
+
+def _relay_stream(resp, close) -> StreamingResponse:
+    """Relay an already-opened backend stream (status < 400) to the client.
+
+    `close` runs from the generator's finally and again from the background
+    task; it is idempotent, so every path closes the backend stream: normal
+    end, client gone mid-stream (generator aborted -> finally), and client
+    gone before the first chunk (the generator never starts, so the
+    background task is the only closer).
+    """
+
+    async def gen():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await close()
+
+    return StreamingResponse(
+        gen(),
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "text/event-stream"),
+        background=BackgroundTask(close),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Background queue consumer
 # ---------------------------------------------------------------------------
@@ -428,19 +475,41 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 is_streaming = body.get("stream", False)
                 try:
                     if is_streaming:
-                        # Note: streaming errors are out of scope for reconcile;
-                        # stream failures have too many non-health-related causes.
-                        async def _stream_gen(request_body=body, url=backend_url):
-                            async with httpx.AsyncClient() as client:
-                                async with client.stream(
-                                    "POST", url, json=request_body, timeout=None,
-                                ) as resp:
-                                    async for chunk in resp.aiter_bytes():
-                                        yield chunk
-                        item["response"] = StreamingResponse(
-                            _stream_gen(),
-                            media_type="text/event-stream",
-                        )
+                        # The consumer opens the backend stream itself so it
+                        # can see the status before the first byte: a 4xx/5xx
+                        # is passed through as a plain error response, only a
+                        # <400 is relayed (A2). Streaming errors stay out of
+                        # scope for reconcile, except 5xx like non-streaming.
+                        client = httpx.AsyncClient()
+                        try:
+                            ctx = client.stream(
+                                "POST", backend_url, json=body,
+                                timeout=httpx.Timeout(
+                                    config.proxy_read_timeout, connect=10.0,
+                                ),
+                            )
+                            resp = await ctx.__aenter__()
+                        except Exception:
+                            await client.aclose()
+                            raise
+                        close = _stream_close(ctx, client)
+                        if resp.status_code >= 400:
+                            try:
+                                content = await resp.aread()
+                            finally:
+                                await close()
+                            if resp.status_code >= 500:
+                                slot.mark_unhealthy()
+                                asyncio.create_task(_reprobe_for(slot))
+                            item["response"] = Response(
+                                content=content,
+                                status_code=resp.status_code,
+                                media_type=resp.headers.get(
+                                    "content-type", "application/json",
+                                ),
+                            )
+                        else:
+                            item["response"] = _relay_stream(resp, close)
                     else:
                         async with httpx.AsyncClient() as client:
                             resp = await client.post(
@@ -462,7 +531,7 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                     # slot stays healthy and no reprobe is scheduled (F4).
                     # ConnectTimeout is deliberately NOT caught here: a
                     # backend that won't accept connections is unhealthy.
-                    logger.exception("slot=%s upstream timeout: %s", slot_name, exc)
+                    logger.warning("slot=%s upstream timeout: %s", slot_name, exc)
                     item["error"] = (
                         f"{slot_name} did not respond within "
                         f"{config.proxy_read_timeout}s"

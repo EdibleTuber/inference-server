@@ -100,6 +100,20 @@ def test_from_env_llama_server_unit_default(monkeypatch):
     assert cfg.llama_server_unit == "llama-server.service"
 
 
+def test_from_env_restart_timeout_default(monkeypatch):
+    monkeypatch.delenv("RESTART_TIMEOUT", raising=False)
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert cfg.restart_timeout == 150
+
+
+def test_from_env_restart_timeout_override(monkeypatch):
+    monkeypatch.setenv("RESTART_TIMEOUT", "200")
+    from manager.config import ManagerConfig
+    cfg = ManagerConfig.from_env()
+    assert cfg.restart_timeout == 200
+
+
 def test_from_env_batch_defaults(monkeypatch):
     """Batch-slot fields have sensible defaults when env vars are absent."""
     for var in ("BATCH_SERVER_HOST", "BATCH_SERVER_PORT", "BATCH_SERVER_ENV",

@@ -5,6 +5,7 @@ Tests mock subprocess (systemctl) and HTTP (health polling) since
 we can't run a real llama-server in the test environment.
 """
 import asyncio
+import subprocess
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -143,6 +144,25 @@ async def test_restart_raises_on_failure(swapper):
         with pytest.raises(RuntimeError, match="Failed to restart"):
             await swapper.restart_llama_server()
 
+
+@pytest.mark.asyncio
+async def test_restart_timeout_is_a_runtime_error(swapper):
+    async def fake_executor(executor, fn):
+        return fn()
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["systemctl"], 150)), \
+         patch.object(asyncio.get_event_loop(), "run_in_executor", side_effect=fake_executor):
+        with pytest.raises(RuntimeError, match="timed out"):
+            await swapper.restart_llama_server()
+
+@pytest.mark.asyncio
+async def test_restart_uses_configured_timeout(swapper):
+    ok = MagicMock(returncode=0)
+    async def fake_executor(executor, fn):
+        return fn()
+    with patch("subprocess.run", return_value=ok) as run, \
+         patch.object(asyncio.get_event_loop(), "run_in_executor", side_effect=fake_executor):
+        await swapper.restart_llama_server()
+    assert run.call_args.kwargs["timeout"] == swapper._config.restart_timeout == 150
 
 @pytest.mark.asyncio
 async def test_wait_for_health_succeeds(swapper):

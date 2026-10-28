@@ -79,15 +79,21 @@ class ModelSwapper:
         unit = self._slot.systemd_unit
         logger.info("slot=%s restarting %s", self._slot.name, unit)
 
-        result = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: subprocess.run(
-                ["sudo", "systemctl", "restart", unit],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            ),
-        )
+        timeout = self._config.restart_timeout
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["sudo", "systemctl", "restart", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Restart of {unit} timed out after {timeout}s"
+            ) from exc
 
         if result.returncode != 0:
             raise RuntimeError(

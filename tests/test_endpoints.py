@@ -348,8 +348,14 @@ def test_chat_completions_cold_start_no_crash(client):
     assert r.status_code == 409  # not a 500
 
 
-def test_chat_completions_503_on_batch_unhealthy(client):
+def test_chat_completions_503_on_batch_unhealthy(client, monkeypatch):
     """Request for a model loaded on batch returns 503 if batch unhealthy."""
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
     app = client.app
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"

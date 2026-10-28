@@ -570,7 +570,25 @@ async def _validate_and_route(
 
     slot = server.slots[slot_name]
     if not slot.healthy and same_model(model_name, slot.loaded_model):
-        # Model IS loaded on this slot but the slot is unhealthy: typed 503.
+        # Model IS loaded on this slot but the slot is unhealthy. Our view
+        # may be stale -- the backend may have recovered, or even loaded a
+        # different model, since the last probe (F6) -- so reprobe once
+        # before answering. A slot mid-swap (lock held) is skipped by
+        # _reprobe_slot_if_unlocked, so this path never waits behind a swap.
+        async with httpx.AsyncClient() as probe_client:
+            await server._reprobe_slot_if_unlocked(slot_name, slot, probe_client)
+        if slot.healthy and same_model(model_name, slot.loaded_model):
+            # The probe confirms it: route normally.
+            return None, slot_name
+        if not same_model(model_name, slot.loaded_model):
+            # The probe reports a different loaded model: 409, exactly like a
+            # fresh request for a model that isn't loaded.
+            return _RouteDecision(
+                status=409,
+                code="model_not_loaded",
+                message=_not_loaded_message(model_name, server.slots),
+            ), None
+        # Still unhealthy on the same model: typed 503.
         return _RouteDecision(
             status=503, code="slot_unavailable",
             message=f"{slot_name} slot not ready", slot_name=slot_name,

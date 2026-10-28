@@ -61,6 +61,7 @@ class ReindexRegistry:
         self._jobs: dict[str, ReindexJob] = {}
         self._current: dict[str, str] = {}  # collection_id -> job_id of running job
         self._locks: dict[str, asyncio.Lock] = {}
+        self._tasks: set[asyncio.Task] = set()
 
     def get(self, job_id: str) -> Optional[ReindexJob]:
         return self._jobs.get(job_id)
@@ -117,23 +118,47 @@ class ReindexRegistry:
 
         # Spawn without holding the lock — the worker updates state via its own
         # handle and swaps status atomically.
-        asyncio.create_task(self._run_job(job, indexer))
+        task = asyncio.create_task(self._run_job(job, indexer))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return job
+
+    async def wait_idle(self) -> None:
+        """Return once no job task is running, including jobs started
+        while we wait."""
+        while self._tasks:
+            await asyncio.sleep(0.01)
+
+    async def shutdown(self) -> None:
+        """Cancel every running job and wait for all of them."""
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def _run_job(self, job: ReindexJob, indexer) -> None:
         job.status = "running"
         try:
             stats = await indexer(job.paths)
-            if not isinstance(stats, dict):
-                raise TypeError(f"indexer returned non-dict: {type(stats).__name__}")
-            # Merge only the keys we track
-            for key in ("new", "updated", "removed", "unchanged"):
-                if key in stats:
-                    job.stats[key] = int(stats[key])
-            job.status = "done"
+        except asyncio.CancelledError:
+            job.status = "error"
+            job.error = "cancelled"
+            raise
         except Exception as exc:
             logger.exception("reindex job %s failed", job.job_id)
             job.status = "error"
             job.error = f"{type(exc).__name__}: {exc}"
+        else:
+            if not isinstance(stats, dict):
+                raise TypeError(f"indexer returned non-dict: {type(stats).__name__}")
+            # Merge only the keys we track
+            for key in ("new", "updated", "removed", "unchanged", "errors"):
+                if key in stats:
+                    job.stats[key] = int(stats[key])
+            job.status = "done"
+            logger.info(
+                "reindex job %s for '%s' done: %s",
+                job.job_id, job.collection_id, job.stats,
+            )
         finally:
             job.finished_at = _utcnow()

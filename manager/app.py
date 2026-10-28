@@ -42,7 +42,7 @@ from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
 from manager.swap import ModelSwapper, sampling_args_for_model
 from manager.vectordb import VectorDB
-from manager.collections import index_all_collections, index_collection, get_children
+from manager.collections import index_collection, load_collections_config, get_children
 from manager.routing import home_slot, resolve_slot
 
 logger = logging.getLogger(__name__)
@@ -419,6 +419,26 @@ def _relay_stream(resp, close) -> StreamingResponse:
         media_type=resp.headers.get("content-type", "text/event-stream"),
         background=BackgroundTask(close),
     )
+
+
+def _collection_indexer(server, entry: dict):
+    """Build the `async (paths) -> stats` indexer for one collection entry.
+
+    Used by both startup (lifespan) and the POST /reindex endpoint, so the
+    two paths share one definition.
+    """
+
+    async def indexer(paths):
+        return await index_collection(
+            collection_id=entry["id"],
+            source_dir=entry["source_dir"],
+            doc_type=entry["doc_type"],
+            db=server.db,
+            embeddings=server.embeddings_client,
+            paths=paths,
+        )
+
+    return indexer
 
 
 # ---------------------------------------------------------------------------
@@ -816,21 +836,44 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             for name in server.slots
         ]
 
-        # Initialize collection retrieval if configured.
+        # Initialize collection retrieval if configured. Indexing runs in the
+        # background so a restart never blocks inference startup (S3); the
+        # startup job shows up in GET /collections/{id}/reindex/status.
         if config.skills_db_path:
             try:
                 server.db = VectorDB(config.skills_db_path)
                 server.db.init_schema()
                 server.embeddings_client = EmbeddingsClient(config.embeddings_url)
-                await index_all_collections(
-                    config.collections_config, server.db, server.embeddings_client,
-                )
-                logger.info("Collection indexing complete")
             except Exception:
-                logger.exception("Collection indexing failed — endpoints will return 503")
+                server.db = None
+                logger.exception(
+                    "Collection retrieval initialization failed — "
+                    "collection endpoints will return 503"
+                )
+            if server.db:
+                for entry in load_collections_config(config.collections_config):
+                    try:
+                        # Register the collection first so the endpoints
+                        # recognize it immediately, even before indexing
+                        # finishes.
+                        server.db.upsert_collection(
+                            entry["id"], entry["source_dir"], entry["doc_type"],
+                        )
+                        await server.reindex_registry.start(
+                            collection_id=entry["id"],
+                            indexer=_collection_indexer(server, entry),
+                            paths=None,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not start indexing collection '%s' — "
+                            "serving the existing index", entry["id"],
+                        )
 
         yield
 
+        # Cancel any running reindex jobs before closing what they use.
+        await server.reindex_registry.shutdown()
         if server.embeddings_client:
             await server.embeddings_client.close()
         if server.db:
@@ -1135,19 +1178,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                     )
                 paths = list(raw_paths)
 
-        async def _indexer(job_paths):
-            return await index_collection(
-                collection_id=entry["id"],
-                source_dir=entry["source_dir"],
-                doc_type=entry["doc_type"],
-                db=server.db,
-                embeddings=server.embeddings_client,
-                paths=job_paths,
-            )
-
         job = await server.reindex_registry.start(
             collection_id=collection_id,
-            indexer=_indexer,
+            indexer=_collection_indexer(server, entry),
             paths=paths,
         )
         return JSONResponse(job.to_dict(), status_code=202)

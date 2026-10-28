@@ -275,29 +275,3 @@ def load_collections_config(config_path: str) -> list[dict]:
 
     with open(path) as f:
         return json.load(f)
-
-
-async def index_all_collections(
-    config_path: str,
-    db: VectorDB,
-    embeddings: EmbeddingsClient,
-) -> None:
-    """Index all collections defined in the config file."""
-    collections = load_collections_config(config_path)
-    if not collections:
-        logger.info("No collections configured, skipping indexing")
-        return
-
-    for col in collections:
-        logger.info("Indexing collection '%s' from %s", col["id"], col["source_dir"])
-        stats = await index_collection(
-            collection_id=col["id"],
-            source_dir=col["source_dir"],
-            doc_type=col["doc_type"],
-            db=db,
-            embeddings=embeddings,
-        )
-        logger.info(
-            "Collection '%s': %d new, %d updated, %d removed, %d unchanged",
-            col["id"], stats["new"], stats["updated"], stats["removed"], stats["unchanged"],
-        )

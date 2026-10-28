@@ -459,7 +459,7 @@ COLLECTIONS_CONFIG=/etc/llama/collections.json
 SKILLS_DB_PATH=/opt/llama/data/skills.db
 ```
 
-5. **Restart the manager** — indexing runs automatically on startup.
+5. **Restart the manager** — indexing starts automatically in the background, so a restart never blocks inference; `GET /collections/{id}/reindex/status` shows the startup job.
 
 ### API
 
@@ -517,8 +517,8 @@ Manager (:11434)
 └── /collections/*/docs/* → SQLite-vec (in-process)
 ```
 
-Documents are indexed on startup with SHA-256 hash-based change detection.
-Only new or modified files are re-embedded.
+Documents are indexed in the background on startup, with SHA-256 hash-based
+change detection. Only new or modified files are re-embedded.
 
 ---
 

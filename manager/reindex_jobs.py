@@ -140,15 +140,6 @@ class ReindexRegistry:
         job.status = "running"
         try:
             stats = await indexer(job.paths)
-        except asyncio.CancelledError:
-            job.status = "error"
-            job.error = "cancelled"
-            raise
-        except Exception as exc:
-            logger.exception("reindex job %s failed", job.job_id)
-            job.status = "error"
-            job.error = f"{type(exc).__name__}: {exc}"
-        else:
             if not isinstance(stats, dict):
                 raise TypeError(f"indexer returned non-dict: {type(stats).__name__}")
             # Merge only the keys we track
@@ -160,5 +151,13 @@ class ReindexRegistry:
                 "reindex job %s for '%s' done: %s",
                 job.job_id, job.collection_id, job.stats,
             )
+        except asyncio.CancelledError:
+            job.status = "error"
+            job.error = "cancelled"
+            raise
+        except Exception as exc:
+            logger.exception("reindex job %s failed", job.job_id)
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
         finally:
             job.finished_at = _utcnow()

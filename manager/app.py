@@ -850,8 +850,16 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                     "Collection retrieval initialization failed — "
                     "collection endpoints will return 503"
                 )
-            if server.db:
-                for entry in load_collections_config(config.collections_config):
+            if server.db is not None:
+                try:
+                    entries = load_collections_config(config.collections_config)
+                except Exception:
+                    logger.exception(
+                        "Could not read the collections config — "
+                        "serving the existing index"
+                    )
+                    entries = []
+                for entry in entries:
                     try:
                         # Register the collection first so the endpoints
                         # recognize it immediately, even before indexing

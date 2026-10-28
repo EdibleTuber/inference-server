@@ -283,6 +283,31 @@ async def test_consumer_recovers_from_a_proxy_timeout_without_restarting(
     assert swapped(slot) == []
 
 
+@pytest.mark.asyncio
+async def test_backend_5xx_is_passed_through_and_does_not_restart(
+        server, probes, backend):
+    """A backend 5xx marks the slot unhealthy; the next request on the same
+    model must be served after a probe, not trigger a restart (F1 via 5xx)."""
+    slot = load(server, "test-model-q4", healthy=True)
+    probes.result = True
+
+    def handler(request, n):
+        if n == 1:
+            return httpx.Response(503, json={"error": "busy"})
+        return httpx.Response(200, json={"ok": True})
+    backend.handler = handler
+
+    first, second = make_item("test-model-q4"), make_item("test-model-q4")
+    async with consumer(server) as task:
+        await submit(server, first, second)
+        await answered(task, first, second)
+        assert not task.done()
+
+    assert first["error"] is None and first["response"].status_code == 503
+    assert second["response"] is not None and second["response"].status_code == 200
+    assert swapped(slot) == []
+
+
 # ---------------------------------------------------------------------------
 # Task 4: the consumer cannot die (F2)
 # ---------------------------------------------------------------------------

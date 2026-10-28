@@ -387,6 +387,12 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
     out while it sat in the queue gets the 409 a fresh request would
     (O1: chat requests never swap a slot).
 
+    Every dequeued item is answered exactly once (response or error) and
+    its event set exactly once: an Exception on any per-item step is
+    answered as a 503 queue_error for that item and the loop continues,
+    while cancellation (asyncio.CancelledError) still propagates and
+    cancels the consumer.
+
     The backend PATH is per-item: each endpoint stamps its own
     item["backend_path"] when enqueuing, since OpenAI chat and Anthropic
     messages are proxied by the same consumer to different backend
@@ -400,57 +406,68 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
 
         while not slot.queue.empty():
             item = await slot.queue.dequeue()
-            body: dict = item["body"]
             event: asyncio.Event = item["event"]
-            model_name: str = body.get("model", "")
-            backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
 
-            readiness = await server.ready_for(slot_name, model_name)
-            if readiness == "wrong_model":
-                if item["error"] is None:
+            try:
+                body: dict = item["body"]
+                model_name: str = body.get("model", "")
+                backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
+
+                readiness = await server.ready_for(slot_name, model_name)
+                if readiness == "wrong_model":
                     item["error"] = _not_loaded_message(model_name, server.slots)
                     item["error_code"] = "model_not_loaded"
                     event.set()
-                continue
-            if readiness == "unavailable":
-                if item["error"] is None:
+                    continue
+                if readiness == "unavailable":
                     item["error"] = f"{slot_name} slot not ready"
                     item["error_code"] = "slot_unavailable"
                     event.set()
-                continue
+                    continue
 
-            is_streaming = body.get("stream", False)
-            try:
-                if is_streaming:
-                    # Note: streaming errors are out of scope for reconcile;
-                    # stream failures have too many non-health-related causes.
-                    async def _stream_gen(request_body=body, url=backend_url):
+                is_streaming = body.get("stream", False)
+                try:
+                    if is_streaming:
+                        # Note: streaming errors are out of scope for reconcile;
+                        # stream failures have too many non-health-related causes.
+                        async def _stream_gen(request_body=body, url=backend_url):
+                            async with httpx.AsyncClient() as client:
+                                async with client.stream(
+                                    "POST", url, json=request_body, timeout=None,
+                                ) as resp:
+                                    async for chunk in resp.aiter_bytes():
+                                        yield chunk
+                        item["response"] = StreamingResponse(
+                            _stream_gen(),
+                            media_type="text/event-stream",
+                        )
+                    else:
                         async with httpx.AsyncClient() as client:
-                            async with client.stream(
-                                "POST", url, json=request_body, timeout=None,
-                            ) as resp:
-                                async for chunk in resp.aiter_bytes():
-                                    yield chunk
-                    item["response"] = StreamingResponse(
-                        _stream_gen(),
-                        media_type="text/event-stream",
-                    )
-                else:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.post(backend_url, json=body, timeout=120)
-                    if resp.status_code >= 500:
-                        slot.mark_unhealthy()
-                        asyncio.create_task(_reprobe_for(slot))
-                    item["response"] = Response(
-                        content=resp.content,
-                        status_code=resp.status_code,
-                        media_type=resp.headers.get("content-type", "application/json"),
-                    )
+                            resp = await client.post(backend_url, json=body, timeout=120)
+                        if resp.status_code >= 500:
+                            slot.mark_unhealthy()
+                            asyncio.create_task(_reprobe_for(slot))
+                        item["response"] = Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type", "application/json"),
+                        )
+                except Exception as exc:
+                    logger.exception("slot=%s proxy error: %s", slot_name, exc)
+                    item["error"] = f"Proxy error: {exc}"
+                    slot.mark_unhealthy()
+                    asyncio.create_task(_reprobe_for(slot))
+
             except Exception as exc:
-                logger.exception("slot=%s proxy error: %s", slot_name, exc)
-                item["error"] = f"Proxy error: {exc}"
-                slot.mark_unhealthy()
-                asyncio.create_task(_reprobe_for(slot))
+                # A per-item failure must never end the consumer (F2 part 2):
+                # answer this one item as a 503 queue_error and move on.
+                # asyncio.CancelledError is a BaseException, so a cancelled
+                # consumer still propagates and dies.
+                logger.exception("slot=%s internal error: %s", slot_name, exc)
+                item["error"] = f"Internal error on slot {slot_name}: {exc}"
+                item["error_code"] = "queue_error"
+                event.set()
+                continue
 
             event.set()
 

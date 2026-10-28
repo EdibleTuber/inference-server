@@ -124,6 +124,15 @@ cancels it on `http.disconnect`. Cancellation unwinds `_stream_gen`'s
 then cancels its task (`srv stop: cancel task` in llama-server.err). This
 narrows A3 to **non-streaming** requests and to waiting in the queue.
 
+Re-verified 2026-10-28 against a real socket (`tests/test_stream_disconnect_real.py`
+and a scratch probe), because a mocked stream misleads here. A mock whose close
+suspends predicts a leak on mid-stream disconnect, but with real httpx/httpcore
+the backend connection closes at once on every version tested: when a read is
+cancelled, httpcore closes the connection itself. The one path where the
+manager's own close is the only closer is a client that leaves before the first
+chunk. Round 2's relay covers that with `StreamingResponse(background=...)`, and
+the real-socket test fails if that close is removed.
+
 ## Docs vs code
 
 | # | Finding | Severity |

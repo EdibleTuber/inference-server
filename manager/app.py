@@ -26,6 +26,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request, Response
@@ -46,6 +47,11 @@ from manager.routing import home_slot, resolve_slot
 logger = logging.getLogger(__name__)
 
 _start_time = time.time()
+
+# What ServerState.ready_for can answer. The consumer is the only caller, and
+# the only thing it is allowed to do with the answer is proxy (ready) or
+# answer an error (wrong_model, unavailable) -- never swap.
+Readiness = Literal["ready", "wrong_model", "unavailable"]
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +127,41 @@ class ServerState:
         if not models_dir.exists():
             return []
         return sorted(p.stem for p in models_dir.glob("*.gguf"))
+
+    # ------------------------------------------------------------------
+    # Readiness (read-only; the queue consumer's only gate)
+    # ------------------------------------------------------------------
+
+    async def ready_for(self, slot_name: str, model_name: str) -> Readiness:
+        """Whether the named slot can serve model_name right now.
+
+        Read-only with respect to the backend: never swaps, restarts or
+        rewrites anything -- that is ensure_model_on_slot's job, reachable
+        only from POST /swap. A chat request must not be able to restart a
+        slot out from under another request (O1, incident 2026-10-27).
+
+        Holds the slot's swap_lock for the whole body so the
+        same_model/healthy decision cannot race an in-flight swap.
+        """
+        slot = self.slots[slot_name]
+        async with slot.swap_lock:
+            if not same_model(model_name, slot.loaded_model):
+                return "wrong_model"
+            if slot.healthy:
+                return "ready"
+            # Same model but unhealthy: exactly one probe, on a client we own
+            # (the lock is ours, so the client never outlives this method).
+            try:
+                async with httpx.AsyncClient() as probe_client:
+                    await slot.probe(probe_client)
+            except Exception:
+                # The probe contract says it never raises; if it somehow
+                # does, this method's swap_lock context releases the lock and
+                # the answer is unavailable -- never a wedged slot.
+                logger.exception("slot=%s readiness probe raised", slot_name)
+            if slot.healthy and same_model(model_name, slot.loaded_model):
+                return "ready"
+            return "unavailable"
 
     # ------------------------------------------------------------------
     # Model swap
@@ -256,12 +297,22 @@ class ServerState:
 
             sampling_args = sampling_args_for_model(path)
             logger.info("slot=%s swapping to %s", slot_name, model_name)
-            success = await slot.swapper.swap_to(path, sampling_args)
+            msg: str | None = None
+            try:
+                success = await slot.swapper.swap_to(path, sampling_args)
+            except Exception as exc:
+                # A raising swap is a failed swap, not a crash: the same
+                # failure tail as the timeout case (unhealthy, drained
+                # queue, False) so no caller ever sees an exception here.
+                logger.exception("slot=%s swap to %s raised", slot_name, model_name)
+                success = False
+                msg = f"Model swap failed on slot {slot_name}: {model_name}: {exc}"
             if success:
                 slot.mark_swapped(display_name(path))   # store the real on-disk stem
                 return True
 
-            msg = f"Model swap timed out on slot {slot_name}: {model_name}"
+            if msg is None:
+                msg = f"Model swap timed out on slot {slot_name}: {model_name}"
             slot.mark_unhealthy()
             self._drain_slot_queue_with_error(slot_name, msg)
             return False
@@ -331,7 +382,16 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
     """Background task: process one slot's queue serially.
 
     Waits on the slot's queue_event, dispatches items one-by-one through
-    ensure_model_on_slot + proxy to the slot's backend URL.
+    a readiness check (ready_for -- read-only, never swaps or restarts)
+    + proxy to the slot's backend URL. A request whose model was swapped
+    out while it sat in the queue gets the 409 a fresh request would
+    (O1: chat requests never swap a slot).
+
+    Every dequeued item is answered exactly once (response or error) and
+    its event set exactly once: an Exception on any per-item step is
+    answered as a 503 queue_error for that item and the loop continues,
+    while cancellation (asyncio.CancelledError) still propagates and
+    cancels the consumer.
 
     The backend PATH is per-item: each endpoint stamps its own
     item["backend_path"] when enqueuing, since OpenAI chat and Anthropic
@@ -346,50 +406,68 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
 
         while not slot.queue.empty():
             item = await slot.queue.dequeue()
-            body: dict = item["body"]
             event: asyncio.Event = item["event"]
-            model_name: str = body.get("model", "")
-            backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
 
-            ok = await server.ensure_model_on_slot(slot_name, model_name)
-            if not ok:
-                if item["error"] is None:
-                    item["error"] = f"Model swap failed on slot {slot_name}"
-                    event.set()
-                continue
-
-            is_streaming = body.get("stream", False)
             try:
-                if is_streaming:
-                    # Note: streaming errors are out of scope for reconcile;
-                    # stream failures have too many non-health-related causes.
-                    async def _stream_gen(request_body=body, url=backend_url):
+                body: dict = item["body"]
+                model_name: str = body.get("model", "")
+                backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
+
+                readiness = await server.ready_for(slot_name, model_name)
+                if readiness == "wrong_model":
+                    item["error"] = _not_loaded_message(model_name, server.slots)
+                    item["error_code"] = "model_not_loaded"
+                    event.set()
+                    continue
+                if readiness == "unavailable":
+                    item["error"] = f"{slot_name} slot not ready"
+                    item["error_code"] = "slot_unavailable"
+                    event.set()
+                    continue
+
+                is_streaming = body.get("stream", False)
+                try:
+                    if is_streaming:
+                        # Note: streaming errors are out of scope for reconcile;
+                        # stream failures have too many non-health-related causes.
+                        async def _stream_gen(request_body=body, url=backend_url):
+                            async with httpx.AsyncClient() as client:
+                                async with client.stream(
+                                    "POST", url, json=request_body, timeout=None,
+                                ) as resp:
+                                    async for chunk in resp.aiter_bytes():
+                                        yield chunk
+                        item["response"] = StreamingResponse(
+                            _stream_gen(),
+                            media_type="text/event-stream",
+                        )
+                    else:
                         async with httpx.AsyncClient() as client:
-                            async with client.stream(
-                                "POST", url, json=request_body, timeout=None,
-                            ) as resp:
-                                async for chunk in resp.aiter_bytes():
-                                    yield chunk
-                    item["response"] = StreamingResponse(
-                        _stream_gen(),
-                        media_type="text/event-stream",
-                    )
-                else:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.post(backend_url, json=body, timeout=120)
-                    if resp.status_code >= 500:
-                        slot.mark_unhealthy()
-                        asyncio.create_task(_reprobe_for(slot))
-                    item["response"] = Response(
-                        content=resp.content,
-                        status_code=resp.status_code,
-                        media_type=resp.headers.get("content-type", "application/json"),
-                    )
+                            resp = await client.post(backend_url, json=body, timeout=120)
+                        if resp.status_code >= 500:
+                            slot.mark_unhealthy()
+                            asyncio.create_task(_reprobe_for(slot))
+                        item["response"] = Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type", "application/json"),
+                        )
+                except Exception as exc:
+                    logger.exception("slot=%s proxy error: %s", slot_name, exc)
+                    item["error"] = f"Proxy error: {exc}"
+                    slot.mark_unhealthy()
+                    asyncio.create_task(_reprobe_for(slot))
+
             except Exception as exc:
-                logger.exception("slot=%s proxy error: %s", slot_name, exc)
-                item["error"] = f"Proxy error: {exc}"
-                slot.mark_unhealthy()
-                asyncio.create_task(_reprobe_for(slot))
+                # A per-item failure must never end the consumer (F2 part 2):
+                # answer this one item as a 503 queue_error and move on.
+                # asyncio.CancelledError is a BaseException, so a cancelled
+                # consumer still propagates and dies.
+                logger.exception("slot=%s internal error: %s", slot_name, exc)
+                item["error"] = f"Internal error on slot {slot_name}: {exc}"
+                item["error_code"] = "queue_error"
+                event.set()
+                continue
 
             event.set()
 
@@ -414,6 +492,42 @@ class _RouteDecision:
     message: str = ""
     slot_name: str | None = None
     response: Response | None = None
+
+
+def _not_loaded_message(model_name: str, slots: dict[str, SlotState]) -> str:
+    """The 409 'not loaded on any slot' message, shared by the routing path
+    (a fresh request) and the queue consumer (a request routed before its
+    model was swapped out): WHAT IS loaded where, so the mismatch is
+    self-evident, not just 'not loaded', plus the remedy."""
+    loaded_desc = ", ".join(
+        f"{name}='{s.loaded_model or 'none'}'"
+        for name, s in slots.items()
+    )
+    return (
+        f"model '{model_name}' not loaded on any slot "
+        f"(loaded: {loaded_desc}); POST /swap to load it, "
+        f"or request the model that is already loaded"
+    )
+
+
+def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
+    """Map a queued item's error onto a _RouteDecision.
+
+    `error_code` None or "queue_error" (e.g. items drained by a failed
+    swap) is a 503 queue_error; "slot_unavailable" is the typed 503;
+    "model_not_loaded" is the 409 for a request whose model was swapped
+    out while it was queued. The error shapers render these unchanged.
+    """
+    code = item.get("error_code")
+    if code == "model_not_loaded":
+        status, code = 409, "model_not_loaded"
+    elif code == "slot_unavailable":
+        status, code = 503, "slot_unavailable"
+    else:  # None or "queue_error"
+        status, code = 503, "queue_error"
+    return _RouteDecision(
+        status=status, code=code, message=item["error"], slot_name=slot_name,
+    )
 
 
 async def _validate_and_route(
@@ -448,23 +562,33 @@ async def _validate_and_route(
         # Loaded on neither slot. Do NOT implicitly restart main; tell the
         # caller WHAT IS loaded so the mismatch is self-evident, not just
         # "not loaded". (Implicit swaps live only on POST /swap.)
-        loaded_desc = ", ".join(
-            f"{name}='{s.loaded_model or 'none'}'"
-            for name, s in server.slots.items()
-        )
         return _RouteDecision(
             status=409,
             code="model_not_loaded",
-            message=(
-                f"model '{model_name}' not loaded on any slot "
-                f"(loaded: {loaded_desc}); POST /swap to load it, "
-                f"or request the model that is already loaded"
-            ),
+            message=_not_loaded_message(model_name, server.slots),
         ), None
 
     slot = server.slots[slot_name]
     if not slot.healthy and same_model(model_name, slot.loaded_model):
-        # Model IS loaded on this slot but the slot is unhealthy: typed 503.
+        # Model IS loaded on this slot but the slot is unhealthy. Our view
+        # may be stale -- the backend may have recovered, or even loaded a
+        # different model, since the last probe (F6) -- so reprobe once
+        # before answering. A slot mid-swap (lock held) is skipped by
+        # _reprobe_slot_if_unlocked, so this path never waits behind a swap.
+        async with httpx.AsyncClient() as probe_client:
+            await server._reprobe_slot_if_unlocked(slot_name, slot, probe_client)
+        if slot.healthy and same_model(model_name, slot.loaded_model):
+            # The probe confirms it: route normally.
+            return None, slot_name
+        if not same_model(model_name, slot.loaded_model):
+            # The probe reports a different loaded model: 409, exactly like a
+            # fresh request for a model that isn't loaded.
+            return _RouteDecision(
+                status=409,
+                code="model_not_loaded",
+                message=_not_loaded_message(model_name, server.slots),
+            ), None
+        # Still unhealthy on the same model: typed 503.
         return _RouteDecision(
             status=503, code="slot_unavailable",
             message=f"{slot_name} slot not ready", slot_name=slot_name,
@@ -488,7 +612,7 @@ async def _route_and_wait(
     event = asyncio.Event()
     item: dict = {
         "body": body, "event": event, "response": None, "error": None,
-        "backend_path": backend_path,
+        "error_code": None, "backend_path": backend_path,
     }
     slot = server.slots[slot_name]
 
@@ -504,10 +628,7 @@ async def _route_and_wait(
     await event.wait()
 
     if item["error"]:
-        return _RouteDecision(
-            status=503, code="queue_error", message=item["error"],
-            slot_name=slot_name,
-        )
+        return _decision_from_item_error(item, slot_name)
     return _RouteDecision(response=item["response"])
 
 

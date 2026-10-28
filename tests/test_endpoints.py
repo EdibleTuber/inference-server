@@ -182,6 +182,21 @@ async def test_ensure_model_on_slot_drains_queue_on_failure(test_config):
 
 
 @pytest.mark.asyncio
+async def test_ensure_model_on_slot_returns_false_when_swap_raises(test_config):
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    slot = server.slots["main"]
+    slot.swapper.swap_to = AsyncMock(side_effect=RuntimeError("restart refused"))
+    queued = {"body": {}, "event": asyncio.Event(), "response": None, "error": None}
+    await slot.queue.enqueue(queued)
+
+    assert await server.ensure_model_on_slot("main", "test-model-q4") is False
+    assert slot.healthy is False
+    assert not slot.swap_lock.locked()
+    assert slot.queue.depth == 0
+    assert queued["event"].is_set() and "restart refused" in queued["error"]
+
+@pytest.mark.asyncio
 async def test_ensure_model_on_slot_skips_swap_if_already_loaded(test_config):
     from manager.app import ServerState
     server = ServerState(test_config)
@@ -333,8 +348,14 @@ def test_chat_completions_cold_start_no_crash(client):
     assert r.status_code == 409  # not a 500
 
 
-def test_chat_completions_503_on_batch_unhealthy(client):
+def test_chat_completions_503_on_batch_unhealthy(client, monkeypatch):
     """Request for a model loaded on batch returns 503 if batch unhealthy."""
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
     app = client.app
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
@@ -526,6 +547,14 @@ def test_swap_failure_visible_via_slot_state(client, monkeypatch):
     # BackgroundTasks completed: slot should be marked unhealthy.
     assert not server.slots["main"].healthy
 
+
+def test_background_swap_failure_is_logged_not_raised(client, monkeypatch, caplog):
+    async def boom(self, model_path, sampling_args=""):
+        raise RuntimeError("restart refused")
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", boom)
+    r = client.post("/swap", json={"model": "test-model-q8", "target": "main"})
+    assert r.status_code == 202
+    assert "background swap failed" in caplog.text
 
 def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
     """A slot beyond the legacy main/batch pair is a valid /swap target when configured."""
@@ -1331,7 +1360,7 @@ def test_messages_queue_error_is_anthropic_503(test_config, monkeypatch):
         server = client.app.state.server
         server.slots["main"].loaded_model = "test-model-q4"
         server.slots["main"].healthy = True
-        server.ensure_model_on_slot = AsyncMock(return_value=False)
+        server.ready_for = AsyncMock(return_value="unavailable")
 
         r = client.post("/v1/messages", json={
             "model": "test-model-q4", "max_tokens": 1, "messages": [],
@@ -1340,7 +1369,7 @@ def test_messages_queue_error_is_anthropic_503(test_config, monkeypatch):
     assert r.status_code == 503
     err = _anthropic_error_envelope(r)
     assert err["type"] == "api_error"
-    assert "Model swap failed" in err["message"]
+    assert "main slot not ready" in err["message"]
     assert r.headers.get("retry-after") == "5"
 
 

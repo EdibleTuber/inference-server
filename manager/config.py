@@ -52,6 +52,7 @@ class ManagerConfig:
         batch_queue_limit: Max number of requests to hold in the batch FIFO queue.
         batch_model_default: Default model name for the batch slot.
         slots: Ordered slot list built from SLOTS and SLOT_<NAME>_* (or legacy) env vars.
+        restart_timeout: Seconds to allow a systemctl restart before it fails.
     """
     host: str
     port: int
@@ -74,6 +75,7 @@ class ManagerConfig:
     batch_queue_limit: int
     batch_model_default: str
     slots: tuple[SlotConfig, ...] = ()
+    restart_timeout: int = 150
 
     @property
     def llama_server_url(self) -> str:
@@ -115,4 +117,5 @@ class ManagerConfig:
             batch_queue_limit=_int_env("BATCH_QUEUE_LIMIT", 20),
             batch_model_default=os.getenv("BATCH_MODEL_DEFAULT", "gemma-4-E4B-it-Q4_K_M"),
             slots=build_slots(),
+            restart_timeout=_int_env("RESTART_TIMEOUT", 150),
         )

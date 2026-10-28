@@ -144,6 +144,48 @@ async def test_shutdown_cancels_running_jobs_and_marks_them():
 
 
 @pytest.mark.asyncio
+async def test_a_bad_indexer_result_fails_the_job_and_does_not_block_the_next():
+    """A non-dict (or non-integer) result is a failed job, not a job stuck in
+    "running" -- start() returns a running job instead of starting a new one,
+    so a stuck job would block every later reindex of that collection."""
+    reg = ReindexRegistry()
+
+    async def bad(paths):
+        return "not a dict"
+
+    async def good(paths):
+        return {"new": 1}
+
+    first = await reg.start("c", bad)
+    await asyncio.wait_for(reg.wait_idle(), 1)
+    second = await reg.start("c", good)
+    await asyncio.wait_for(reg.wait_idle(), 1)
+
+    assert first.status == "error" and "TypeError" in first.error
+    assert first.finished_at is not None
+    assert second.job_id != first.job_id and second.status == "done"
+
+
+def test_unreadable_collections_config_does_not_stop_startup(
+        collection_config, monkeypatch):
+    """A typo in collections.json must not take inference down with it."""
+    from pathlib import Path
+    from manager.slots import SlotState
+
+    async def _no_probe(self, probe_client):
+        return None
+
+    monkeypatch.setattr(SlotState, "probe", _no_probe)
+    Path(collection_config.collections_config).write_text("{ not json")
+    with patch("manager.app.EmbeddingsClient") as client_cls:
+        client_cls.return_value = _gated_embeddings(threading.Event(), 0.0, [])
+        from manager.app import create_app
+        with TestClient(create_app(collection_config)) as client:
+            assert client.get("/health").status_code == 200
+            assert client.get("/collections").status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_job_stats_carry_the_indexers_error_count():
     reg = ReindexRegistry()
 

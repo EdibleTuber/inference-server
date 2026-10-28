@@ -92,10 +92,15 @@ def derive_tags(file_path: str, source_dir: str, frontmatter: dict) -> list[str]
     for part in rel.parent.parts:
         tags.add(part.lower())
 
-    # Tags from frontmatter
-    if "tags" in frontmatter:
-        for tag in frontmatter["tags"]:
-            tags.add(tag.lower())
+    # Tags from frontmatter: a string counts as a one-item list;
+    # non-string items in a list are skipped. Never raises.
+    raw_tags = frontmatter.get("tags")
+    if isinstance(raw_tags, str):
+        raw_tags = [raw_tags]
+    if isinstance(raw_tags, list):
+        for tag in raw_tags:
+            if isinstance(tag, str):
+                tags.add(tag.lower())
 
     # Parse USE WHEN pattern from description
     desc = frontmatter.get("description", "")
@@ -165,9 +170,11 @@ async def index_collection(
     under source_dir are considered and stale-deletion is skipped. When `paths` is
     None, behaviour is unchanged: full rglob scan + stale-deletion.
 
-    Returns stats dict {new, updated, removed, unchanged}.
+    Returns stats dict {new, updated, removed, unchanged, errors}.
+    A document that fails to index is counted in `errors`, left out of the
+    database (so the next run retries it), and never aborts the collection.
     """
-    stats = {"new": 0, "updated": 0, "removed": 0, "unchanged": 0}
+    stats = {"new": 0, "updated": 0, "removed": 0, "unchanged": 0, "errors": 0}
 
     db.upsert_collection(collection_id, source_dir, doc_type)
 
@@ -205,38 +212,48 @@ async def index_collection(
 
         is_new = existing_hash is None
 
-        content = Path(file_path).read_text(encoding="utf-8")
-        frontmatter, body = parse_frontmatter(content)
+        try:
+            content = Path(file_path).read_text(encoding="utf-8")
+            frontmatter, body = parse_frontmatter(content)
 
-        doc_id = make_doc_id(file_path, source_dir)
-        name = frontmatter.get("name", Path(file_path).stem)
-        summary = extract_summary(frontmatter, body, doc_type)
-        tags = derive_tags(file_path, source_dir, frontmatter)
-        metadata = {"tags": tags}
+            doc_id = make_doc_id(file_path, source_dir)
+            name = frontmatter.get("name", Path(file_path).stem)
+            summary = extract_summary(frontmatter, body, doc_type)
+            tags = derive_tags(file_path, source_dir, frontmatter)
+            metadata = {"tags": tags}
 
-        if "category" not in metadata and doc_type == "skill":
-            parts = Path(file_path).relative_to(source_dir).parts
-            if parts:
-                metadata["category"] = parts[0]
+            if "category" not in metadata and doc_type == "skill":
+                parts = Path(file_path).relative_to(source_dir).parts
+                if parts:
+                    metadata["category"] = parts[0]
 
-        embedding = await embeddings.embed_text(summary)
+            embedding = await embeddings.embed_text(summary)
 
-        db.upsert_document(
-            doc_id=doc_id,
-            collection=collection_id,
-            name=name,
-            metadata=metadata,
-            summary=summary,
-            content=content,
-            file_path=file_path,
-            file_hash=file_hash,
-            embedding=embedding,
-        )
+            db.upsert_document(
+                doc_id=doc_id,
+                collection=collection_id,
+                name=name,
+                metadata=metadata,
+                summary=summary,
+                content=content,
+                file_path=file_path,
+                file_hash=file_hash,
+                embedding=embedding,
+            )
 
-        if is_new:
-            stats["new"] += 1
-        else:
-            stats["updated"] += 1
+            if is_new:
+                stats["new"] += 1
+            else:
+                stats["updated"] += 1
+        except Exception:
+            # One bad document must not abort the collection: the path is
+            # already in seen_paths (no stale-deletion) and its hash is not
+            # stored, so the next run retries it.
+            logger.exception(
+                "Failed to index document %s in collection '%s'; skipping",
+                file_path, collection_id,
+            )
+            stats["errors"] += 1
 
     # Stale-deletion only runs on a full scan, never in scoped mode.
     if paths is None:

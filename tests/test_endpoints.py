@@ -182,6 +182,21 @@ async def test_ensure_model_on_slot_drains_queue_on_failure(test_config):
 
 
 @pytest.mark.asyncio
+async def test_ensure_model_on_slot_returns_false_when_swap_raises(test_config):
+    from manager.app import ServerState
+    server = ServerState(test_config)
+    slot = server.slots["main"]
+    slot.swapper.swap_to = AsyncMock(side_effect=RuntimeError("restart refused"))
+    queued = {"body": {}, "event": asyncio.Event(), "response": None, "error": None}
+    await slot.queue.enqueue(queued)
+
+    assert await server.ensure_model_on_slot("main", "test-model-q4") is False
+    assert slot.healthy is False
+    assert not slot.swap_lock.locked()
+    assert slot.queue.depth == 0
+    assert queued["event"].is_set() and "restart refused" in queued["error"]
+
+@pytest.mark.asyncio
 async def test_ensure_model_on_slot_skips_swap_if_already_loaded(test_config):
     from manager.app import ServerState
     server = ServerState(test_config)
@@ -526,6 +541,14 @@ def test_swap_failure_visible_via_slot_state(client, monkeypatch):
     # BackgroundTasks completed: slot should be marked unhealthy.
     assert not server.slots["main"].healthy
 
+
+def test_background_swap_failure_is_logged_not_raised(client, monkeypatch, caplog):
+    async def boom(self, model_path, sampling_args=""):
+        raise RuntimeError("restart refused")
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", boom)
+    r = client.post("/swap", json={"model": "test-model-q8", "target": "main"})
+    assert r.status_code == 202
+    assert "background swap failed" in caplog.text
 
 def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
     """A slot beyond the legacy main/batch pair is a valid /swap target when configured."""

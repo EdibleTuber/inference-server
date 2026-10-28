@@ -175,7 +175,7 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 
 ### Switch to a different model
 
-Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, and a model with no home slot is refused with 400. The call returns once the slot is healthy on the new model — 30 seconds to several minutes for a large cold load — so give it a long client timeout.
+Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, and a model with no home slot is refused with 400. The call returns **202** as soon as the swap has started — the swap itself runs in the background and takes 30 seconds to several minutes for a large cold load. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up).
 
 ```bash
 curl -m 900 http://YOUR_LAN_IP:11434/swap \
@@ -184,7 +184,7 @@ curl -m 900 http://YOUR_LAN_IP:11434/swap \
 # → {"slot": "main", "model": "llama-3-8b-instruct-q5_k_m", "status": "ok"}
 ```
 
-Errors: 400 for a missing `model` or unknown `target`, 400 `no_home_slot` for an untargeted swap of a model no slot lists in `SLOT_<NAME>_MODELS`, 404 if no such GGUF exists, 503 if the swap fails.
+Errors: 400 for a missing `model` or unknown `target`, 400 `no_home_slot` for an untargeted swap of a model no slot lists in `SLOT_<NAME>_MODELS`, 404 if no such GGUF exists. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error; it leaves the slot `healthy: false` in `GET /status`.
 
 ### Anthropic Messages API
 
@@ -387,7 +387,7 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/chat/completions` | OpenAI chat completions. Routes by the `model` field to the slot that has it loaded and queues there. 404 if no such GGUF, 409 if it is not loaded on any slot. Supports streaming (`"stream": true`). |
 | `POST` | `/v1/messages` | Anthropic Messages API. Byte passthrough to the slot's llama-server, with the same routing, queueing and status codes as chat completions; errors use the Anthropic error envelope. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
-| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; without `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, else 400. Returns when the slot is healthy. |
+| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; without `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, else 400. Returns 200 if already loaded, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. |
 | `POST` | `/v1/embeddings` | Proxy to llama-embeddings instance. OpenAI-compatible. |
 | `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
 | `GET` | `/status` | Per-slot health, loaded model, and queue depth; GPU VRAM usage; uptime. Re-probes every slot before answering. |
@@ -411,7 +411,7 @@ A chat request for a model that isn't loaded on any slot returns **409** rather 
 
 ### Client timeout guidance
 
-Model swaps take from 30 seconds to several minutes depending on model size and whether the file is in page cache. `POST /swap` holds the connection open until the slot is healthy or `SWAP_TIMEOUT` expires, so give that call a client timeout longer than `SWAP_TIMEOUT`. Avoid sending chat requests to a slot while you are swapping it.
+Model swaps take from 30 seconds to several minutes depending on model size and whether the file is in page cache. `POST /swap` returns 202 immediately and runs the swap in the background, so it needs no long client timeout — poll `GET /status` until the target slot reports `swapping: false` and its `loaded_model` is the new model, and only send requests there once `healthy` is `true` again. Avoid sending chat requests to a slot while you are swapping it.
 
 If you prefer not to wait, poll `/status` before sending requests and check the target slot's `healthy` flag (and `loaded_model`) rather than a top-level state.
 

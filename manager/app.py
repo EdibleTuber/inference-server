@@ -256,12 +256,22 @@ class ServerState:
 
             sampling_args = sampling_args_for_model(path)
             logger.info("slot=%s swapping to %s", slot_name, model_name)
-            success = await slot.swapper.swap_to(path, sampling_args)
+            msg: str | None = None
+            try:
+                success = await slot.swapper.swap_to(path, sampling_args)
+            except Exception as exc:
+                # A raising swap is a failed swap, not a crash: the same
+                # failure tail as the timeout case (unhealthy, drained
+                # queue, False) so no caller ever sees an exception here.
+                logger.exception("slot=%s swap to %s raised", slot_name, model_name)
+                success = False
+                msg = f"Model swap failed on slot {slot_name}: {model_name}: {exc}"
             if success:
                 slot.mark_swapped(display_name(path))   # store the real on-disk stem
                 return True
 
-            msg = f"Model swap timed out on slot {slot_name}: {model_name}"
+            if msg is None:
+                msg = f"Model swap timed out on slot {slot_name}: {model_name}"
             slot.mark_unhealthy()
             self._drain_slot_queue_with_error(slot_name, msg)
             return False

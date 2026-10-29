@@ -459,7 +459,7 @@ COLLECTIONS_CONFIG=/etc/llama/collections.json
 SKILLS_DB_PATH=/opt/llama/data/skills.db
 ```
 
-5. **Restart the manager** — indexing starts automatically in the background, so a restart never blocks inference; `GET /collections/{id}/reindex/status` shows the startup job.
+5. **Restart the manager** — indexing starts automatically in the background, so a restart never blocks inference; `GET /collections/{id}/reindex/status` shows the startup job. After startup indexing finishes, collections no longer listed in `collections.json` are deleted from the index; a missing or empty config deletes nothing.
 
 ### API
 

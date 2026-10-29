@@ -441,6 +441,24 @@ def _collection_indexer(server, entry: dict):
     return indexer
 
 
+async def _prune_orphaned_collections(server, keep: set[str]) -> None:
+    """Delete collections the collections config no longer lists.
+
+    Waits for every startup index job first (move first, delete after): a
+    document is only removed once its replacement under a still-configured
+    collection has been indexed. A missing, empty or unreadable config never
+    starts this task, so it can never prune everything.
+    """
+    await server.reindex_registry.wait_idle()
+    for c in server.db.list_collections():
+        if c["id"] not in keep:
+            removed = server.db.delete_collection(c["id"])
+            logger.info(
+                "pruned collection '%s' (%d documents) — not in the collections config",
+                c["id"], removed,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Background queue consumer
 # ---------------------------------------------------------------------------
@@ -839,6 +857,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         # Initialize collection retrieval if configured. Indexing runs in the
         # background so a restart never blocks inference startup (S3); the
         # startup job shows up in GET /collections/{id}/reindex/status.
+        prune_task = None
         if config.skills_db_path:
             try:
                 server.db = VectorDB(config.skills_db_path)
@@ -851,8 +870,10 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                     "collection endpoints will return 503"
                 )
             if server.db is not None:
+                config_read = False
                 try:
                     entries = load_collections_config(config.collections_config)
+                    config_read = True
                 except Exception:
                     logger.exception(
                         "Could not read the collections config — "
@@ -877,8 +898,23 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                             "Could not start indexing collection '%s' — "
                             "serving the existing index", entry["id"],
                         )
+                # Prune collections the config no longer lists, but only when
+                # the config was read successfully and names at least one
+                # collection: a missing, empty or unreadable config must
+                # leave the index untouched.
+                if config_read and entries:
+                    prune_task = asyncio.create_task(
+                        _prune_orphaned_collections(server, {e["id"] for e in entries}),
+                        name="prune_orphaned_collections",
+                    )
 
         yield
+
+        # A pending prune waits on the reindex registry, so cancel and await
+        # it before that registry (and the DB) closes.
+        if prune_task is not None:
+            prune_task.cancel()
+            await asyncio.gather(prune_task, return_exceptions=True)
 
         # Cancel any running reindex jobs before closing what they use.
         await server.reindex_registry.shutdown()

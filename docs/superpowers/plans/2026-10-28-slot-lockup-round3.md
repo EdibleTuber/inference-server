@@ -40,7 +40,8 @@ Same as rounds 1 and 2:
 2. **Move first, delete after.** Pruning waits for every startup index job (`ReindexRegistry.wait_idle`), so a document is never missing while its replacement is still being embedded. Pinned by the first assertion in `test_orphaned_collection_is_pruned_after_its_documents_move`.
 3. **The pending prune is cancelled on shutdown** before the registry and DB close. Pinned by `test_shutdown_with_a_pending_prune_is_prompt`.
 4. **An unchanged pass must yield.** With the index the lookups are fast (0.041s for 2,937 on the live data), but a pass with no awaits still holds the loop. Pinned by `test_an_unchanged_index_pass_yields_to_the_event_loop`.
-5. Pruning deletes vector rows too, so no orphaned `documents_vec` rows are left. Pinned by `test_delete_collection_removes_its_documents_vectors_and_row`.
+5. **A prune that fails says so, and a failed startup pass blocks it** (Task 2b). Without a handler, the prune task's exception is discarded at shutdown by `gather(return_exceptions=True)`. `wait_idle` waits for jobs to finish, not to succeed, so with the embeddings server down the vault job would end with errors and `notes` would be deleted before its 695 documents moved. Pinned by `test_a_failed_prune_is_logged` and both cases of `test_a_failed_startup_index_job_prunes_nothing`.
+6. Pruning deletes vector rows too, so no orphaned `documents_vec` rows are left. Pinned by `test_delete_collection_removes_its_documents_vectors_and_row`.
 
 Validated on a copy of the live DB, with a stub embedder: a full vault pass moved exactly 695 documents to `vault` in 4.4s, leaving 2,937 `vault` rows to match 2,937 files. Pruning `notes` then removed its 443 stale rows, with 0 orphaned vector rows.
 
@@ -101,6 +102,24 @@ Validated on a copy of the live DB, with a stub embedder: a full vault pass move
 - [ ] **Step 3:** Run `tests/`. Expected: **all pass**.
 - [ ] **Step 4:** Commit `fix(collections): prune unconfigured collections after startup indexing`.
 
+### Task 2b: A failed prune is logged; a failed startup pass skips the prune
+
+Found reviewing Task 2. Both gaps came from the plan, not from the Task 2 implementation, which matched the plan.
+
+**Files:** Modify `manager/app.py` (`_prune_orphaned_collections` only). Commit `tests/test_orphan_pruning.py` as given.
+
+**Interfaces** (the signature and the lifespan are unchanged):
+- After `await server.reindex_registry.wait_idle()`, for every id in `keep`, take `job = server.reindex_registry.get_current(id)`. The startup pass for that id failed if `job` is `None` (it never started), `job.status != "done"`, or `job.stats.get("errors", 0) > 0`.
+- If any failed: log **one `WARNING`** from the `manager.app` logger that names every failed collection id and says nothing was pruned, then return without deleting anything.
+- Wrap everything after `wait_idle` in `try: ... except Exception: logger.exception(...)`, with a message containing the word `prune`. Catch `Exception` only. `CancelledError` must still propagate, so shutdown can cancel the task.
+
+- [ ] **Step 1:** Commit the test file and this plan as they are in the working tree: `test: a failed prune is logged; a failed startup pass skips the prune`. Then run `tests/`. Expected: **3 failed, 294 passed**:
+  - `test_a_failed_prune_is_logged`: `the failed prune left no ERROR record in manager.app`;
+  - both cases of `test_a_failed_startup_index_job_prunes_nothing`: `assert 'notes' in ['skills']`.
+- [ ] **Step 2:** Implement per the Interfaces block.
+- [ ] **Step 3:** Run `tests/`. Expected: **all pass**.
+- [ ] **Step 4:** Commit `fix(collections): log a failed prune; skip pruning when a startup pass failed`.
+
 ### Task 3: PR, merge, deploy, verify (Claude and the user; not the implementer)
 
 - [ ] **Step 1:** Push, open the PR, user merges.
@@ -109,5 +128,6 @@ Validated on a copy of the live DB, with a stub embedder: a full vault pass move
   - provenance: the stamp and every file's sha256 match the merge;
   - "Application startup complete" within a few seconds of the start;
   - `manager.log` shows the vault job with `new` ≈ 695 and `errors: 0`, then `pruned collection 'notes' (443 documents)`;
+  - no WARNING that pruning was skipped (if there is one, the vault pass had errors: read them before going further);
   - `GET /collections` lists no `notes`, and `vault`'s `doc_count` equals its file count on disk;
   - both slots pass a smoke request.

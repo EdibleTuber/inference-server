@@ -9,6 +9,8 @@ after), and never runs when the config is unreadable, missing or empty.
 import asyncio
 import dataclasses
 import hashlib
+import logging
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -67,10 +69,18 @@ def _ids(client) -> list[str]:
     return [c["id"] for c in client.get("/collections").json()["collections"]]
 
 
-def _start(config, gate: threading.Event, cap: float = 3.0):
+def _failing_embeddings():
+    instance = AsyncMock()
+    instance.embed_text = AsyncMock(side_effect=RuntimeError("embeddings server down"))
+    instance.embed_batch = AsyncMock(side_effect=RuntimeError("embeddings server down"))
+    instance.close = AsyncMock()
+    return instance
+
+
+def _start(config, gate: threading.Event, cap: float = 3.0, embeddings=None):
     patcher = patch("manager.app.EmbeddingsClient")
     client_cls = patcher.start()
-    client_cls.return_value = _gated_embeddings(gate, cap)
+    client_cls.return_value = embeddings or _gated_embeddings(gate, cap)
     from manager.app import create_app
     return create_app(config), patcher
 
@@ -156,3 +166,77 @@ def test_shutdown_with_a_pending_prune_is_prompt(collection_config, skills_dir, 
         gate.set()
 
     assert exited_after < 2.0
+
+
+def _app_records(caplog, level: int, needle: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records
+            if r.name == "manager.app" and r.levelno >= level
+            and needle in r.getMessage().lower()]
+
+
+def test_a_failed_prune_is_logged(collection_config, skills_dir, no_probe, caplog, monkeypatch):
+    """A prune that raises must say so: unlogged, its exception sits on the
+    task until shutdown, where gather(return_exceptions=True) discards it."""
+    _seed_orphan(collection_config.skills_db_path, skills_dir)
+
+    def locked(self, collection):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(VectorDB, "delete_collection", locked)
+    gate = threading.Event()
+    gate.set()
+    app, patcher = _start(collection_config, gate)
+    try:
+        with caplog.at_level(logging.INFO, logger="manager.app"):
+            with TestClient(app) as client:
+                client.portal.call(app.state.server.reindex_registry.wait_idle)
+                deadline = time.monotonic() + 3
+                while (not _app_records(caplog, logging.ERROR, "prune")
+                       and time.monotonic() < deadline):
+                    time.sleep(0.05)
+                logged = _app_records(caplog, logging.ERROR, "prune")
+    finally:
+        patcher.stop()
+
+    assert logged, "the failed prune left no ERROR record in manager.app"
+    assert logged[0].exc_info is not None
+    assert "database is locked" in str(logged[0].exc_info[1])
+
+
+@pytest.mark.parametrize("failure", ["document_errors", "job_error"])
+def test_a_failed_startup_index_job_prunes_nothing(
+        collection_config, skills_dir, no_probe, caplog, failure):
+    """wait_idle waits for jobs to finish, not to succeed. If a configured
+    collection's startup pass failed, its documents may still sit only under
+    the orphan (the embeddings server down: 695 vault files), so the prune
+    must be skipped, and must say why, naming the collection."""
+    _seed_orphan(collection_config.skills_db_path, skills_dir)
+    gate = threading.Event()
+    gate.set()
+    if failure == "document_errors":     # every document fails: job done, errors > 0
+        app, patcher = _start(collection_config, gate, embeddings=_failing_embeddings())
+        job_patch = None
+    else:                                # the pass itself raises: job status "error"
+        app, patcher = _start(collection_config, gate)
+        job_patch = patch("manager.app.index_collection",
+                          AsyncMock(side_effect=RuntimeError("walk failed")))
+        job_patch.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="manager.app"):
+            with TestClient(app) as client:
+                client.portal.call(app.state.server.reindex_registry.wait_idle)
+                time.sleep(0.3)
+                ids = _ids(client)
+                job = client.get("/collections/skills/reindex/status").json()
+    finally:
+        if job_patch is not None:
+            job_patch.stop()
+        patcher.stop()
+
+    if failure == "document_errors":     # the setup produced the failure it claims
+        assert job["status"] == "done" and job["stats"]["errors"] > 0, job
+    else:
+        assert job["status"] == "error", job
+    assert "notes" in ids
+    assert _app_records(caplog, logging.WARNING, "skills"), \
+        "the skipped prune should log a WARNING naming the failed collection"

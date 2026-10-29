@@ -56,6 +56,9 @@ class VectorDB:
                 id TEXT PRIMARY KEY,
                 embedding float[768]
             );
+
+            CREATE INDEX IF NOT EXISTS idx_documents_collection_file_path
+                ON documents(collection, file_path);
         """)
         self._conn.commit()
 
@@ -169,11 +172,11 @@ class VectorDB:
             "metadata": meta,
         }
 
-    def get_hash(self, file_path: str) -> str | None:
-        """Get stored hash for a file path, or None if not indexed."""
+    def get_hash(self, collection: str, file_path: str) -> str | None:
+        """Get stored hash for a file path within a collection, or None if not indexed."""
         row = self._conn.execute(
-            "SELECT file_hash FROM documents WHERE file_path = ?",
-            (file_path,),
+            "SELECT file_hash FROM documents WHERE collection = ? AND file_path = ?",
+            (collection, file_path),
         ).fetchone()
         return row["file_hash"] if row else None
 
@@ -192,6 +195,22 @@ class VectorDB:
         if removed:
             self._conn.commit()
         return removed
+
+    def delete_collection(self, collection: str) -> int:
+        """Delete a collection's vector rows, document rows and its own row.
+
+        Returns the number of documents removed.
+        """
+        rows = self._conn.execute(
+            "SELECT id FROM documents WHERE collection = ?",
+            (collection,),
+        ).fetchall()
+        for row in rows:
+            self._conn.execute("DELETE FROM documents_vec WHERE id = ?", (row["id"],))
+            self._conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+        self._conn.execute("DELETE FROM collections WHERE id = ?", (collection,))
+        self._conn.commit()
+        return len(rows)
 
     def list_collections(self) -> list[dict]:
         """List all collections with document counts."""

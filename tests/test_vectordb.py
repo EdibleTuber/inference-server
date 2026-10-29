@@ -110,8 +110,8 @@ def test_get_hash(db):
     db.upsert_collection("skills", "/tmp", "skill")
     db.upsert_document("test", "skills", "Test", {}, "test", "test",
         "/tmp/test.md", "sha256abc", [0.1] * 768)
-    assert db.get_hash("/tmp/test.md") == "sha256abc"
-    assert db.get_hash("/tmp/nonexistent.md") is None
+    assert db.get_hash("skills", "/tmp/test.md") == "sha256abc"
+    assert db.get_hash("skills", "/tmp/nonexistent.md") is None
 
 
 def test_delete_stale_removes_missing_files(db):

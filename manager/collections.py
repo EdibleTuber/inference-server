@@ -5,6 +5,7 @@ Collection indexing pipeline.
 Scans configured directories for markdown files, extracts summaries and tags,
 generates embeddings, and stores documents in the vector database.
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -200,12 +201,19 @@ async def index_collection(
 
     seen_paths = set()
 
+    processed = 0
     for file_info in files:
         file_path = file_info["file_path"]
         file_hash = file_info["file_hash"]
         seen_paths.add(file_path)
 
-        existing_hash = db.get_hash(file_path)
+        # Yield to the event loop every 50 files, whether or not the file
+        # changed, so a long unchanged pass cannot block the loop.
+        processed += 1
+        if processed % 50 == 0:
+            await asyncio.sleep(0)
+
+        existing_hash = db.get_hash(collection_id, file_path)
         if existing_hash == file_hash:
             stats["unchanged"] += 1
             continue

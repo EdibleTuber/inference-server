@@ -4,7 +4,8 @@
 
 - **Fixed in round 1** (PR #14, merge `a183d14`, deployed 2026-10-28): F1, F2, F3, F6, O1, O2, O3, A6, W3, W5.
 - **Fixed on the host** 2026-10-28: S8 (`_llama-mgr` added to group `llama`), S9 (`re` env file ownership and sudoers entry).
-- **Round 2** (`docs/superpowers/plans/2026-10-28-slot-lockup-round2.md`): S1, S2, S3, A2, A4, F4.
+- **Fixed in round 2** (PR #15, merge `2adbc71`, deployed 2026-10-28): S1, S2, A2, A4, F4. S3 is in place but **not effective** in production until I1 is fixed: the index pass still blocks the event loop for about 30s.
+- **Open, found after the round-2 deploy:** I1 (missing `file_path` index), I2 (orphaned `notes` collection hides 695 vault files).
 - **Deferred to the design review:** A1, F5, W2 (whether a slot is busy until its response completes); O4, Q1 (slot state machine); Q2 (supervisor and hung-backend restart).
 - **Not yet scheduled:** A3, A5, S4–S7, D1–D5, W1, W4, X1, and the rest of Q3–Q14.
 
@@ -97,6 +98,15 @@ Not bugs, but each would have shortened or prevented the incident.
 | S7 | `requirements.txt` has only lower bounds. A fresh venv today resolves Starlette 1.10 / FastAPI 0.162 vs deployed 1.0 / 0.135, so `setup.sh` on a new host gets untested versions. | pip resolution in a scratch venv | Medium |
 | S8 | **F7 root cause:** `setup.sh` adds `_llama` to group `llama` but not `_llama-mgr` (`setup.sh:51–52`), and `/var/log/llama` is `root:llama 775`, so the manager cannot create `manager.log`. | `id _llama-mgr` | Low |
 | S9 | **The `re` slot cannot swap and would kill its own consumer.** `/etc/llama/llama-server-re.env` is `root:root 644`; the README's `chown _llama-mgr` step (README:589) was skipped on this host. Any swap of `re` (including F1's self-restart after one proxy timeout) raises `PermissionError` in `update_env_file` (`swap.py:71`), which is unhandled, so O2 applies: the consumer dies. Even with the env file fixed, the restart would fail: `/etc/sudoers.d/llama-manager` permits `restart llama-server.service` and `llama-server-batch.service` (decommissioned) only, so `sudo systemctl restart llama-server-re.service` is refused, `restart_llama_server` raises `RuntimeError` (`swap.py:92–95`), and the result is the same consumer death. | `ls -l /etc/llama`; sudoers read 2026-10-28; O2 reproduced | High |
+
+## Found after the round-2 deploy (2026-10-28)
+
+| # | Finding | Evidence | Severity |
+|---|---|---|---|
+| I1 | **No index on `documents.file_path`.** `get_hash` (`vectordb.py:172-177`) is a full table scan, and `index_collection` calls it once per file synchronously, never awaiting for an unchanged file. 2,937 lookups take **30.3s** and block the event loop, so S3's background indexing did not shorten startup in production (startup complete about 33s after start, as before). Any full reindex while serving freezes every endpoint, chat proxying included, for about 30s. Tests used two-file directories, so they could not show it. With `CREATE INDEX ... ON documents(file_path)` on a copy of the live DB: **0.041s**. | timed on a copy of `/opt/llama/data/skills.db` | High |
+| I2 | **695 vault files (24%) are invisible to vault search.** An orphaned collection `notes` (not in `collections.json`, same `source_dir`, 1,138 rows) holds them. `get_hash` is not scoped to a collection, so the vault pass sees them as "unchanged" and never indexes them under `vault`. Document ids are global (`id TEXT PRIMARY KEY`, the relative path), so two collections over one directory cannot coexist anyway. Once `get_hash` is scoped, `upsert_document`'s `ON CONFLICT(id)` moves each row to `vault`, which needs about 695 re-embeds. Pre-existing. | DB copy: vault 2,242 rows vs 2,937 files; 695 present only under `notes` | High |
+
+Deploy note: `DEPLOYED_FROM` reads `676737a` (the branch tip) rather than merge `2adbc71`. The trees are identical and every file's sha256 matches the merge, so it is provenance-only. Deploy from `main` next time.
 
 ## Tests
 

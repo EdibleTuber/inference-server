@@ -446,17 +446,38 @@ async def _prune_orphaned_collections(server, keep: set[str]) -> None:
 
     Waits for every startup index job first (move first, delete after): a
     document is only removed once its replacement under a still-configured
-    collection has been indexed. A missing, empty or unreadable config never
-    starts this task, so it can never prune everything.
+    collection has been indexed. wait_idle waits for jobs to finish, not to
+    succeed, so if any configured collection's startup pass failed, its
+    documents may still sit only under the orphan: the prune is then skipped
+    and logged. A missing, empty or unreadable config never starts this task,
+    so it can never prune everything.
     """
     await server.reindex_registry.wait_idle()
-    for c in server.db.list_collections():
-        if c["id"] not in keep:
-            removed = server.db.delete_collection(c["id"])
-            logger.info(
-                "pruned collection '%s' (%d documents) — not in the collections config",
-                c["id"], removed,
+    try:
+        failed = []
+        for cid in keep:
+            job = server.reindex_registry.get_current(cid)
+            if (
+                job is None
+                or job.status != "done"
+                or job.stats.get("errors", 0) > 0
+            ):
+                failed.append(cid)
+        if failed:
+            logger.warning(
+                "prune skipped: startup index pass failed for %s — nothing was pruned",
+                ", ".join(sorted(failed)),
             )
+            return
+        for c in server.db.list_collections():
+            if c["id"] not in keep:
+                removed = server.db.delete_collection(c["id"])
+                logger.info(
+                    "pruned collection '%s' (%d documents) — not in the collections config",
+                    c["id"], removed,
+                )
+    except Exception:
+        logger.exception("collection prune failed")
 
 
 # ---------------------------------------------------------------------------

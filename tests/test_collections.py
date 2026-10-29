@@ -185,7 +185,7 @@ async def test_index_collection_with_paths_only_indexes_given_files(notes_dir, t
     # Only b.md was considered. No stale-delete ran — a.md's row is still in the DB.
     assert stats["unchanged"] + stats["updated"] == 1
     assert stats["removed"] == 0
-    existing = db.get_hash(str(Path(notes_dir) / "a.md"))
+    existing = db.get_hash("notes", str(Path(notes_dir) / "a.md"))
     assert existing is not None, "stale-delete should NOT run when paths is given"
 
     db._conn.close()

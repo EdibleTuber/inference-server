@@ -78,7 +78,7 @@ def _failing_embeddings():
 
 
 def _start(config, gate: threading.Event, cap: float = 3.0, embeddings=None):
-    patcher = patch("manager.app.EmbeddingsClient")
+    patcher = patch("manager.retrieval.EmbeddingsClient")
     client_cls = patcher.start()
     client_cls.return_value = embeddings or _gated_embeddings(gate, cap)
     from manager.app import create_app
@@ -170,7 +170,7 @@ def test_shutdown_with_a_pending_prune_is_prompt(collection_config, skills_dir, 
 
 def _app_records(caplog, level: int, needle: str) -> list[logging.LogRecord]:
     return [r for r in caplog.records
-            if r.name == "manager.app" and r.levelno >= level
+            if r.name == "manager.retrieval" and r.levelno >= level
             and needle in r.getMessage().lower()]
 
 
@@ -187,7 +187,7 @@ def test_a_failed_prune_is_logged(collection_config, skills_dir, no_probe, caplo
     gate.set()
     app, patcher = _start(collection_config, gate)
     try:
-        with caplog.at_level(logging.INFO, logger="manager.app"):
+        with caplog.at_level(logging.INFO, logger="manager.retrieval"):
             with TestClient(app) as client:
                 client.portal.call(app.state.server.reindex_registry.wait_idle)
                 deadline = time.monotonic() + 3
@@ -218,11 +218,11 @@ def test_a_failed_startup_index_job_prunes_nothing(
         job_patch = None
     else:                                # the pass itself raises: job status "error"
         app, patcher = _start(collection_config, gate)
-        job_patch = patch("manager.app.index_collection",
+        job_patch = patch("manager.retrieval.index_collection",
                           AsyncMock(side_effect=RuntimeError("walk failed")))
         job_patch.start()
     try:
-        with caplog.at_level(logging.INFO, logger="manager.app"):
+        with caplog.at_level(logging.INFO, logger="manager.retrieval"):
             with TestClient(app) as client:
                 client.portal.call(app.state.server.reindex_registry.wait_idle)
                 time.sleep(0.3)

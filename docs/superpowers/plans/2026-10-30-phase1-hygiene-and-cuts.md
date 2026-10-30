@@ -551,6 +551,6 @@ Expected: every check `PASS`, exit 0.
 ! cd /opt/llama/models && sudo rm -v gemma-3-4b-it-q4_k_m.gguf Qwen3.5-35B-A3B-Q4_K_M.gguf Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf gemma-4-E4B-it-Q4_K_M.gguf Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf && sudo rm -rv CYBER-FROST-3.8 && ls
 ```
 
-Expected: these remain: `Qwen3.6-35B-A3B-UD-IQ4_NL_XL.{gguf,args}`, `Qwen3.8-27B-UD-Q6_K.{gguf,args}`, `gemma-4-26b-a4b-it-q4_k_m.gguf`, `nomic-embed-text-v1.5.Q8_0.gguf`, and the `Qwen3.8-Flash-Next/` directory. That directory isn't in the decision list, so it isn't touched here. Ask the owner about it.
+Expected: these remain: `Qwen3.6-35B-A3B-UD-IQ4_NL_XL.{gguf,args}`, `Qwen3.8-27B-UD-Q6_K.{gguf,args}`, `gemma-4-26b-a4b-it-q4_k_m.gguf`, `nomic-embed-text-v1.5.Q8_0.gguf`, and the `Qwen3.8-Flash-Next/` directory. The owner decided on 2026-10-30 that this directory stays.
 
 **Rollback before Step 6:** restore `/root/llama-manager.sudoers.bak` and `/root/manager.env.bak`, reverse the moves in Step 3, and redeploy the previous commit with `deploy-manager.sh` from a checkout at that commit.

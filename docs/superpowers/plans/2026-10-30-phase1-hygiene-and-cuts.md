@@ -202,8 +202,9 @@ def test_every_template_slot_has_its_unit_and_env_file_in_the_repo():
 
 def test_no_live_file_names_the_old_re_slot():
     # Historical records under docs/ keep their wording; everything else must not.
+    # The [E]/[e] classes stop the pattern matching this file's own source.
     out = subprocess.run(
-        ["git", "-C", str(REPO), "grep", "-n", "-E", r"SLOT_RE_|llama-server-re\b",
+        ["git", "-C", str(REPO), "grep", "-n", "-E", r"SLOT_R[E]_|llama-server-r[e]\b",
          "--", ".", ":!docs/"],
         capture_output=True, text=True,
     )
@@ -213,7 +214,7 @@ def test_no_live_file_names_the_old_re_slot():
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_repo_consistency.py -v -p no:cacheprovider`
-Expected: `test_no_live_file_names_the_old_re_slot` FAILS, listing the `SLOT_RE_` lines. The first test passes before the rename too, because the `re` files exist. It's a guard for the rename, not proof of it, which is acceptable.
+Expected: `test_no_live_file_names_the_old_re_slot` FAILS, listing the `SLOT_RE_` lines. It must not list `tests/test_repo_consistency.py` itself; if it does, the pattern is matching its own source. The first test passes before the rename too, because the `re` files exist. It's a guard for the rename, not proof of it, which is acceptable.
 
 - [ ] **Step 3: Do the renames and edits listed under Files**
 

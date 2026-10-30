@@ -12,7 +12,6 @@ Endpoints:
     POST /v1/chat/completions                 - Proxy to llama-server (with model swap)
     POST /v1/messages                         - Anthropic API passthrough (same queue/swap semantics)
     POST /v1/messages/count_tokens            - Anthropic token counting passthrough
-    POST /v1/embeddings                       - Proxy to embeddings server
     GET  /collections                         - List registered collections
     POST /collections/{collection_id}/search  - Semantic search within a collection
     GET  /collections/{collection_id}/docs/{doc_id:path} - Get full document by ID
@@ -1090,35 +1089,6 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 f"{slot.url}/v1/messages/count_tokens",
                 json=body,
                 timeout=30,
-            )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-
-    # ------------------------------------------------------------------
-    # POST /v1/embeddings
-    # ------------------------------------------------------------------
-
-    @app.post("/v1/embeddings")
-    async def embeddings_proxy(request: Request):
-        """Proxy embeddings requests to the dedicated embeddings server."""
-        if not config.embeddings_url:
-            return JSONResponse(
-                {"error": "Embeddings server not configured"}, status_code=503
-            )
-        try:
-            body = await request.body()
-        except Exception:
-            return JSONResponse({"error": "Failed to read request body"}, status_code=400)
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{config.embeddings_url}/v1/embeddings",
-                content=body,
-                headers={"content-type": request.headers.get("content-type", "application/json")},
-                timeout=60,
             )
         return Response(
             content=resp.content,

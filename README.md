@@ -16,7 +16,7 @@ A native llama.cpp inference server that fronts several llama-server backends ("
 │  │   OpenAI API     POST /v1/chat/completions, GET /v1/models     │  │
 │  │   Anthropic API  POST /v1/messages, /v1/messages/count_tokens  │  │
 │  │   Admin          POST /swap, GET /status, GET /health          │  │
-│  │   Retrieval      POST /v1/embeddings, /collections/*           │  │
+│  │   Retrieval      POST /collections/*                           │  │
 │  │                                                                │  │
 │  │   routes by model → one FIFO queue per slot                    │  │
 │  └──────┬─────────────────────────────────────┬───────────┬───────┘  │
@@ -389,7 +389,6 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/messages` | Anthropic Messages API. Byte passthrough to the slot's llama-server, with the same routing, queueing and status codes as chat completions; errors use the Anthropic error envelope. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
 | `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; without `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, else 400. Returns 200 if already loaded, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. |
-| `POST` | `/v1/embeddings` | Proxy to llama-embeddings instance. OpenAI-compatible. |
 | `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
 | `GET` | `/status` | Per-slot health, loaded model, and queue depth; GPU VRAM usage; uptime. Re-probes every slot before answering. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
@@ -497,22 +496,12 @@ curl -s http://LAN_IP:11434/collections/vault/reindex/<job_id> | jq
 
 Concurrent POSTs to the same collection return the in-flight `job_id` rather than stacking duplicate scans. Jobs are in-memory only and wiped on server restart (which already triggers a full reindex).
 
-
-**Generate embeddings directly:**
-
-```bash
-curl -s http://LAN_IP:11434/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"model": "nomic-embed-text", "input": "hello world"}' | jq
-```
-
 ### Architecture
 
 ```
 Manager (:11434)
 ├── /v1/chat/completions → llama-server (:8081, GPU)
-├── /v1/embeddings       → llama-embeddings (:8082, CPU)
-├── /collections/*/search → SQLite-vec (in-process)
+├── /collections/*/search → query vector from llama-embeddings (:8082, CPU) → SQLite-vec (in-process)
 └── /collections/*/docs/* → SQLite-vec (in-process)
 ```
 

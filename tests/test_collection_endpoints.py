@@ -1,9 +1,5 @@
 # tests/test_collection_endpoints.py
-"""Tests for the collection and embeddings API endpoints."""
-import pytest
-import json
-from unittest.mock import AsyncMock, patch, MagicMock
-from fastapi.testclient import TestClient
+"""Tests for the collection API endpoints."""
 
 
 def test_list_collections(collection_client):
@@ -57,30 +53,6 @@ def test_get_document_not_found(collection_client):
     """GET /collections/skills/docs/nonexistent returns 404."""
     response = collection_client.get("/collections/skills/docs/nonexistent")
     assert response.status_code == 404
-
-
-def test_embeddings_proxy(collection_client):
-    """POST /v1/embeddings proxies to embedding server."""
-    with patch("manager.app.httpx.AsyncClient") as MockClient:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.content = json.dumps({
-            "object": "list",
-            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
-            "model": "nomic-embed-text",
-        }).encode()
-        mock_resp.headers = {"content-type": "application/json"}
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
-        MockClient.return_value = mock_client
-
-        response = collection_client.post(
-            "/v1/embeddings",
-            json={"model": "nomic-embed-text", "input": "hello"},
-        )
-        assert response.status_code == 200
 
 
 def test_reindex_post_rejects_unknown_collection(collection_client):

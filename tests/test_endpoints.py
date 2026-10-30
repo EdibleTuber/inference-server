@@ -1118,9 +1118,9 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
 # Queue-consumer tests (passthrough, streaming, queue errors) build their own
 # app + `with TestClient(app)` so the per-slot background consumers exist, and
 # set slot state AFTER entering (the startup probe runs on enter). The
-# backend HTTP is mocked by patching manager.app.httpx.AsyncClient -- the same
-# precedent as test_embeddings_proxy in test_collection_endpoints.py -- so the
-# tests assert on the exact backend URL the consumer dials.
+# backend HTTP is mocked by patching manager.app.httpx.AsyncClient, exactly as
+# the tests in this section do -- so they assert on the exact backend URL the
+# consumer dials.
 
 def test_messages_non_streaming_passthrough(test_config, monkeypatch):
     """POST /v1/messages is passed through, byte for byte, to the routed
@@ -1527,3 +1527,13 @@ def test_count_tokens_unhealthy_slot_is_anthropic_503(client, monkeypatch):
     err = _anthropic_error_envelope(r)
     assert err["type"] == "api_error"
     assert r.headers.get("retry-after") == "5"
+
+
+def test_embeddings_proxy_is_gone(client):
+    """The /v1/embeddings proxy is removed (spec Q24): nothing called it.
+
+    Collections reach the embeddings backend directly through
+    manager/embeddings.py, so POST /v1/embeddings must be an unknown route.
+    """
+    r = client.post("/v1/embeddings", json={"input": "x"})
+    assert r.status_code == 404

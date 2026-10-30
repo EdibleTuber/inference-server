@@ -145,6 +145,10 @@ def test_delete_collection_removes_its_documents_vectors_and_row(db):
 
     assert removed == 2
     assert [c["id"] for c in db.list_collections()] == ["keep"]
-    vec_ids = {r[0] for r in db._conn.execute("SELECT id FROM documents_vec").fetchall()}
-    assert vec_ids == {"k"}
+    # Raw rowids, not a join to documents: a leaked vector's document row is
+    # already gone, so a join would hide exactly the leak this checks for.
+    k_pk = db._conn.execute(
+        "SELECT pk FROM documents WHERE collection = 'keep' AND id = 'k'").fetchone()[0]
+    vec_rowids = {r[0] for r in db._conn.execute("SELECT rowid FROM doc_vectors").fetchall()}
+    assert vec_rowids == {k_pk}
     assert db.get_document("keep", "k") is not None

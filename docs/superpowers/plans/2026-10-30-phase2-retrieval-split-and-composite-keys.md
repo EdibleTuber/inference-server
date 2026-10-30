@@ -167,6 +167,7 @@ git commit -m "refactor: move collections routes and indexing to manager/retriev
   with
   `vec_ids = {r[0] for r in db._conn.execute("SELECT d.id FROM doc_vectors v JOIN documents d ON d.pk = v.rowid").fetchall()}`.
   The assertion that follows it (`== {"k"}`) stays.
+  (After review: the join was a mistake in the plan. A leaked vector's document row is already gone, so the join hid the leak. `1a2bcae` replaced it with a raw rowid count. Also, `tests/test_orphan_pruning.py:112` needed the same table rename, and Qwen correctly changed it to count the `notes` partition.)
 
 **Interfaces:**
 - Produces, in `manager/vectordb.py`:
@@ -296,7 +297,7 @@ def test_a_small_collection_is_searchable_beside_a_large_one(db):
     hits = db.search("small", unit(0), limit=5)
 
     assert [h["id"] for h in hits] == ["only"]
-    assert hits[0]["score"] == pytest.approx(0.0)   # orthogonal unit vectors
+    assert hits[0]["score"] == pytest.approx(0.0, abs=1e-6)   # orthogonal; float32 distances
 
 
 def test_children_match_the_prefix_literally(db):
@@ -371,7 +372,9 @@ git commit -m "feat(vectordb): per-collection document keys; collection-partitio
   8. `logger.info("skills.db schema migrated v0 -> v1: %d documents, %d vectors; backup at %s", …)`. The host step greps for this line.
 
   Any exception in steps 2–7 runs `ROLLBACK` and re-raises. Verified on a copy of the live DB with sqlite-vec 0.1.9: vec0 `CREATE VIRTUAL TABLE` and `DROP TABLE` roll back cleanly inside a transaction, and the full migration of 2917 documents takes about 1.3 s.
-- The connection's transaction handling: Python's `sqlite3` with the default `isolation_level` does **not** open a transaction for DDL. Without an explicit `BEGIN`, every `CREATE`/`DROP` autocommits on its own, and `test_failed_migration_rolls_back_to_the_legacy_database` is the test that catches that. Choose either an explicit `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on the existing connection, or `isolation_level=None` with explicit transactions in every mutating method. Whichever you choose, `upsert_document`, `delete_stale` and `delete_collection` must each stay a single transaction.
+- The connection's transaction handling: Python's `sqlite3` with the default `isolation_level` does **not** open a transaction for DDL. Without an explicit `BEGIN`, every `CREATE`/`DROP` autocommits on its own, and `test_failed_migration_rolls_back_to_the_legacy_database` is the test that catches that. Choose either an explicit `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on the existing connection, or `isolation_level=None` with explicit transactions in every mutating method. Whichever you choose, `upsert_document`, `delete_stale` and `delete_collection` must each stay a single transaction, and **each must roll back on any exception before re-raising**.
+  - This was added after Task 3's review. It fixes a pre-existing bug, verified on the Task 3 commit. A vector insert that raises leaves the document row in an open transaction, and the next write's `commit()` commits it, so the document is stored with its hash and no vector. Every later reindex sees an unchanged hash and skips it, so it can never be found by search. It would also make `_verify_migration` abort a later migration.
+  - The test is `test_a_failed_upsert_leaves_no_half_written_document`.
 - No change is needed in the lifespan. `start_retrieval` (Task 1) already catches any exception from `init_schema()`, sets `server.db = None`, and logs it, so a failed migration leaves collection endpoints at 503 while inference keeps serving.
 
 - [ ] **Step 1: Write the failing tests** `tests/test_schema_migration.py`
@@ -600,6 +603,24 @@ def test_a_failed_migration_leaves_inference_up(collection_config, monkeypatch):
         with TestClient(create_app(collection_config)) as client:
             assert client.get("/health").status_code == 200
             assert client.get("/collections").status_code == 503
+
+
+def test_a_failed_upsert_leaves_no_half_written_document(tmp_path):
+    db = VectorDB(str(tmp_path / "skills.db"))
+    db.init_schema()
+    try:
+        db.upsert_collection("c", "/c", "markdown")
+        with pytest.raises(sqlite3.Error):
+            db.upsert_document("bad", "c", "B", {}, "s", "c", "/c/bad.md", "hbad",
+                               [0.0] * 4)              # wrong dimension: the vector insert raises
+        db.upsert_document("good", "c", "G", {}, "s", "c", "/c/good.md", "hgood", unit(0))
+
+        assert db.get_hash("c", "/c/bad.md") is None   # retried on the next reindex
+        docs = db._conn.execute("SELECT count(*) FROM documents").fetchone()[0]
+        vecs = db._conn.execute("SELECT count(*) FROM doc_vectors").fetchone()[0]
+        assert (docs, vecs) == (1, 1)
+    finally:
+        db.close()
 ```
 
 - [ ] **Step 2: Run them and check that they fail**
@@ -607,6 +628,7 @@ def test_a_failed_migration_leaves_inference_up(collection_config, monkeypatch):
 Run: `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_schema_migration.py -q -p no:cacheprovider`
 Expected:
 - The first six FAIL. Task 3's code raises `SchemaVersionError` on a legacy DB, and `MigrationError` doesn't exist yet.
+- `test_a_failed_upsert_leaves_no_half_written_document` FAILS on `get_hash` returning `'hbad'`.
 - `test_a_failed_migration_leaves_inference_up` errors at `monkeypatch.setattr`, because `_verify_migration` doesn't exist yet. That counts as failing.
 
 - [ ] **Step 3: Implement the migration** in `init_schema()`'s legacy branch, per the Interfaces block, in exactly that order.

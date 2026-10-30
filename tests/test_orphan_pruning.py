@@ -109,8 +109,10 @@ def test_orphaned_collection_is_pruned_after_its_documents_move(
     try:
         assert db._conn.execute(
             "SELECT COUNT(*) FROM documents WHERE collection = 'notes'").fetchone()[0] == 0
+        # gone/doc was seeded into notes and its file is gone, so its vector was
+        # never moved out: an empty notes partition means no orphaned vectors.
         assert db._conn.execute(
-            "SELECT COUNT(*) FROM documents_vec WHERE id = 'gone/doc'").fetchone()[0] == 0
+            "SELECT COUNT(*) FROM doc_vectors WHERE collection = 'notes'").fetchone()[0] == 0
     finally:
         db.close()
 

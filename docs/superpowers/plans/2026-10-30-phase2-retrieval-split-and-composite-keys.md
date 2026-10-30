@@ -38,7 +38,7 @@
 These are the failure modes most likely to reach the live system. Each has a test in the task named after the arrow.
 
 1. A stale `patch("manager.app.EmbeddingsClient")` that silently stops patching after the move. Tests would then build a real embeddings client. → Task 1 `test_app_no_longer_holds_retrieval_names` makes a stale target raise `AttributeError` instead.
-2. Shutdown order changes in the move: the DB closes while a reindex job or the prune task is still using it. → Task 1 keeps the order (prune cancel → registry shutdown → embeddings close → DB close → consumers cancelled). The existing `tests/test_orphan_pruning.py` and `tests/test_background_indexing.py` must pass with no edits other than the patch targets.
+2. Shutdown order changes in the move: the DB closes while a reindex job or the prune task is still using it. → Task 1 keeps the order (prune cancel → registry shutdown → embeddings close → DB close → consumers cancelled). The existing `tests/test_orphan_pruning.py` and `tests/test_background_indexing.py` must pass with no edits other than the patch-target and logger-name strings.
 3. A migration that half-applies: the new tables are created, then an error occurs, leaving neither schema usable. → Task 4 `test_failed_migration_rolls_back_to_the_legacy_database` injects a failure after the copies.
 4. Migration with no backup. → Task 4 `test_migration_backs_up_the_legacy_database_first`.
 5. A failed migration taking inference down with it. → Task 4 `test_a_failed_migration_leaves_inference_up`.
@@ -64,6 +64,7 @@ Not covered, on purpose: tag filtering still post-filters `max(limit*20, 100)` c
 - Sanctioned test edits, patch-target strings only:
   - `tests/conftest.py:207`, `tests/test_background_indexing.py:48`, `tests/test_background_indexing.py:180` and `tests/test_orphan_pruning.py:81`: `"manager.app.EmbeddingsClient"` becomes `"manager.retrieval.EmbeddingsClient"`.
   - `tests/test_orphan_pruning.py:221`: `"manager.app.index_collection"` becomes `"manager.retrieval.index_collection"`.
+  - `tests/test_orphan_pruning.py:173,190,225`: the logger name `"manager.app"` becomes `"manager.retrieval"`, because the prune logs now come from the new module. (Added after Task 1: the plan originally missed these, and Qwen was right to change them.)
 
 **Interfaces:**
 - Produces, in `manager/retrieval.py`:

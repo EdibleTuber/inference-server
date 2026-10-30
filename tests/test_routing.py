@@ -65,35 +65,35 @@ def test_resolves_a_third_slot():
     slots = {
         "main": _slot("main", "coding-model"),
         "egpu": _slot("egpu", "small-model"),
-        "re": _slot("re", "gemma-4-26b-a4b-it-q4_k_m"),
+        "aux": _slot("aux", "gemma-4-26b-a4b-it-q4_k_m"),
     }
-    assert resolve_slot("gemma-4-26b-a4b-it-q4_k_m", slots) == "re"
+    assert resolve_slot("gemma-4-26b-a4b-it-q4_k_m", slots) == "aux"
 
 
 def test_first_configured_slot_wins_when_duplicated():
     """Priority is iteration order, so the earliest configured slot wins."""
-    slots = {"re": _slot("re", "shared"), "main": _slot("main", "shared")}
-    assert resolve_slot("shared", slots) == "re"
+    slots = {"aux": _slot("aux", "shared"), "main": _slot("main", "shared")}
+    assert resolve_slot("shared", slots) == "aux"
 
 
 def test_first_configured_slot_wins_when_duplicated_reverse_order():
     """Same guarantee with the dict built in the opposite order, so the test
     cannot pass by accident of a hardcoded 'main'/'egpu'-then-others walk --
     it only passes if resolve_slot genuinely follows dict iteration order."""
-    slots = {"main": _slot("main", "shared"), "re": _slot("re", "shared")}
+    slots = {"main": _slot("main", "shared"), "aux": _slot("aux", "shared")}
     assert resolve_slot("shared", slots) == "main"
 
 
 def test_unknown_model_across_three_slots_returns_none():
     slots = {
-        "main": _slot("main", "a"), "egpu": _slot("egpu", "b"), "re": _slot("re", "c"),
+        "main": _slot("main", "a"), "egpu": _slot("egpu", "b"), "aux": _slot("aux", "c"),
     }
     assert resolve_slot("d", slots) is None
 
 
 def test_third_slot_comparison_is_normalised():
-    slots = {"main": _slot("main", None), "re": _slot("re", "Gemma-4-26B")}
-    assert resolve_slot("/models/gemma-4-26b.gguf", slots) == "re"
+    slots = {"main": _slot("main", None), "aux": _slot("aux", "Gemma-4-26B")}
+    assert resolve_slot("/models/gemma-4-26b.gguf", slots) == "aux"
 
 
 from manager.routing import home_slot
@@ -106,15 +106,15 @@ def _sc(name, *models):
 
 
 def test_home_slot_finds_the_configured_slot():
-    scs = [_sc("main", "model-a"), _sc("re", "model-b")]
-    assert home_slot("model-b", scs) == "re"
+    scs = [_sc("main", "model-a"), _sc("egpu", "model-b")]
+    assert home_slot("model-b", scs) == "egpu"
 
 
 def test_home_slot_is_case_and_suffix_insensitive():
-    scs = [_sc("main"), _sc("re", "Model-B.gguf")]
-    assert home_slot("model-b", scs) == "re"
+    scs = [_sc("main"), _sc("egpu", "Model-B.gguf")]
+    assert home_slot("model-b", scs) == "egpu"
 
 
 def test_home_slot_none_for_unmapped_model():
-    scs = [_sc("main", "model-a"), _sc("re")]
+    scs = [_sc("main", "model-a"), _sc("egpu")]
     assert home_slot("model-z", scs) is None

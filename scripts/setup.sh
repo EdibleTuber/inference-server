@@ -118,6 +118,7 @@ echo "[6/8] Installing sudoers entry..."
 cat > /etc/sudoers.d/llama-manager << 'EOF'
 # Allow model manager to restart llama-server for model swapping.
 _llama-mgr ALL=(root) NOPASSWD: /usr/bin/systemctl restart llama-server.service
+_llama-mgr ALL=(root) NOPASSWD: /usr/bin/systemctl restart llama-server-egpu.service
 EOF
 chmod 440 /etc/sudoers.d/llama-manager
 

@@ -121,14 +121,15 @@ from manager.slot_config import SlotConfig
 
 
 def test_from_env_populates_slots_in_order(monkeypatch):
-    # SLOT_EGPU_PORT is required: only 'main' has built-in defaults, so an
-    # extra slot needs an explicit port (see test_slot_config.py).
-    monkeypatch.setenv("SLOTS", "main,re,egpu")
-    monkeypatch.setenv("SLOT_RE_PORT", "18084")
+    # SLOT_AUX_PORT and SLOT_EGPU_PORT are required: only 'main' has
+    # built-in defaults, so each extra slot needs an explicit port
+    # (see test_slot_config.py).
+    monkeypatch.setenv("SLOTS", "main,aux,egpu")
+    monkeypatch.setenv("SLOT_AUX_PORT", "18084")
     monkeypatch.setenv("SLOT_EGPU_PORT", "18085")
     from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
-    assert [s.name for s in cfg.slots] == ["main", "re", "egpu"]
+    assert [s.name for s in cfg.slots] == ["main", "aux", "egpu"]
 
 
 def test_from_env_defaults_to_main_only(monkeypatch):

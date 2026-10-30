@@ -27,7 +27,7 @@ DEFAULT_SLOTS = ("main",)
 
 # Per-field suffix used to build the SLOT_<NAME>_<SUFFIX> variable name.
 # Note env_file/systemd_unit use short suffixes (ENV/UNIT) rather than the
-# field name itself -- SLOT_RE_ENV, not SLOT_RE_ENV_FILE.
+# field name itself -- SLOT_EGPU_ENV, not SLOT_EGPU_ENV_FILE.
 _FIELD_SUFFIX = {
     "host": "HOST",
     "port": "PORT",

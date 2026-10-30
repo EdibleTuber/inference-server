@@ -436,33 +436,33 @@ def _homes_client(config, monkeypatch, **homes):
 
 
 def test_untargeted_swap_goes_to_the_models_home_slot(three_slot_config, monkeypatch):
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q8"})
     assert r.status_code == 202, r.text
-    assert r.json()["slot"] == "re"
-    assert swapped == ["re"]
+    assert r.json()["slot"] == "aux"
+    assert swapped == ["aux"]
 
 
 def test_untargeted_swap_matches_home_case_and_suffix_insensitively(
         three_slot_config, monkeypatch):
     client, swapped = _homes_client(
-        three_slot_config, monkeypatch, re=["TEST-MODEL-Q8.gguf"])
+        three_slot_config, monkeypatch, aux=["TEST-MODEL-Q8.gguf"])
     r = client.post("/swap", json={"model": "test-model-q8"})
     assert r.status_code == 202, r.text
-    assert swapped == ["re"]
+    assert swapped == ["aux"]
 
 
 def test_untargeted_swap_with_null_target_uses_the_map(three_slot_config, monkeypatch):
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q8", "target": None})
     assert r.status_code == 202, r.text
-    assert swapped == ["re"]
+    assert swapped == ["aux"]
 
 
 def test_untargeted_swap_of_unmapped_model_is_refused_and_touches_no_slot(
         three_slot_config, monkeypatch):
     # test-model-q4 exists on disk but no slot calls it home.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q4"})
     assert r.status_code == 400, r.text
     body = r.json()
@@ -474,7 +474,7 @@ def test_untargeted_swap_of_unmapped_model_is_refused_and_touches_no_slot(
 def test_untargeted_swap_of_mapped_but_missing_model_is_404(three_slot_config, monkeypatch):
     # (pin) 404 before and after: proves the map lookup runs before, and does
     # not replace, the model-file check.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["does-not-exist"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["does-not-exist"])
     r = client.post("/swap", json={"model": "does-not-exist"})
     assert r.status_code == 404, r.text
     assert r.json()["error"]["type"] == "model_not_found"
@@ -483,7 +483,7 @@ def test_untargeted_swap_of_mapped_but_missing_model_is_404(three_slot_config, m
 
 def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
     # (pin) An explicit target is an operator override, even against the map.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q4"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q4"])
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
     assert r.status_code == 202, r.text
     assert swapped == ["main"]
@@ -491,9 +491,9 @@ def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
 
 def test_status_reports_each_slots_home_models(three_slot_config):
     from manager.app import create_app
-    client = TestClient(create_app(_with_homes(three_slot_config, re=["test-model-q8"])))
+    client = TestClient(create_app(_with_homes(three_slot_config, aux=["test-model-q8"])))
     slots = client.get("/status").json()["slots"]
-    assert slots["re"]["models"] == ["test-model-q8"]
+    assert slots["aux"]["models"] == ["test-model-q8"]
     assert slots["main"]["models"] == []
 
 
@@ -559,9 +559,9 @@ def test_background_swap_failure_is_logged_not_raised(client, monkeypatch, caplo
 def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
     """A slot beyond the main slot is a valid /swap target when configured."""
     resp = client_with_three_slots.post(
-        "/swap", json={"model": "test-model-q4", "target": "re"})
+        "/swap", json={"model": "test-model-q4", "target": "aux"})
     assert resp.status_code == 202, resp.text
-    assert resp.json()["slot"] == "re"
+    assert resp.json()["slot"] == "aux"
 
 
 def test_swap_rejects_an_unconfigured_target(client_with_three_slots):
@@ -828,15 +828,15 @@ def test_server_builds_every_configured_slot(test_config):
     cfg = replace(test_config, slots=(
         SlotConfig("main", "127.0.0.1", 18081, "/tmp/main.env", "main.service", 20),
         SlotConfig("egpu", "127.0.0.1", 18083, "/tmp/egpu.env", "egpu.service", 20),
-        SlotConfig("re", "127.0.0.1", 18084, "/tmp/re.env", "re.service", 30),
+        SlotConfig("aux", "127.0.0.1", 18084, "/tmp/aux.env", "aux.service", 30),
     ))
     server = ServerState(cfg)
 
-    assert list(server.slots) == ["main", "egpu", "re"]
-    assert server.slots["re"].port == 18084
-    assert server.slots["re"].queue.max_size == 30
-    assert server.slots["re"].env_file == "/tmp/re.env"
-    assert server.slots["re"].systemd_unit == "re.service"
+    assert list(server.slots) == ["main", "egpu", "aux"]
+    assert server.slots["aux"].port == 18084
+    assert server.slots["aux"].queue.max_size == 30
+    assert server.slots["aux"].env_file == "/tmp/aux.env"
+    assert server.slots["aux"].systemd_unit == "aux.service"
     assert all(s.swapper is not None for s in server.slots.values())
 
 
@@ -853,7 +853,7 @@ def test_slot_count_follows_configuration(test_config):
     cfg = replace(test_config, slots=(
         SlotConfig("main", "127.0.0.1", 18081, "/tmp/main.env", "main.service", 20),
         SlotConfig("egpu", "127.0.0.1", 18083, "/tmp/egpu.env", "egpu.service", 20),
-        SlotConfig("re", "127.0.0.1", 18084, "/tmp/re.env", "re.service", 30),
+        SlotConfig("aux", "127.0.0.1", 18084, "/tmp/aux.env", "aux.service", 30),
     ))
     server = ServerState(cfg)
     assert len(server.slots) == len(cfg.slots)

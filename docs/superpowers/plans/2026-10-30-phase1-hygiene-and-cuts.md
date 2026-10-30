@@ -517,18 +517,20 @@ Expected: the suite runs and passes, the files install, and the manager is healt
 - [ ] **Step 2: Stage the new sudoers file and validate it before installing it**
 
 ```
-! sudo cp /etc/sudoers.d/llama-manager /root/llama-manager.sudoers.bak && sed 's/llama-server-re\.service/llama-server-egpu.service/' /etc/sudoers.d/llama-manager | sudo tee /tmp/llama-manager.new >/dev/null && sudo visudo -cf /tmp/llama-manager.new && sudo install -m 440 -o root -g root /tmp/llama-manager.new /etc/sudoers.d/llama-manager && sudo cat /etc/sudoers.d/llama-manager
+! sudo cp /etc/sudoers.d/llama-manager /root/llama-manager.sudoers.bak && sudo sh -c "sed 's/llama-server-re\.service/llama-server-egpu.service/' /etc/sudoers.d/llama-manager > /root/llama-manager.new" && sudo grep -c 'systemctl restart llama-server' /root/llama-manager.new && sudo grep -q 'llama-server-egpu\.service' /root/llama-manager.new && sudo visudo -cf /root/llama-manager.new && sudo install -m 440 -o root -g root /root/llama-manager.new /etc/sudoers.d/llama-manager && sudo cat /etc/sudoers.d/llama-manager
 ```
 
-Expected: `parsed OK`, and the output lists both `llama-server.service` and `llama-server-egpu.service`.
+Expected: `2`, then `parsed OK`, and the output lists both `llama-server.service` and `llama-server-egpu.service`.
+
+The `sed` runs under `sudo` because the sudoers file is `0440 root`. An unprivileged `sed` piped to `sudo tee` fails to read it, `tee` still succeeds, and `visudo -c` passes the resulting empty file (checked 2026-10-30), which would install an empty entry. The two `grep`s stop the chain before `install` if the edited file is empty or lacks the `egpu` line.
 
 - [ ] **Step 3: Move the egpu slot's unit, env file and logs, and update `manager.env`**
 
 ```
-! sudo systemctl disable --now llama-server-re.service && sudo mv /etc/llama/llama-server-re.env /etc/llama/llama-server-egpu.env && sudo install -m 644 systemd/llama-server-egpu.service /etc/systemd/system/ && sudo rm /etc/systemd/system/llama-server-re.service && for f in log err; do [ -e /var/log/llama/llama-server-re.$f ] && sudo mv /var/log/llama/llama-server-re.$f /var/log/llama/llama-server-egpu.$f; done; sudo cp /etc/llama/manager.env /root/manager.env.bak && sudo sed -i -e 's/^SLOTS=main,re$/SLOTS=main,egpu/' -e 's/^SLOT_RE_/SLOT_EGPU_/' -e 's#llama-server-re\.#llama-server-egpu.#g' -e '/^BATCH_/d' /etc/llama/manager.env && grep -E '^(SLOTS|SLOT_EGPU_)' /etc/llama/manager.env
+! sudo systemctl disable --now llama-server-re.service && sudo mv /etc/llama/llama-server-re.env /etc/llama/llama-server-egpu.env && sudo install -m 644 /mnt/secondary/inference-server/systemd/llama-server-egpu.service /etc/systemd/system/ && sudo rm /etc/systemd/system/llama-server-re.service && for f in log err; do [ -e /var/log/llama/llama-server-re.$f ] && sudo mv /var/log/llama/llama-server-re.$f /var/log/llama/llama-server-egpu.$f; done; sudo cp /etc/llama/manager.env /root/manager.env.bak && sudo sed -i -e 's/^SLOTS=main,re$/SLOTS=main,egpu/' -e 's/^SLOT_RE_/SLOT_EGPU_/' -e 's#llama-server-re\.#llama-server-egpu.#g' -e '/^BATCH_/d' /etc/llama/manager.env && grep -E '^(SLOTS|SLOT_EGPU_)' /etc/llama/manager.env
 ```
 
-Expected: `SLOTS=main,egpu`, and every `SLOT_EGPU_*` key points at `-egpu` paths. The ownership of the moved env file stays `_llama-mgr`.
+Expected: `SLOTS=main,egpu`, and every `SLOT_EGPU_*` key points at `-egpu` paths. The ownership of the moved env file stays `_llama-mgr`. Only the current `.log` and `.err` are renamed. Rotated `llama-server-re.err.*` files keep their old names as history; logrotate matches `*.log` and `*.err`, so it doesn't care about the name.
 
 - [ ] **Step 4: Start the renamed unit and restart the manager**
 
@@ -541,10 +543,10 @@ Expected: slots `main` and `egpu`, both with their models and `healthy: true`. `
 - [ ] **Step 5: Remove the batch leftovers and run the doctor**
 
 ```
-! sudo rm -f /etc/llama/llama-server-batch.env /etc/systemd/system/llama-server-batch.service && sudo systemctl daemon-reload && sudo ./scripts/doctor.sh
+! sudo rm -f /etc/llama/llama-server-batch.env /etc/systemd/system/llama-server-batch.service && sudo install -m 644 /mnt/secondary/inference-server/systemd/llama-embeddings.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo /mnt/secondary/inference-server/scripts/doctor.sh
 ```
 
-Expected: every check `PASS`, exit 0.
+Expected: every check `PASS`, exit 0. The embeddings unit is reinstalled because Task 4 changed one of its comments, and check 5 compares installed units with the repo byte for byte. The change is comment-only, so `daemon-reload` is enough and the embeddings server doesn't need a restart.
 
 - [ ] **Step 6: Delete the dropped GGUFs (Q35, Q39). Ask for a separate yes before running this.**
 

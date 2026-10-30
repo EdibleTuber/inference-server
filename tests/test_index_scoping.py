@@ -145,6 +145,6 @@ def test_delete_collection_removes_its_documents_vectors_and_row(db):
 
     assert removed == 2
     assert [c["id"] for c in db.list_collections()] == ["keep"]
-    vec_ids = {r[0] for r in db._conn.execute("SELECT id FROM documents_vec").fetchall()}
+    vec_ids = {r[0] for r in db._conn.execute("SELECT d.id FROM doc_vectors v JOIN documents d ON d.pk = v.rowid").fetchall()}
     assert vec_ids == {"k"}
     assert db.get_document("keep", "k") is not None

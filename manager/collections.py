@@ -148,15 +148,7 @@ def get_children(db: VectorDB, collection: str, skill_doc_id: str) -> list[dict]
     skill's parent path prefix (e.g., Security/Recon/SKILL ->
     Security/Recon/Workflows/*).
     """
-    # Get the parent directory from the skill doc ID
-    parent_prefix = skill_doc_id.rsplit("/", 1)[0] + "/"
-
-    rows = db._conn.execute(
-        "SELECT id, name, summary FROM documents WHERE collection = ? AND id LIKE ? AND id != ?",
-        (collection, f"{parent_prefix}%", skill_doc_id),
-    ).fetchall()
-
-    return [{"id": r["id"], "name": r["name"], "summary": r["summary"]} for r in rows]
+    return db.children(collection, skill_doc_id)
 
 
 async def index_collection(

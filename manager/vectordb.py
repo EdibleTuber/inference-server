@@ -14,6 +14,12 @@ import sqlite_vec
 
 logger = logging.getLogger(__name__)
 
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised when the database schema version cannot be handled by this code."""
+
 
 def _serialize_vec(vec: list[float]) -> bytes:
     """Serialize float vector to bytes for sqlite-vec."""
@@ -31,7 +37,41 @@ class VectorDB:
         self._conn.enable_load_extension(False)
 
     def init_schema(self) -> None:
-        """Create tables if they don't exist."""
+        """Create or verify the schema, dispatching on the stored version.
+
+        A fresh database is created at SCHEMA_VERSION. A v1 database gets its
+        index re-asserted. A legacy v0 database (one that predates the version
+        stamp) is refused until a migration lands, and an unknown newer version
+        is refused outright.
+        """
+        has_documents = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+        ).fetchone() is not None
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+
+        if version == 0 and not has_documents:
+            self._create_v1()
+        elif version == 0:
+            raise SchemaVersionError("legacy schema v0; migration not implemented")
+        elif version == SCHEMA_VERSION:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_documents_collection_file_path"
+                " ON documents(collection, file_path)"
+            )
+            self._conn.commit()
+        else:
+            raise SchemaVersionError(f"unknown schema version {version}")
+
+    def _create_v1(self) -> None:
+        """Create the v1 schema. This DDL is the contract the v0 -> v1
+        migration copies into place (see the phase 2 plan, Task 4).
+
+        Documents are keyed by (collection, id): the same relative path can
+        exist in several collections. doc_vectors.rowid = documents.pk — the
+        vec rowid space is shared across partitions, so it must be globally
+        unique, which documents.pk (a rowid alias) is while documents.id is
+        only unique per collection.
+        """
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS collections (
                 id          TEXT PRIMARY KEY,
@@ -40,26 +80,29 @@ class VectorDB:
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS documents (
-                id          TEXT PRIMARY KEY,
+            CREATE TABLE documents (
+                pk          INTEGER PRIMARY KEY,
                 collection  TEXT NOT NULL REFERENCES collections(id),
+                id          TEXT NOT NULL,
                 name        TEXT NOT NULL,
                 metadata    TEXT,
                 summary     TEXT NOT NULL,
                 content     TEXT NOT NULL,
                 file_path   TEXT NOT NULL,
                 file_hash   TEXT NOT NULL,
-                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(collection, id)
             );
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS documents_vec USING vec0(
-                id TEXT PRIMARY KEY,
-                embedding float[768]
+            CREATE VIRTUAL TABLE doc_vectors USING vec0(
+                collection TEXT PARTITION KEY,
+                embedding  float[768]
             );
 
-            CREATE INDEX IF NOT EXISTS idx_documents_collection_file_path
+            CREATE INDEX idx_documents_collection_file_path
                 ON documents(collection, file_path);
         """)
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
     def upsert_collection(self, id: str, source_dir: str, doc_type: str) -> None:
@@ -84,22 +127,26 @@ class VectorDB:
         file_hash: str,
         embedding: list[float],
     ) -> None:
-        """Insert or update a document and its embedding."""
+        """Insert or update a document and its embedding, in one transaction."""
         meta_json = json.dumps(metadata)
-        self._conn.execute(
-            """INSERT INTO documents (id, collection, name, metadata, summary, content, file_path, file_hash, updated_at)
+        pk = self._conn.execute(
+            """INSERT INTO documents (collection, id, name, metadata, summary, content, file_path, file_hash, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(id) DO UPDATE SET
-                 collection=excluded.collection, name=excluded.name, metadata=excluded.metadata,
+               ON CONFLICT(collection, id) DO UPDATE SET
+                 name=excluded.name, metadata=excluded.metadata,
                  summary=excluded.summary, content=excluded.content, file_path=excluded.file_path,
-                 file_hash=excluded.file_hash, updated_at=CURRENT_TIMESTAMP""",
-            (doc_id, collection, name, meta_json, summary, content, file_path, file_hash),
-        )
+                 file_hash=excluded.file_hash, updated_at=CURRENT_TIMESTAMP
+               RETURNING pk""",
+            (collection, doc_id, name, meta_json, summary, content, file_path, file_hash),
+        ).fetchone()[0]
         vec_bytes = _serialize_vec(embedding)
-        self._conn.execute("DELETE FROM documents_vec WHERE id = ?", (doc_id,))
         self._conn.execute(
-            "INSERT INTO documents_vec (id, embedding) VALUES (?, ?)",
-            (doc_id, vec_bytes),
+            "DELETE FROM doc_vectors WHERE collection = ? AND rowid = ?",
+            (collection, pk),
+        )
+        self._conn.execute(
+            "INSERT INTO doc_vectors (rowid, collection, embedding) VALUES (?, ?, ?)",
+            (pk, collection, vec_bytes),
         )
         self._conn.commit()
 
@@ -113,22 +160,25 @@ class VectorDB:
         """Search for similar documents within a collection."""
         vec_bytes = _serialize_vec(query_embedding)
         # sqlite-vec requires k= or LIMIT directly on the vec0 table — JOINs with WHERE
-        # clauses confuse the query planner. Fetch a broad candidate set then filter in Python.
+        # clauses confuse the query planner. The collection partition key keeps the KNN
+        # inside one collection, but the tag filter still runs afterwards, so we keep a
+        # broad candidate set.
         k = max(limit * 20, 100)
         vec_rows = self._conn.execute(
-            """SELECT id, distance
-               FROM documents_vec
+            """SELECT rowid, distance
+               FROM doc_vectors
                WHERE embedding MATCH ?
                AND k = ?
+               AND collection = ?
                ORDER BY distance""",
-            (vec_bytes, k),
+            (vec_bytes, k, collection),
         ).fetchall()
 
         results = []
         for row in vec_rows:
             doc = self._conn.execute(
-                "SELECT id, name, collection, summary, metadata FROM documents WHERE id = ? AND collection = ?",
-                (row["id"], collection),
+                "SELECT id, name, collection, summary, metadata FROM documents WHERE pk = ? AND collection = ?",
+                (row["rowid"], collection),
             ).fetchone()
             if doc is None:
                 continue
@@ -142,7 +192,7 @@ class VectorDB:
                 "collection": doc["collection"],
                 "summary": doc["summary"],
                 "tags": doc_tags,
-                # documents_vec uses sqlite-vec's DEFAULT L2 (Euclidean) metric, so
+                # doc_vectors uses sqlite-vec's DEFAULT L2 (Euclidean) metric, so
                 # row["distance"] is an L2 distance, not cosine distance. Embeddings are
                 # unit-normalized, for which cosine = 1 - L2^2/2. Recover that so score
                 # is a true cosine similarity in [-1, 1]. (The old `1 - distance` treated
@@ -180,17 +230,36 @@ class VectorDB:
         ).fetchone()
         return row["file_hash"] if row else None
 
+    def children(self, collection: str, skill_doc_id: str) -> list[dict]:
+        """Get child workflow documents for a SKILL.md document.
+
+        A child is any document in the same collection whose ID literally
+        starts with the skill's parent path prefix (e.g., Security/Recon/SKILL
+        -> Security/Recon/Workflows/*). The prefix is compared literally, not
+        with LIKE, so a '_' in a directory name is not a wildcard.
+        """
+        parent_prefix = skill_doc_id.rsplit("/", 1)[0] + "/"
+        rows = self._conn.execute(
+            """SELECT id, name, summary FROM documents
+               WHERE collection = ? AND substr(id, 1, ?) = ? AND id != ?""",
+            (collection, len(parent_prefix), parent_prefix, skill_doc_id),
+        ).fetchall()
+        return [{"id": r["id"], "name": r["name"], "summary": r["summary"]} for r in rows]
+
     def delete_stale(self, collection: str, keep_paths: set[str]) -> int:
         """Delete documents whose file_path is not in keep_paths. Returns count removed."""
         rows = self._conn.execute(
-            "SELECT id, file_path FROM documents WHERE collection = ?",
+            "SELECT pk, file_path FROM documents WHERE collection = ?",
             (collection,),
         ).fetchall()
         removed = 0
         for row in rows:
             if row["file_path"] not in keep_paths:
-                self._conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
-                self._conn.execute("DELETE FROM documents_vec WHERE id = ?", (row["id"],))
+                self._conn.execute(
+                    "DELETE FROM doc_vectors WHERE collection = ? AND rowid = ?",
+                    (collection, row["pk"]),
+                )
+                self._conn.execute("DELETE FROM documents WHERE pk = ?", (row["pk"],))
                 removed += 1
         if removed:
             self._conn.commit()
@@ -202,12 +271,15 @@ class VectorDB:
         Returns the number of documents removed.
         """
         rows = self._conn.execute(
-            "SELECT id FROM documents WHERE collection = ?",
+            "SELECT pk FROM documents WHERE collection = ?",
             (collection,),
         ).fetchall()
         for row in rows:
-            self._conn.execute("DELETE FROM documents_vec WHERE id = ?", (row["id"],))
-            self._conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+            self._conn.execute(
+                "DELETE FROM doc_vectors WHERE collection = ? AND rowid = ?",
+                (collection, row["pk"]),
+            )
+            self._conn.execute("DELETE FROM documents WHERE pk = ?", (row["pk"],))
         self._conn.execute("DELETE FROM collections WHERE id = ?", (collection,))
         self._conn.commit()
         return len(rows)

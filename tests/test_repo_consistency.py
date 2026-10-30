@@ -19,10 +19,11 @@ def test_every_template_slot_has_its_unit_and_env_file_in_the_repo():
 
 def test_no_live_file_names_the_old_re_slot():
     # Historical records under docs/ keep their wording; everything else must not.
+    # scripts/doctor.sh names the old unit on purpose: it checks it is gone.
     # The [E]/[e] classes stop the pattern matching this file's own source.
     out = subprocess.run(
         ["git", "-C", str(REPO), "grep", "-n", "-E", r"SLOT_R[E]_|llama-server-r[e]\b",
-         "--", ".", ":!docs/"],
+         "--", ".", ":!docs/", ":!scripts/doctor.sh"],
         capture_output=True, text=True,
     )
     assert out.stdout == "", out.stdout

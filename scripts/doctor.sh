@@ -133,13 +133,11 @@ else
   fail 5 "$bad"
 fi
 
-# 6. No leftovers from the re->egpu rename or the batch removal.
-# The renamed-from slot name is spliced in so this file itself carries no
-# occurrence of it (tests/test_repo_consistency.py greps for it outside docs/);
-# the expanded path is printed verbatim in the FAIL reason.
-renamed_from="re"
+# 6. No leftovers from the re->egpu rename or the batch removal. This is the
+# one live file allowed to name the old unit (see the exclusion in
+# tests/test_repo_consistency.py).
 bad=""
-for path in "/etc/systemd/system/llama-server-${renamed_from}.service" \
+for path in /etc/systemd/system/llama-server-re.service \
             /etc/systemd/system/llama-server-batch.service \
             /etc/llama/llama-server-batch.env; do
   if [ -e "$path" ]; then

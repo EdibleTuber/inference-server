@@ -118,6 +118,7 @@ echo "[6/8] Installing sudoers entry..."
 cat > /etc/sudoers.d/llama-manager << 'EOF'
 # Allow model manager to restart llama-server for model swapping.
 _llama-mgr ALL=(root) NOPASSWD: /usr/bin/systemctl restart llama-server.service
+_llama-mgr ALL=(root) NOPASSWD: /usr/bin/systemctl restart llama-server-egpu.service
 EOF
 chmod 440 /etc/sudoers.d/llama-manager
 
@@ -136,8 +137,9 @@ python3 -m venv /opt/llama/manager/venv
 # Copy the manager package (including __init__.py)
 cp "$REPO_DIR/manager/"*.py /opt/llama/manager/
 cp "$REPO_DIR/manager/requirements.txt" /opt/llama/manager/
+cp "$REPO_DIR/manager/requirements.lock" /opt/llama/manager/
 
-/opt/llama/manager/venv/bin/pip install -r /opt/llama/manager/requirements.txt --quiet
+/opt/llama/manager/venv/bin/pip install -r /opt/llama/manager/requirements.lock --quiet
 chown -R _llama-mgr:_llama-mgr /opt/llama/manager
 echo "  Virtualenv created, dependencies installed"
 

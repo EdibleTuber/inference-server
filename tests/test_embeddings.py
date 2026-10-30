@@ -7,7 +7,7 @@ import httpx
 
 @pytest.fixture
 def embeddings_url():
-    return "http://127.0.0.1:8082"
+    return "http://127.0.0.1:18082"
 
 
 @pytest.mark.asyncio

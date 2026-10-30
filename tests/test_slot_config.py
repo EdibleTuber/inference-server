@@ -9,9 +9,15 @@ def _env(mapping):
     return lambda key, default=None: mapping.get(key, default)
 
 
-def test_defaults_to_main_and_batch_in_that_order():
-    slots = build_slots(_env({}))
-    assert [s.name for s in slots] == ["main", "batch"]
+def test_unset_slots_is_main_only():
+    slots = build_slots(getenv={}.get)
+    assert [s.name for s in slots] == ["main"]
+
+
+def test_leftover_batch_vars_are_ignored_not_rejected():
+    env = {"BATCH_SERVER_PORT": "8083", "BATCH_SERVER_UNIT": "llama-server-batch.service"}
+    slots = build_slots(getenv=env.get)
+    assert [s.name for s in slots] == ["main"]
 
 
 def test_main_reads_legacy_llama_server_vars():
@@ -34,63 +40,47 @@ def test_main_reads_legacy_llama_server_vars():
     assert main.queue_limit == 50
 
 
-def test_batch_reads_legacy_batch_server_vars():
-    # Every value here is deliberately distinct from _DEFAULTS["batch"]
-    # (port 8083, env_file ".../llama-server-batch.env", systemd_unit
-    # "llama-server-batch.service", queue_limit 20). If any assertion used
-    # a value that matched the default, it would keep passing even when the
-    # legacy lookup for that field was broken and silently fell through to
-    # the hardcoded default instead of reading the env var.
-    slots = build_slots(_env({
-        "BATCH_SERVER_HOST": "127.0.0.1",
-        "BATCH_SERVER_PORT": "8099",
-        "BATCH_SERVER_ENV": "/etc/llama/batch.env",
-        "BATCH_SERVER_UNIT": "custom-llama-batch.service",
-        "BATCH_QUEUE_LIMIT": "45",
-    }))
-    batch = next(s for s in slots if s.name == "batch")
-    assert (batch.port, batch.queue_limit) == (8099, 45)
-    assert batch.env_file == "/etc/llama/batch.env"
-    assert batch.systemd_unit == "custom-llama-batch.service"
-
-
 def test_slots_var_controls_membership_and_order():
-    # SLOT_RE_PORT is required here: an unconfigured port raises (see
-    # test_unconfigured_port_raises_and_names_the_variable below), and this
-    # test is only about membership/order, not port validation.
-    slots = build_slots(_env({"SLOTS": "main,re,batch", "SLOT_RE_PORT": "8084"}))
-    assert [s.name for s in slots] == ["main", "re", "batch"]
+    # SLOT_AUX_PORT and SLOT_EGPU_PORT are required here: an unconfigured port
+    # raises (see test_unconfigured_port_raises_and_names_the_variable below),
+    # and this test is only about membership/order, not port validation.
+    slots = build_slots(_env({
+        "SLOTS": "main,aux,egpu",
+        "SLOT_AUX_PORT": "18084",
+        "SLOT_EGPU_PORT": "18085",
+    }))
+    assert [s.name for s in slots] == ["main", "aux", "egpu"]
 
 
 def test_new_slot_reads_prefixed_vars():
     slots = build_slots(_env({
-        "SLOTS": "main,re",
-        "SLOT_RE_HOST": "127.0.0.1",
-        "SLOT_RE_PORT": "8084",
-        "SLOT_RE_ENV": "/etc/llama/llama-server-re.env",
-        "SLOT_RE_UNIT": "llama-server-re.service",
-        "SLOT_RE_QUEUE_LIMIT": "30",
-        "SLOT_RE_DEVICE": "GPU-abc123",
+        "SLOTS": "main,egpu",
+        "SLOT_EGPU_HOST": "127.0.0.1",
+        "SLOT_EGPU_PORT": "18084",
+        "SLOT_EGPU_ENV": "/etc/llama/llama-server-egpu.env",
+        "SLOT_EGPU_UNIT": "llama-server-egpu.service",
+        "SLOT_EGPU_QUEUE_LIMIT": "30",
+        "SLOT_EGPU_DEVICE": "GPU-abc123",
     }))
-    re_slot = slots[1]
-    assert re_slot.port == 8084
-    assert re_slot.env_file == "/etc/llama/llama-server-re.env"
-    assert re_slot.systemd_unit == "llama-server-re.service"
-    assert re_slot.queue_limit == 30
-    assert re_slot.device == "GPU-abc123"
+    egpu_slot = slots[1]
+    assert egpu_slot.port == 18084
+    assert egpu_slot.env_file == "/etc/llama/llama-server-egpu.env"
+    assert egpu_slot.systemd_unit == "llama-server-egpu.service"
+    assert egpu_slot.queue_limit == 30
+    assert egpu_slot.device == "GPU-abc123"
 
 
 def test_prefixed_var_overrides_legacy_for_main():
     """An explicit SLOT_MAIN_PORT wins over LLAMA_SERVER_PORT."""
-    slots = build_slots(_env({"LLAMA_SERVER_PORT": "8081", "SLOT_MAIN_PORT": "9999"}))
+    slots = build_slots(_env({"LLAMA_SERVER_PORT": "18081", "SLOT_MAIN_PORT": "9999"}))
     assert slots[0].port == 9999
 
 
 def test_slot_names_are_normalised_and_whitespace_tolerant():
-    # SLOT_RE_PORT is required for the same reason as in
+    # SLOT_AUX_PORT is required for the same reason as in
     # test_slots_var_controls_membership_and_order above.
-    slots = build_slots(_env({"SLOTS": " main , RE ", "SLOT_RE_PORT": "8084"}))
-    assert [s.name for s in slots] == ["main", "re"]
+    slots = build_slots(_env({"SLOTS": " main , AUX ", "SLOT_AUX_PORT": "18084"}))
+    assert [s.name for s in slots] == ["main", "aux"]
 
 
 def test_duplicate_slot_names_are_rejected():
@@ -104,16 +94,16 @@ def test_empty_slots_var_is_rejected():
 
 
 def test_bad_port_names_the_variable():
-    with pytest.raises(ValueError, match="SLOT_RE_PORT"):
-        build_slots(_env({"SLOTS": "re", "SLOT_RE_PORT": "not-a-number"}))
+    with pytest.raises(ValueError, match="SLOT_EGPU_PORT"):
+        build_slots(_env({"SLOTS": "egpu", "SLOT_EGPU_PORT": "not-a-number"}))
 
 
 def test_unconfigured_port_raises_and_names_the_variable():
-    """A slot with no default (not main/batch) and no configured port must
+    """A slot with no default (not main) and no configured port must
     fail loudly, naming the variable the operator needs to set, rather than
     silently picking a port that could collide with another slot."""
-    with pytest.raises(ValueError, match="SLOT_RE_PORT"):
-        build_slots(_env({"SLOTS": "re"}))
+    with pytest.raises(ValueError, match="SLOT_EGPU_PORT"):
+        build_slots(_env({"SLOTS": "egpu"}))
 
 
 def test_slot_config_is_frozen():
@@ -129,14 +119,14 @@ def test_slot_models_default_to_empty():
 
 def test_slot_models_parsed_and_whitespace_tolerant():
     slots = build_slots(_env({
-        "SLOTS": "main,re",
-        "SLOT_RE_PORT": "8084",
+        "SLOTS": "main,egpu",
+        "SLOT_EGPU_PORT": "18084",
         "SLOT_MAIN_MODELS": " model-a , model-b,",
-        "SLOT_RE_MODELS": "model-c",
+        "SLOT_EGPU_MODELS": "model-c",
     }))
     by_name = {s.name: s for s in slots}
     assert by_name["main"].models == ("model-a", "model-b")
-    assert by_name["re"].models == ("model-c",)
+    assert by_name["egpu"].models == ("model-c",)
 
 
 def test_model_with_two_home_slots_is_rejected_naming_both_vars():
@@ -144,11 +134,13 @@ def test_model_with_two_home_slots_is_rejected_naming_both_vars():
     # one model, so this is a conflict, not two models.
     with pytest.raises(ValueError) as exc:
         build_slots(_env({
+            "SLOTS": "main,egpu",
+            "SLOT_EGPU_PORT": "18085",
             "SLOT_MAIN_MODELS": "Foo-Q4",
-            "SLOT_BATCH_MODELS": "foo-q4.gguf",
+            "SLOT_EGPU_MODELS": "foo-q4.gguf",
         }))
     assert "SLOT_MAIN_MODELS" in str(exc.value)
-    assert "SLOT_BATCH_MODELS" in str(exc.value)
+    assert "SLOT_EGPU_MODELS" in str(exc.value)
 
 
 def test_model_repeated_within_one_slot_is_allowed():

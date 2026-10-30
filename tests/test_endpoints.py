@@ -33,9 +33,9 @@ def test_status_endpoint_has_slots(client):
     data = response.json()
     assert "slots" in data
     assert "main" in data["slots"]
-    assert "batch" in data["slots"]
+    assert "egpu" in data["slots"]
 
-    for slot_name in ("main", "batch"):
+    for slot_name in ("main", "egpu"):
         slot = data["slots"][slot_name]
         assert set(slot.keys()) == {
             "host", "port", "loaded_model", "healthy", "swapping",
@@ -65,7 +65,7 @@ def test_status_main_queue_limit_matches_config(client):
     """Slots reflect the config's per-slot queue limits."""
     data = client.get("/status").json()
     assert data["slots"]["main"]["queue_limit"] == 20
-    assert data["slots"]["batch"]["queue_limit"] == 20
+    assert data["slots"]["egpu"]["queue_limit"] == 20
 
 
 @pytest.mark.asyncio
@@ -209,18 +209,18 @@ async def test_ensure_model_on_slot_skips_swap_if_already_loaded(test_config):
     server.slots["main"].swapper.swap_to.assert_not_called()
 
 
-def test_chat_completions_routes_batch_model(client):
-    """When the batch slot has model X loaded, a request for X enqueues on batch, not main."""
+def test_chat_completions_routes_egpu_model(client):
+    """When the egpu slot has model X loaded, a request for X enqueues on egpu, not main."""
     app = client.app
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = "test-model-q8"
-    server.slots["batch"].healthy = True
+    server.slots["egpu"].loaded_model = "test-model-q8"
+    server.slots["egpu"].healthy = True
 
     enqueued_on = []
     original_enqueue_main = server.slots["main"].queue.enqueue
-    original_enqueue_batch = server.slots["batch"].queue.enqueue
+    original_enqueue_egpu = server.slots["egpu"].queue.enqueue
 
     async def wrap_main(item):
         enqueued_on.append("main")
@@ -228,14 +228,14 @@ def test_chat_completions_routes_batch_model(client):
         item["response"] = Response(content=b'{"id":"m"}', media_type="application/json")
         item["event"].set()
 
-    async def wrap_batch(item):
-        enqueued_on.append("batch")
+    async def wrap_egpu(item):
+        enqueued_on.append("egpu")
         from fastapi.responses import Response
         item["response"] = Response(content=b'{"id":"b"}', media_type="application/json")
         item["event"].set()
 
     server.slots["main"].queue.enqueue = wrap_main
-    server.slots["batch"].queue.enqueue = wrap_batch
+    server.slots["egpu"].queue.enqueue = wrap_egpu
 
     try:
         r = client.post("/v1/chat/completions", json={
@@ -244,9 +244,9 @@ def test_chat_completions_routes_batch_model(client):
         })
     finally:
         server.slots["main"].queue.enqueue = original_enqueue_main
-        server.slots["batch"].queue.enqueue = original_enqueue_batch
+        server.slots["egpu"].queue.enqueue = original_enqueue_egpu
 
-    assert enqueued_on == ["batch"]
+    assert enqueued_on == ["egpu"]
 
 
 def test_chat_completions_routes_main_when_loaded_on_main(client):
@@ -255,12 +255,12 @@ def test_chat_completions_routes_main_when_loaded_on_main(client):
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = "test-model-q8"
-    server.slots["batch"].healthy = True
+    server.slots["egpu"].loaded_model = "test-model-q8"
+    server.slots["egpu"].healthy = True
 
     enqueued_on = []
     original_enqueue_main = server.slots["main"].queue.enqueue
-    original_enqueue_batch = server.slots["batch"].queue.enqueue
+    original_enqueue_egpu = server.slots["egpu"].queue.enqueue
 
     async def wrap_main(item):
         enqueued_on.append("main")
@@ -268,14 +268,14 @@ def test_chat_completions_routes_main_when_loaded_on_main(client):
         item["response"] = Response(content=b'{}', media_type="application/json")
         item["event"].set()
 
-    async def wrap_batch(item):
-        enqueued_on.append("batch")
+    async def wrap_egpu(item):
+        enqueued_on.append("egpu")
         from fastapi.responses import Response
         item["response"] = Response(content=b'{}', media_type="application/json")
         item["event"].set()
 
     server.slots["main"].queue.enqueue = wrap_main
-    server.slots["batch"].queue.enqueue = wrap_batch
+    server.slots["egpu"].queue.enqueue = wrap_egpu
 
     try:
         r = client.post("/v1/chat/completions", json={
@@ -284,7 +284,7 @@ def test_chat_completions_routes_main_when_loaded_on_main(client):
         })
     finally:
         server.slots["main"].queue.enqueue = original_enqueue_main
-        server.slots["batch"].queue.enqueue = original_enqueue_batch
+        server.slots["egpu"].queue.enqueue = original_enqueue_egpu
 
     assert enqueued_on == ["main"]
 
@@ -295,15 +295,15 @@ def test_chat_completions_409_when_not_loaded(client, monkeypatch):
     The probe is stubbed because this test asserts on the 409 MESSAGE, and the
     message is built from slot state this test sets by hand. The chat handler
     now re-probes before declaring a model unloaded (so a stale slot is not
-    reported as empty), and test_config points the slots at 127.0.0.1:8081/8083
-    -- which on a machine where the real backends are running is not a fixture,
-    it is production. Without this stub the probe replaced the fabricated state
-    with the live models and the assertion read
-    `main='gemma-4-26b-a4b-it-q4_k_m'`.
+    reported as empty). Without this stub the probe replaced the fabricated
+    state with the probed models; historically, when test_config still pointed
+    the slots at the live 127.0.0.1:8081/8083, those were the live models and
+    the assertion read `main='gemma-4-26b-a4b-it-q4_k_m'`.
 
     Worth knowing more broadly: TestClient runs the lifespan, so the startup
-    probe has always reached those ports. This stub makes one test hermetic; the
-    suite as a whole still depends on what happens to be listening.
+    probe has always reached those ports. The fixture's ports are no longer
+    live ports, and the suite-wide guard (tests/live_ports.py) fails any test
+    that connects to one.
     """
     from manager.slots import SlotState
 
@@ -316,8 +316,8 @@ def test_chat_completions_409_when_not_loaded(client, monkeypatch):
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = None
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None
+    server.slots["egpu"].healthy = False
 
     r = client.post("/v1/chat/completions", json={
         "model": "test-model-q8",  # on disk, not loaded anywhere
@@ -338,8 +338,8 @@ def test_chat_completions_cold_start_no_crash(client):
     server = app.state.server
     server.slots["main"].loaded_model = None
     server.slots["main"].healthy = False
-    server.slots["batch"].loaded_model = None
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None
+    server.slots["egpu"].healthy = False
 
     r = client.post("/v1/chat/completions", json={
         "model": "test-model-q4",  # exists on disk, not loaded
@@ -348,8 +348,8 @@ def test_chat_completions_cold_start_no_crash(client):
     assert r.status_code == 409  # not a 500
 
 
-def test_chat_completions_503_on_batch_unhealthy(client, monkeypatch):
-    """Request for a model loaded on batch returns 503 if batch unhealthy."""
+def test_chat_completions_503_on_egpu_unhealthy(client, monkeypatch):
+    """Request for a model loaded on egpu returns 503 if egpu unhealthy."""
     from manager.slots import SlotState
 
     async def _no_probe(self, probe_client):
@@ -360,8 +360,8 @@ def test_chat_completions_503_on_batch_unhealthy(client, monkeypatch):
     server = app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = "test-model-q8"
-    server.slots["batch"].healthy = False  # unhealthy
+    server.slots["egpu"].loaded_model = "test-model-q8"
+    server.slots["egpu"].healthy = False  # unhealthy
 
     r = client.post("/v1/chat/completions", json={
         "model": "test-model-q8",
@@ -369,7 +369,7 @@ def test_chat_completions_503_on_batch_unhealthy(client, monkeypatch):
     })
     assert r.status_code == 503
     body = r.json()
-    assert body["error"]["type"] == "batch_unavailable"
+    assert body["error"]["type"] == "egpu_unavailable"
 
 
 def test_swap_valid_main(client, monkeypatch):
@@ -400,17 +400,17 @@ def test_swap_already_loaded_returns_200(client, monkeypatch):
     assert r.json() == {"slot": "main", "model": "test-model-q4", "status": "ok"}
 
 
-def test_swap_valid_batch(client, monkeypatch):
+def test_swap_valid_egpu(client, monkeypatch):
     app = client.app
     server = app.state.server
     async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
-    r = client.post("/swap", json={"model": "test-model-q8", "target": "batch"})
+    r = client.post("/swap", json={"model": "test-model-q8", "target": "egpu"})
     assert r.status_code == 202
-    assert r.json()["slot"] == "batch"
-    assert server.slots["batch"].loaded_model == "test-model-q8"
+    assert r.json()["slot"] == "egpu"
+    assert server.slots["egpu"].loaded_model == "test-model-q8"
 
 
 def _with_homes(config, **homes):
@@ -436,33 +436,33 @@ def _homes_client(config, monkeypatch, **homes):
 
 
 def test_untargeted_swap_goes_to_the_models_home_slot(three_slot_config, monkeypatch):
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q8"})
     assert r.status_code == 202, r.text
-    assert r.json()["slot"] == "re"
-    assert swapped == ["re"]
+    assert r.json()["slot"] == "aux"
+    assert swapped == ["aux"]
 
 
 def test_untargeted_swap_matches_home_case_and_suffix_insensitively(
         three_slot_config, monkeypatch):
     client, swapped = _homes_client(
-        three_slot_config, monkeypatch, re=["TEST-MODEL-Q8.gguf"])
+        three_slot_config, monkeypatch, aux=["TEST-MODEL-Q8.gguf"])
     r = client.post("/swap", json={"model": "test-model-q8"})
     assert r.status_code == 202, r.text
-    assert swapped == ["re"]
+    assert swapped == ["aux"]
 
 
 def test_untargeted_swap_with_null_target_uses_the_map(three_slot_config, monkeypatch):
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q8", "target": None})
     assert r.status_code == 202, r.text
-    assert swapped == ["re"]
+    assert swapped == ["aux"]
 
 
 def test_untargeted_swap_of_unmapped_model_is_refused_and_touches_no_slot(
         three_slot_config, monkeypatch):
     # test-model-q4 exists on disk but no slot calls it home.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q8"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
     r = client.post("/swap", json={"model": "test-model-q4"})
     assert r.status_code == 400, r.text
     body = r.json()
@@ -474,7 +474,7 @@ def test_untargeted_swap_of_unmapped_model_is_refused_and_touches_no_slot(
 def test_untargeted_swap_of_mapped_but_missing_model_is_404(three_slot_config, monkeypatch):
     # (pin) 404 before and after: proves the map lookup runs before, and does
     # not replace, the model-file check.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["does-not-exist"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["does-not-exist"])
     r = client.post("/swap", json={"model": "does-not-exist"})
     assert r.status_code == 404, r.text
     assert r.json()["error"]["type"] == "model_not_found"
@@ -483,7 +483,7 @@ def test_untargeted_swap_of_mapped_but_missing_model_is_404(three_slot_config, m
 
 def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
     # (pin) An explicit target is an operator override, even against the map.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, re=["test-model-q4"])
+    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q4"])
     r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
     assert r.status_code == 202, r.text
     assert swapped == ["main"]
@@ -491,9 +491,9 @@ def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
 
 def test_status_reports_each_slots_home_models(three_slot_config):
     from manager.app import create_app
-    client = TestClient(create_app(_with_homes(three_slot_config, re=["test-model-q8"])))
+    client = TestClient(create_app(_with_homes(three_slot_config, aux=["test-model-q8"])))
     slots = client.get("/status").json()["slots"]
-    assert slots["re"]["models"] == ["test-model-q8"]
+    assert slots["aux"]["models"] == ["test-model-q8"]
     assert slots["main"]["models"] == []
 
 
@@ -557,11 +557,11 @@ def test_background_swap_failure_is_logged_not_raised(client, monkeypatch, caplo
     assert "background swap failed" in caplog.text
 
 def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
-    """A slot beyond the legacy main/batch pair is a valid /swap target when configured."""
+    """A slot beyond the main slot is a valid /swap target when configured."""
     resp = client_with_three_slots.post(
-        "/swap", json={"model": "test-model-q4", "target": "re"})
+        "/swap", json={"model": "test-model-q4", "target": "aux"})
     assert resp.status_code == 202, resp.text
-    assert resp.json()["slot"] == "re"
+    assert resp.json()["slot"] == "aux"
 
 
 def test_swap_rejects_an_unconfigured_target(client_with_three_slots):
@@ -727,11 +727,11 @@ def test_a_stale_slot_is_reprobed_before_returning_409(client, monkeypatch):
     server = client.app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = None       # stale; it IS loaded
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None       # stale; it IS loaded
+    server.slots["egpu"].healthy = False
 
     async def fake_probe(self, probe_client):
-        if self.name == "batch":
+        if self.name == "egpu":
             self.loaded_model = "test-model-q8"
             self.healthy = True
 
@@ -746,7 +746,7 @@ def test_a_stale_slot_is_reprobed_before_returning_409(client, monkeypatch):
         item["event"].set()
 
     server.slots["main"].queue.enqueue = lambda i: wrap(i, "main")
-    server.slots["batch"].queue.enqueue = lambda i: wrap(i, "batch")
+    server.slots["egpu"].queue.enqueue = lambda i: wrap(i, "egpu")
 
     r = client.post("/v1/chat/completions", json={
         "model": "test-model-q8",
@@ -754,7 +754,7 @@ def test_a_stale_slot_is_reprobed_before_returning_409(client, monkeypatch):
     })
 
     assert r.status_code != 409, r.json()
-    assert enqueued_on == ["batch"], enqueued_on
+    assert enqueued_on == ["egpu"], enqueued_on
 
 
 def test_a_genuinely_unloaded_model_still_409s_after_the_reprobe(client, monkeypatch):
@@ -765,8 +765,8 @@ def test_a_genuinely_unloaded_model_still_409s_after_the_reprobe(client, monkeyp
     server = client.app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = None
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None
+    server.slots["egpu"].healthy = False
 
     probed = []
 
@@ -781,7 +781,7 @@ def test_a_genuinely_unloaded_model_still_409s_after_the_reprobe(client, monkeyp
     })
     assert r.status_code == 409
     assert r.json()["error"]["type"] == "model_not_loaded"
-    assert set(probed) == {"main", "batch"}, probed
+    assert set(probed) == {"main", "egpu"}, probed
 
 
 def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
@@ -793,8 +793,8 @@ def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
     server = client.app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = None
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None
+    server.slots["egpu"].healthy = False
 
     probed = []
 
@@ -804,18 +804,18 @@ def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
     monkeypatch.setattr(SlotState, "probe", fake_probe)
 
     async def hold_and_request():
-        await server.slots["batch"].swap_lock.acquire()
+        await server.slots["egpu"].swap_lock.acquire()
         try:
             return await asyncio.to_thread(
                 client.post, "/v1/chat/completions",
                 json={"model": "test-model-q8",
                       "messages": [{"role": "user", "content": "hi"}]})
         finally:
-            server.slots["batch"].swap_lock.release()
+            server.slots["egpu"].swap_lock.release()
 
     r = asyncio.run(hold_and_request())
     assert r.status_code == 409
-    assert "batch" not in probed, probed
+    assert "egpu" not in probed, probed
     assert "main" in probed, probed
 
 
@@ -826,17 +826,17 @@ def test_server_builds_every_configured_slot(test_config):
     from manager.app import ServerState
 
     cfg = replace(test_config, slots=(
-        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
-        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
-        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+        SlotConfig("main", "127.0.0.1", 18081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("egpu", "127.0.0.1", 18083, "/tmp/egpu.env", "egpu.service", 20),
+        SlotConfig("aux", "127.0.0.1", 18084, "/tmp/aux.env", "aux.service", 30),
     ))
     server = ServerState(cfg)
 
-    assert list(server.slots) == ["main", "batch", "re"]
-    assert server.slots["re"].port == 8084
-    assert server.slots["re"].queue.max_size == 30
-    assert server.slots["re"].env_file == "/tmp/re.env"
-    assert server.slots["re"].systemd_unit == "re.service"
+    assert list(server.slots) == ["main", "egpu", "aux"]
+    assert server.slots["aux"].port == 18084
+    assert server.slots["aux"].queue.max_size == 30
+    assert server.slots["aux"].env_file == "/tmp/aux.env"
+    assert server.slots["aux"].systemd_unit == "aux.service"
     assert all(s.swapper is not None for s in server.slots.values())
 
 
@@ -844,16 +844,16 @@ def test_slot_count_follows_configuration(test_config):
     """A relationship, not a literal: adding a slot must not need a test edit.
 
     Deliberately uses a 3-slot config (not test_config's own 2) so this
-    can't pass by coincidence against code that still hardcodes main/batch.
+    can't pass by coincidence against code that still hardcodes main/egpu.
     """
     from dataclasses import replace
     from manager.slot_config import SlotConfig
     from manager.app import ServerState
 
     cfg = replace(test_config, slots=(
-        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
-        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
-        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+        SlotConfig("main", "127.0.0.1", 18081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("egpu", "127.0.0.1", 18083, "/tmp/egpu.env", "egpu.service", 20),
+        SlotConfig("aux", "127.0.0.1", 18084, "/tmp/aux.env", "aux.service", 30),
     ))
     server = ServerState(cfg)
     assert len(server.slots) == len(cfg.slots)
@@ -900,14 +900,14 @@ class _FakeV1ModelsServer:
 
     Narrow and local to test_status_survives_a_raising_slot_probe -- NOT
     the general fake-backend fixture for the whole endpoint suite (that is
-    deferred). Needed here specifically because the fixture's slot ports
-    otherwise collide with whatever is actually running on this machine
-    (see the module's other /status tests, which rely on that real
-    backend and are unaffected by this one using a fake instead): a test
-    asserting that a *healthy* sibling survives a concurrent reprobe needs
-    a backend whose health and response timing it actually controls,
-    independent of what happens to be listening on 127.0.0.1:8083 right
-    now.
+    deferred): a test asserting that a *healthy* sibling survives a
+    concurrent reprobe needs a backend whose health and response timing it
+    actually controls. (It was originally also needed because the
+    fixture's slot ports were the live 127.0.0.1:8081/8083; the phase-1
+    plan moved them to 18081/18083, and the guard in tests/live_ports.py
+    now fails any test that connects to a live port. The module's other
+    /status tests accept whatever the startup probe finds on the
+    fixture's ports and are unaffected by this one using a fake.)
     """
 
     def __init__(self):
@@ -961,7 +961,7 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     reprobe_all_slots_concurrently's `async with httpx.AsyncClient()`
     block exits and closes the shared client while another slot's probe
     may still be running. On the real, unforced interleaving (confirmed by
-    the round-3 reviewer: 9/9 runs, batch.probe unwrapped, no client-side
+    the round-3 reviewer: 9/9 runs, egpu.probe unwrapped, no client-side
     sleep, backend delays of 0/50/300ms), the sibling is NEVER corrupted --
     asyncio.gather's ensure_future queues both tasks' first step before
     the awaiting coroutine suspends, so the sibling always reaches
@@ -983,29 +983,30 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
         requires deliberately forcing an interleaving production does not
         naturally produce, since gather's task-scheduling order means the
         sibling normally finishes sending before the raise propagates.
-        batch's probe is wrapped to `await asyncio.sleep(...)` BEFORE
+        egpu's probe is wrapped to `await asyncio.sleep(...)` BEFORE
         calling the real, unmodified SlotState.probe against a real fake
         backend, guaranteeing the shared client is already closed by the
-        time batch's real client.get() call happens, so batch
+        time egpu's real client.get() call happens, so egpu
         deterministically hits the client's real
         "if self._state == ClientState.CLOSED: raise RuntimeError(...)"
         check at send() ENTRY (httpx/_client.py) -- this is a request
         that never got dispatched, not one that was in flight and got torn
         down mid-request.
 
-    The 'batch' slot is pointed at fake_v1_models_backend (a real HTTP
-    server this test controls) rather than test_config's real port, so
-    batch's baseline health/model is deterministic instead of depending on
-    "whatever happens to be running on 127.0.0.1:8083 right now" (see the
-    other /status tests in this module, which do rely on that real
-    backend and are unaffected by this one using a fake instead).
+    The 'egpu' slot is pointed at fake_v1_models_backend (a real HTTP
+    server this test controls) rather than test_config's port, so egpu's
+    baseline health/model is deterministic instead of depending on
+    "whatever happens to be running on 127.0.0.1:18083 right now" (the
+    other /status tests in this module accept whatever the startup probe
+    finds on the fixture's ports and are unaffected by this one using a
+    fake instead).
 
     The final assertion checks loaded_model against a SECOND, distinct
     fake-backend body set just before the /status call (not the same
-    "batch-model" the startup probe already saw) -- this closes a
+    "egpu-model" the startup probe already saw) -- this closes a
     coverage gap the round-2 version left open: with the STALE body, a
     wrong fix that cancelled the sibling instead of awaiting it (silently
-    leaving batch's prior state untouched) would still pass every
+    leaving egpu's prior state untouched) would still pass every
     assertion, since "never probed" and "probed successfully" look
     identical when the answer doesn't change. Asserting on the NEW value
     proves the probe actually ran to completion, not merely that nothing
@@ -1022,16 +1023,16 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     from fastapi.testclient import TestClient
     from manager.app import create_app
 
-    fake_v1_models_backend.body = {"data": [{"id": "batch-model.gguf"}]}
+    fake_v1_models_backend.body = {"data": [{"id": "egpu-model.gguf"}]}
 
-    batch_sc = dataclasses.replace(
-        next(sc for sc in test_config.slots if sc.name == "batch"),
+    egpu_sc = dataclasses.replace(
+        next(sc for sc in test_config.slots if sc.name == "egpu"),
         host=fake_v1_models_backend.host,
         port=fake_v1_models_backend.port,
     )
     config = dataclasses.replace(
         test_config,
-        slots=tuple(batch_sc if sc.name == "batch" else sc for sc in test_config.slots),
+        slots=tuple(egpu_sc if sc.name == "egpu" else sc for sc in test_config.slots),
     )
 
     app = create_app(config)
@@ -1044,23 +1045,23 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     with TestClient(app, raise_server_exceptions=False) as client:
         server = client.app.state.server
         main = server.slots["main"]
-        batch = server.slots["batch"]
+        egpu = server.slots["egpu"]
 
-        # batch starts healthy from the real startup probe against the
+        # egpu starts healthy from the real startup probe against the
         # fake backend above -- deterministic, not dependent on this
         # machine's state.
-        assert batch.healthy is True
-        assert batch.loaded_model == "batch-model"
+        assert egpu.healthy is True
+        assert egpu.loaded_model == "egpu-model"
 
         # Change what the fake backend reports BEFORE triggering the
         # reprobe below, to a value the startup probe never saw. The final
-        # assertion checks for THIS value, not "batch-model" again -- so a
+        # assertion checks for THIS value, not "egpu-model" again -- so a
         # wrong fix that skips/cancels the sibling's probe instead of
-        # awaiting it (leaving batch's old state untouched) fails here,
+        # awaiting it (leaving egpu's old state untouched) fails here,
         # instead of accidentally passing because "never probed" and
         # "probed successfully" look identical when the value doesn't
         # change. See docstring's "coverage gap" paragraph.
-        fake_v1_models_backend.body = {"data": [{"id": "batch-model-v2.gguf"}]}
+        fake_v1_models_backend.body = {"data": [{"id": "egpu-model-v2.gguf"}]}
 
         async def raise_immediately(probe_client):
             raise AttributeError("boom: simulated bug past slot.probe's own guard")
@@ -1072,21 +1073,21 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
             # propagated through gather and closed the shared client
             # before this even attempts client.get() -- see docstring.
             await asyncio.sleep(0.05)
-            await real_probe(batch, probe_client)
+            await real_probe(egpu, probe_client)
 
         main.probe = AsyncMock(side_effect=raise_immediately)
-        batch.probe = AsyncMock(side_effect=delayed_real_probe)
+        egpu.probe = AsyncMock(side_effect=delayed_real_probe)
 
         resp = client.get("/status")
 
         # main's raise propagates near-instantly, so the /status response
-        # above returns well before batch's 0.05s delayed_real_probe has
+        # above returns well before egpu's 0.05s delayed_real_probe has
         # even attempted its client.get() call. That orphaned coroutine
         # (gather without return_exceptions=True does not cancel siblings)
         # keeps running on TestClient's background portal thread after
         # this thread resumes -- a REAL wall-clock sleep here (not
         # asyncio.sleep; this thread isn't in that event loop) gives it
-        # time to finish and actually mutate batch's state before this
+        # time to finish and actually mutate egpu's state before this
         # `with` block exits and tears the portal down.
         import time as _time
         _time.sleep(0.2)
@@ -1094,11 +1095,11 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
     # The limb that matters most, asserted first so it can't be masked by
     # the status-code assertion below: a genuinely healthy sibling must not
     # be fabricated as dead just because another slot's probe raised.
-    assert batch.healthy is True
+    assert egpu.healthy is True
     # The value changed above, not the one the startup probe already saw --
     # this proves the reprobe actually ran to completion rather than a
-    # wrong fix silently leaving batch's prior state untouched.
-    assert batch.loaded_model == "batch-model-v2"
+    # wrong fix silently leaving egpu's prior state untouched.
+    assert egpu.loaded_model == "egpu-model-v2"
     assert resp.status_code == 200
 
 
@@ -1108,17 +1109,18 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
 #
 # Slot-state fabrication note (applies to every test in this section):
 # TestClient runs the lifespan, so the startup probe has already reached the
-# fixture's 127.0.0.1:8081/8083 ports -- which on this machine is not a
-# fixture, it is production. Every test below that sets slot state by hand
+# fixture's 127.0.0.1:18081/18083 ports -- moved off the live ones by the
+# phase-1 plan (the guard in tests/live_ports.py now fails any test that
+# connects to a live port). Every test below that sets slot state by hand
 # therefore stubs SlotState.probe to a no-op, exactly as
 # test_chat_completions_409_when_not_loaded does above.
 #
 # Queue-consumer tests (passthrough, streaming, queue errors) build their own
 # app + `with TestClient(app)` so the per-slot background consumers exist, and
 # set slot state AFTER entering (the startup probe runs on enter). The
-# backend HTTP is mocked by patching manager.app.httpx.AsyncClient -- the same
-# precedent as test_embeddings_proxy in test_collection_endpoints.py -- so the
-# tests assert on the exact backend URL the consumer dials.
+# backend HTTP is mocked by patching manager.app.httpx.AsyncClient, exactly as
+# the tests in this section do -- so they assert on the exact backend URL the
+# consumer dials.
 
 def test_messages_non_streaming_passthrough(test_config, monkeypatch):
     """POST /v1/messages is passed through, byte for byte, to the routed
@@ -1136,8 +1138,8 @@ def test_messages_non_streaming_passthrough(test_config, monkeypatch):
         server = client.app.state.server
         server.slots["main"].loaded_model = "test-model-q4"
         server.slots["main"].healthy = True
-        server.slots["batch"].loaded_model = "test-model-q8"
-        server.slots["batch"].healthy = True
+        server.slots["egpu"].loaded_model = "test-model-q8"
+        server.slots["egpu"].healthy = True
 
         body = {
             "model": "test-model-q4",
@@ -1162,7 +1164,7 @@ def test_messages_non_streaming_passthrough(test_config, monkeypatch):
         assert r.json() == backend_body
         mock_client.post.assert_awaited_once()
         url = mock_client.post.await_args.args[0]
-        assert url == "http://127.0.0.1:8081/v1/messages"
+        assert url == "http://127.0.0.1:18081/v1/messages"
         assert mock_client.post.await_args.kwargs["json"] == body
 
 
@@ -1224,7 +1226,7 @@ def test_messages_streaming_passthrough(test_config, monkeypatch):
         assert r.content == b"".join(chunks)
         method, url = mock_client.stream.call_args.args[:2]
         assert method == "POST"
-        assert url == "http://127.0.0.1:8081/v1/messages"
+        assert url == "http://127.0.0.1:18081/v1/messages"
         assert mock_client.stream.call_args.kwargs["json"] == body
 
 
@@ -1280,8 +1282,8 @@ def test_messages_not_loaded_is_anthropic_409(client, monkeypatch):
     server = client.app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = None
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None
+    server.slots["egpu"].healthy = False
 
     r = client.post("/v1/messages", json={
         "model": "test-model-q8",  # on disk, not loaded anywhere
@@ -1412,7 +1414,7 @@ def test_chat_completions_still_targets_openai_backend_path(test_config, monkeyp
 
         assert r.status_code == 200, r.text
         url = mock_client.post.await_args.args[0]
-        assert url == "http://127.0.0.1:8081/v1/chat/completions"
+        assert url == "http://127.0.0.1:18081/v1/chat/completions"
         assert mock_client.post.await_args.kwargs["json"] == body
 
 
@@ -1433,8 +1435,8 @@ def test_count_tokens_passthrough(test_config, monkeypatch):
         server = client.app.state.server
         server.slots["main"].loaded_model = "test-model-q4"
         server.slots["main"].healthy = True
-        server.slots["batch"].loaded_model = "test-model-q8"
-        server.slots["batch"].healthy = True
+        server.slots["egpu"].loaded_model = "test-model-q8"
+        server.slots["egpu"].healthy = True
 
         body = {
             "model": "test-model-q4",
@@ -1458,7 +1460,7 @@ def test_count_tokens_passthrough(test_config, monkeypatch):
         assert r.json() == {"input_tokens": 42}
         mock_client.post.assert_awaited_once()
         url = mock_client.post.await_args.args[0]
-        assert url == "http://127.0.0.1:8081/v1/messages/count_tokens"
+        assert url == "http://127.0.0.1:18081/v1/messages/count_tokens"
         assert mock_client.post.await_args.kwargs["json"] == body
         # Counting is direct passthrough: it never touches the GPU queue.
         assert server.slots["main"].queue.depth == 0
@@ -1493,8 +1495,8 @@ def test_count_tokens_not_loaded_is_anthropic_409(client, monkeypatch):
     server = client.app.state.server
     server.slots["main"].loaded_model = "test-model-q4"
     server.slots["main"].healthy = True
-    server.slots["batch"].loaded_model = None
-    server.slots["batch"].healthy = False
+    server.slots["egpu"].loaded_model = None
+    server.slots["egpu"].healthy = False
 
     r = client.post("/v1/messages/count_tokens", json={
         "model": "test-model-q8", "messages": [],
@@ -1525,3 +1527,64 @@ def test_count_tokens_unhealthy_slot_is_anthropic_503(client, monkeypatch):
     err = _anthropic_error_envelope(r)
     assert err["type"] == "api_error"
     assert r.headers.get("retry-after") == "5"
+
+
+def test_embeddings_proxy_is_gone(client):
+    """The /v1/embeddings proxy is removed (spec Q24): nothing called it.
+
+    Collections reach the embeddings backend directly through
+    manager/embeddings.py, so POST /v1/embeddings must be an unknown route.
+    """
+    r = client.post("/v1/embeddings", json={"input": "x"})
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Q8: every POST must declare Content-Type application/json (X1).
+# ---------------------------------------------------------------------------
+
+def test_text_plain_swap_is_refused_and_never_swaps(client, monkeypatch):
+    swapped = []
+
+    async def fake_swap(self, model_path, sampling_args=""):
+        swapped.append(self._slot.name)
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    server = client.app.state.server
+    loaded_before = server.slots["main"].loaded_model
+
+    r = client.post(
+        "/swap", content=b'{"model":"test-model-q8","target":"main"}',
+        headers={"content-type": "text/plain"},
+    )
+    assert r.status_code == 415
+    assert r.json()["error"]["type"] == "unsupported_media_type"
+    assert r.json()["error"]["message"] == "Content-Type must be application/json"
+    # the swap path was not entered: no swap was scheduled, nothing loaded
+    assert swapped == []
+    assert server.slots["main"].loaded_model == loaded_before
+
+
+def test_text_plain_chat_is_refused_and_never_queued(client):
+    server = client.app.state.server
+
+    r = client.post(
+        "/v1/chat/completions",
+        content=b'{"model":"test-model-q4","messages":[]}',
+        headers={"content-type": "text/plain"},
+    )
+    assert r.status_code == 415
+    assert all(s.queue.depth == 0 for s in server.slots.values())
+
+
+def test_missing_content_type_on_reindex_is_refused(client):
+    r = client.post("/collections/skills/reindex", content=b"")
+    assert r.status_code == 415
+
+
+@pytest.mark.parametrize("ct", ["application/json; charset=utf-8", "Application/JSON"])
+def test_json_media_type_with_params_or_case_is_accepted(client, ct):
+    r = client.post("/swap", content=b'{"model":"no-such-model"}',
+                    headers={"content-type": ct})
+    assert r.status_code != 415

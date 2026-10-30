@@ -7,10 +7,10 @@ and each slot reads SLOT_<NAME>_* variables.
 
 Order is significant -- it is the routing priority that resolve_slot walks.
 
-The legacy LLAMA_SERVER_* / BATCH_SERVER_* variables remain the source for the
-'main' and 'batch' slots, so a manager.env written before slots were
-configurable produces exactly the behaviour it always did. A SLOT_<NAME>_*
-variable, when set, wins over the legacy name for that field.
+The legacy LLAMA_SERVER_* variables remain the source for the 'main' slot, so
+a manager.env written before slots were configurable produces exactly the
+behaviour it always did. A SLOT_<NAME>_* variable, when set, wins over the
+legacy name for that field.
 
 SLOT_<NAME>_MODELS lists the models whose home is that slot: an untargeted
 POST /swap loads a model onto its home slot (see routing.home_slot). It has no
@@ -23,11 +23,11 @@ from dataclasses import dataclass
 
 from manager.names import match_key
 
-DEFAULT_SLOTS = ("main", "batch")
+DEFAULT_SLOTS = ("main",)
 
 # Per-field suffix used to build the SLOT_<NAME>_<SUFFIX> variable name.
 # Note env_file/systemd_unit use short suffixes (ENV/UNIT) rather than the
-# field name itself -- SLOT_RE_ENV, not SLOT_RE_ENV_FILE.
+# field name itself -- SLOT_EGPU_ENV, not SLOT_EGPU_ENV_FILE.
 _FIELD_SUFFIX = {
     "host": "HOST",
     "port": "PORT",
@@ -41,18 +41,16 @@ _FIELD_SUFFIX = {
 # field key consistently for both the prefixed and the legacy name -- there
 # is no separate "env"/"unit" key vocabulary to fall out of sync with this.
 _LEGACY = {
-    "host":         {"main": "LLAMA_SERVER_HOST", "batch": "BATCH_SERVER_HOST"},
-    "port":         {"main": "LLAMA_SERVER_PORT", "batch": "BATCH_SERVER_PORT"},
-    "env_file":     {"main": "LLAMA_SERVER_ENV",  "batch": "BATCH_SERVER_ENV"},
-    "systemd_unit": {"main": "LLAMA_SERVER_UNIT", "batch": "BATCH_SERVER_UNIT"},
-    "queue_limit":  {"main": "QUEUE_LIMIT",       "batch": "BATCH_QUEUE_LIMIT"},
+    "host":         {"main": "LLAMA_SERVER_HOST"},
+    "port":         {"main": "LLAMA_SERVER_PORT"},
+    "env_file":     {"main": "LLAMA_SERVER_ENV"},
+    "systemd_unit": {"main": "LLAMA_SERVER_UNIT"},
+    "queue_limit":  {"main": "QUEUE_LIMIT"},
 }
 
 _DEFAULTS = {
     "main":  {"host": "127.0.0.1", "port": 8081, "env_file": "/etc/llama/llama-server.env",
               "systemd_unit": "llama-server.service", "queue_limit": 20},
-    "batch": {"host": "127.0.0.1", "port": 8083, "env_file": "/etc/llama/llama-server-batch.env",
-              "systemd_unit": "llama-server-batch.service", "queue_limit": 20},
 }
 
 
@@ -75,8 +73,8 @@ def _lookup(getenv, name: str, field: str, default):
     `field` is always one of the SlotConfig field names ("env_file",
     "systemd_unit", ...) and is used, unchanged, as the key into both
     _FIELD_SUFFIX (to build the prefixed variable name) and _LEGACY (to find
-    the pre-existing variable name for "main"/"batch"). Using one key for
-    both lookups is what keeps them from drifting apart.
+    the pre-existing variable name for "main"). Using one key for both
+    lookups is what keeps them from drifting apart.
     """
     suffix = _FIELD_SUFFIX[field]
     prefixed = f"SLOT_{name.upper()}_{suffix}"

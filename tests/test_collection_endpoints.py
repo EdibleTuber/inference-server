@@ -1,9 +1,5 @@
 # tests/test_collection_endpoints.py
-"""Tests for the collection and embeddings API endpoints."""
-import pytest
-import json
-from unittest.mock import AsyncMock, patch, MagicMock
-from fastapi.testclient import TestClient
+"""Tests for the collection API endpoints."""
 
 
 def test_list_collections(collection_client):
@@ -59,30 +55,6 @@ def test_get_document_not_found(collection_client):
     assert response.status_code == 404
 
 
-def test_embeddings_proxy(collection_client):
-    """POST /v1/embeddings proxies to embedding server."""
-    with patch("manager.app.httpx.AsyncClient") as MockClient:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.content = json.dumps({
-            "object": "list",
-            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
-            "model": "nomic-embed-text",
-        }).encode()
-        mock_resp.headers = {"content-type": "application/json"}
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
-        MockClient.return_value = mock_client
-
-        response = collection_client.post(
-            "/v1/embeddings",
-            json={"model": "nomic-embed-text", "input": "hello"},
-        )
-        assert response.status_code == 200
-
-
 def test_reindex_post_rejects_unknown_collection(collection_client):
     resp = collection_client.post("/collections/does-not-exist/reindex", json={})
     assert resp.status_code == 404
@@ -108,7 +80,9 @@ def test_reindex_post_accepts_paths(collection_client):
 
 
 def test_reindex_post_missing_body_defaults_to_full_scan(collection_client):
-    resp = collection_client.post("/collections/skills/reindex")
+    # Q8: a bodyless POST carries no Content-Type and is refused with 415;
+    # the full-scan default is what an explicit empty JSON body gets.
+    resp = collection_client.post("/collections/skills/reindex", json={})
     assert resp.status_code == 202
     body = resp.json()
     assert body["paths"] is None

@@ -3,18 +3,19 @@
 ## Status
 
 - **Fixed in round 1** (PR #14, merge `a183d14`, deployed 2026-10-28): F1, F2, F3, F6, O1, O2, O3, A6, W3, W5.
-- **Fixed on the host** 2026-10-28: S8 (`_llama-mgr` added to group `llama`), S9 (`re` env file ownership and sudoers entry).
-- **Fixed in round 2** (PR #15, merge `2adbc71`, deployed 2026-10-28): S1, S2, A2, A4, F4. S3 is in place but **not effective** in production until I1 is fixed: the index pass still blocks the event loop for about 30s.
-- **Open, found after the round-2 deploy:** I1 (missing `file_path` index), I2 (orphaned `notes` collection hides 695 vault files).
-- **Deferred to the design review:** A1, F5, W2 (whether a slot is busy until its response completes); O4, Q1 (slot state machine); Q2 (supervisor and hung-backend restart).
-- **Not yet scheduled:** A3, A5, S4–S7, D1–D5, W1, W4, X1, and the rest of Q3–Q14.
+- **Fixed on the host**: S8 (`_llama-mgr` added to group `llama`), S9 (`re` env file ownership and sudoers entry); checked on the host 2026-10-30.
+- **Fixed in round 2** (PR #15, merge `2adbc71`, deployed 2026-10-28): S1, S2, A2, A4, F4, and S3 (background indexing), which stayed blocked in production on I1.
+- **Fixed in PR #16** (merge `fb55b33`, deployed and verified live 2026-10-29): I1 (missing `file_path` index), I2 (orphaned `notes` collection hiding vault files). With I1 fixed, S3's background indexing is **effective in production as of PR #16**.
+- **Fixed in phase 1** of the design review: X1, S4–S7, W1, D2, D3 and Q11–Q13 (this audit's numbering) — D2's `re` env file is now `config/llama-server-egpu.env` with a current header, and D3's unit-norm assumption is checked (a sample `:8082` vector has norm 1.0000) — plus the batch-slot removal and the repo side of the `re` → `egpu` rename. Plan: `docs/superpowers/plans/2026-10-30-phase1-hygiene-and-cuts.md`.
+- **Fixed when the phase 1 host cutover runs** (plan task 10; not yet run): D5 (the deployed `/etc/llama/llama-server-batch.env`, the batch slot's last host leftover) and the host side of the `re` → `egpu` rename (unit, env file, `SLOTS`, sudoers).
+- **Still open:** A1, A3, A5, D1, D4, F5, W2, W4, O4, and findings Q1–Q10, Q14. What comes next, and in which phase, is `docs/design-review-2026-10-29.md` and its phase table — note its Q numbers are the review's, not this audit's.
 
 Inputs: Qwen inventory passes p1–p6 (`docs/audit/qwen/out/`), each lead then
 read in source. Code cited is branch HEAD `2fbefeb`; deployed is `7b8ea97`,
 identical in every cited region except where noted. Incident findings F1–F8
 live in `docs/incidents/2026-10-27-main-slot-lockup.md` and are not repeated.
 
-All findings are **pre-existing** unless marked otherwise. Nothing is fixed.
+All findings are **pre-existing** unless marked otherwise.
 
 ## Verified in source
 

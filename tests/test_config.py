@@ -1,5 +1,6 @@
 # tests/test_config.py
 """Tests for configuration loading from environment variables."""
+import dataclasses
 import pytest
 from manager.config import ManagerConfig
 
@@ -7,9 +8,11 @@ from manager.config import ManagerConfig
 def test_config_loads_from_env(monkeypatch):
     """Config should load all values from environment variables."""
     monkeypatch.setenv("HOST", "192.168.1.50")
-    monkeypatch.setenv("PORT", "8080")
+    # Values deliberately differ from the from_env defaults below, so a
+    # broken env read cannot hide behind the fallback.
+    monkeypatch.setenv("PORT", "18080")
     monkeypatch.setenv("LLAMA_SERVER_HOST", "127.0.0.1")
-    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "18081")
     monkeypatch.setenv("MODELS_DIR", "/opt/llama/models")
     monkeypatch.setenv("LLAMA_SERVER_ENV", "/etc/llama/llama-server.env")
     monkeypatch.setenv("QUEUE_LIMIT", "20")
@@ -19,9 +22,9 @@ def test_config_loads_from_env(monkeypatch):
     config = ManagerConfig.from_env()
 
     assert config.host == "192.168.1.50"
-    assert config.port == 8080
+    assert config.port == 18080
     assert config.llama_server_host == "127.0.0.1"
-    assert config.llama_server_port == 8081
+    assert config.llama_server_port == 18081
     assert config.models_dir == "/opt/llama/models"
     assert config.llama_server_env == "/etc/llama/llama-server.env"
     assert config.queue_limit == 20
@@ -52,11 +55,11 @@ def test_config_defaults(monkeypatch):
 def test_config_llama_server_url(monkeypatch):
     """Config should provide a convenience URL for the llama-server."""
     monkeypatch.setenv("LLAMA_SERVER_HOST", "127.0.0.1")
-    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "18081")
 
     config = ManagerConfig.from_env()
 
-    assert config.llama_server_url == "http://127.0.0.1:8081"
+    assert config.llama_server_url == "http://127.0.0.1:18081"
 
 
 def test_config_embeddings_defaults(monkeypatch):
@@ -114,93 +117,53 @@ def test_from_env_restart_timeout_override(monkeypatch):
     assert cfg.restart_timeout == 200
 
 
-def test_from_env_batch_defaults(monkeypatch):
-    """Batch-slot fields have sensible defaults when env vars are absent."""
-    for var in ("BATCH_SERVER_HOST", "BATCH_SERVER_PORT", "BATCH_SERVER_ENV",
-                "BATCH_SERVER_UNIT", "BATCH_QUEUE_LIMIT", "BATCH_MODEL_DEFAULT"):
-        monkeypatch.delenv(var, raising=False)
-    cfg = ManagerConfig.from_env()
-    assert cfg.batch_server_host == "127.0.0.1"
-    assert cfg.batch_server_port == 8083
-    assert cfg.batch_server_env == "/etc/llama/llama-server-batch.env"
-    assert cfg.batch_server_unit == "llama-server-batch.service"
-    assert cfg.batch_queue_limit == 20
-    assert cfg.batch_model_default == "gemma-4-E4B-it-Q4_K_M"
-
-
-def test_from_env_batch_overrides(monkeypatch):
-    """Env vars override batch-slot defaults."""
-    monkeypatch.setenv("BATCH_SERVER_HOST", "127.0.0.2")
-    monkeypatch.setenv("BATCH_SERVER_PORT", "9999")
-    monkeypatch.setenv("BATCH_SERVER_ENV", "/tmp/custom.env")
-    monkeypatch.setenv("BATCH_SERVER_UNIT", "custom.service")
-    monkeypatch.setenv("BATCH_QUEUE_LIMIT", "7")
-    monkeypatch.setenv("BATCH_MODEL_DEFAULT", "my-model")
-    cfg = ManagerConfig.from_env()
-    assert cfg.batch_server_host == "127.0.0.2"
-    assert cfg.batch_server_port == 9999
-    assert cfg.batch_server_env == "/tmp/custom.env"
-    assert cfg.batch_server_unit == "custom.service"
-    assert cfg.batch_queue_limit == 7
-    assert cfg.batch_model_default == "my-model"
-
-
-def test_batch_server_url_property():
-    """batch_server_url composes host and port."""
-    cfg = ManagerConfig(
-        host="0.0.0.0", port=11434,
-        llama_server_host="127.0.0.1", llama_server_port=8081,
-        models_dir="/tmp", llama_server_env="/tmp/env",
-        llama_server_unit="llama-server.service",
-        queue_limit=50, swap_timeout=60, log_file="/dev/null",
-        embeddings_host="127.0.0.1", embeddings_port=8082,
-        collections_config="/dev/null", skills_db_path="",
-        batch_server_host="127.0.0.1", batch_server_port=8083,
-        batch_server_env="/tmp/batch.env",
-        batch_server_unit="llama-server-batch.service",
-        batch_queue_limit=20, batch_model_default="gemma-4-E4B-it-Q4_K_M",
-    )
-    assert cfg.batch_server_url == "http://127.0.0.1:8083"
-
-
 from manager.slot_config import SlotConfig
 
 
 def test_from_env_populates_slots_in_order(monkeypatch):
-    monkeypatch.setenv("SLOTS", "main,re,batch")
-    monkeypatch.setenv("SLOT_RE_PORT", "8084")
+    # SLOT_AUX_PORT and SLOT_EGPU_PORT are required: only 'main' has
+    # built-in defaults, so each extra slot needs an explicit port
+    # (see test_slot_config.py).
+    monkeypatch.setenv("SLOTS", "main,aux,egpu")
+    monkeypatch.setenv("SLOT_AUX_PORT", "18084")
+    monkeypatch.setenv("SLOT_EGPU_PORT", "18085")
     from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
-    assert [s.name for s in cfg.slots] == ["main", "re", "batch"]
+    assert [s.name for s in cfg.slots] == ["main", "aux", "egpu"]
 
 
-def test_from_env_defaults_to_the_legacy_two_slots(monkeypatch):
+def test_from_env_defaults_to_main_only(monkeypatch):
     monkeypatch.delenv("SLOTS", raising=False)
     from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
-    assert [s.name for s in cfg.slots] == ["main", "batch"]
+    assert [s.name for s in cfg.slots] == ["main"]
 
 
 def test_legacy_ports_flow_into_slots(monkeypatch):
     monkeypatch.delenv("SLOTS", raising=False)
-    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
-    monkeypatch.setenv("BATCH_SERVER_PORT", "8083")
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "18081")
     from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
     by_name = {s.name: s for s in cfg.slots}
-    assert by_name["main"].port == 8081
-    assert by_name["batch"].port == 8083
+    assert by_name["main"].port == 18081
 
 
 def test_test_config_fixture_slots_match_its_own_ports_and_env_files(test_config):
-    """test_config populates slots consistent with the legacy fields it also
-    sets, so ServerState(test_config) has a real main/batch pair to build
-    from -- not just an empty tuple that happens to type-check."""
-    assert [s.name for s in test_config.slots] == ["main", "batch"]
+    """test_config's slots match the fields the fixture also sets, so
+    ServerState(test_config) has a real two-slot config to build from --
+    not just an empty tuple that happens to type-check. The egpu slot has no
+    top-level field anymore, so it is pinned to its own fixture values."""
+    assert [s.name for s in test_config.slots] == ["main", "egpu"]
     by_name = {s.name: s for s in test_config.slots}
     assert by_name["main"].port == test_config.llama_server_port
     assert by_name["main"].env_file == test_config.llama_server_env
-    assert by_name["batch"].port == test_config.batch_server_port
-    assert by_name["batch"].env_file == test_config.batch_server_env
+    assert by_name["egpu"].port == 18083
+    assert by_name["egpu"].systemd_unit == "llama-server-egpu.service"
+
+
+def test_manager_config_has_no_batch_fields():
+    names = {f.name for f in dataclasses.fields(ManagerConfig)}
+    names |= {n for n in dir(ManagerConfig) if not n.startswith("_")}
+    assert not any(n.startswith("batch_") for n in names)
 
 

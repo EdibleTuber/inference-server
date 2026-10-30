@@ -4,7 +4,8 @@
 #
 # Runs a CPU-only llama.cpp instance dedicated to text embeddings.
 # Uses nomic-embed-text (~275MB), always loaded, no model swapping.
-# The model manager proxies /v1/embeddings requests to this service.
+# The manager's collection indexer queries this service directly
+# (manager/embeddings.py); there is no manager-side /v1/embeddings route.
 #
 # "CPU-only" is enforced by --device none in ExecStart, and only by that.
 # It is not a consequence of --threads: that caps CPU threads and has no

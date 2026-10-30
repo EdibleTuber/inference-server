@@ -13,7 +13,7 @@ Facts were checked on the host on **2026-10-29**, right after round 3 deployed `
 | `docs/superpowers/plans/2026-10-28-slot-lockup-round{2,3}.md` | Historical. They record what each round changed and why. |
 | `docs/superpowers/specs/*.md` | Design docs from March to October 2026, each written for its own phase. Some may be superseded, so verify against the code. |
 | `README.md` | Mostly current. Rounds 1–3 corrected the sections they touched. |
-| `ARCHITECTURE.md` | **Wrong system** (finding W1). It describes a macOS "llama-cli" with a TUI, an auth proxy and JWTs, none of which exist here. Ignore it. |
+| `ARCHITECTURE.md` | **Deleted in phase 1** (finding W1). It described a macOS "llama-cli" with a TUI, an auth proxy and JWTs, none of which exist here. |
 
 ## Live topology
 

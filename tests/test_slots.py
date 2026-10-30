@@ -6,7 +6,7 @@ from manager.slots import SlotState
 from manager.queue import RequestQueue
 
 
-def _make_slot(name="main", port=8081):
+def _make_slot(name="main", port=18081):
     return SlotState(
         name=name,
         host="127.0.0.1",
@@ -22,7 +22,7 @@ def test_slot_defaults():
     assert slot.loaded_model is None
     assert slot.healthy is False
     assert slot.last_swap_utc is None
-    assert slot.url == "http://127.0.0.1:8081"
+    assert slot.url == "http://127.0.0.1:18081"
     assert isinstance(slot.swap_lock, asyncio.Lock)
     assert isinstance(slot.queue_event, asyncio.Event)
 
@@ -40,7 +40,7 @@ async def test_probe_success():
     client.get = AsyncMock(return_value=mock_response)
 
     await slot.probe(client)
-    client.get.assert_awaited_once_with("http://127.0.0.1:8081/v1/models", timeout=3)
+    client.get.assert_awaited_once_with("http://127.0.0.1:18081/v1/models", timeout=3)
     assert slot.loaded_model == "gemma-4-26b-a4b-it-q4_k_m"
     assert slot.healthy is True
 
@@ -297,7 +297,7 @@ def test_mark_swapped_sets_all_three_fields():
 
 def test_to_status_dict_shape():
     """to_status_dict returns exactly the 8 keys expected by the /status endpoint."""
-    slot = _make_slot(name="batch", port=8083)
+    slot = _make_slot(name="egpu", port=18083)
     slot.loaded_model = "some-model"
     slot.healthy = True
     slot.last_swap_utc = "2026-04-19T14:00:00+00:00"
@@ -309,7 +309,7 @@ def test_to_status_dict_shape():
         "last_swap_utc", "queue_depth", "queue_limit",
     }
     assert status["host"] == "127.0.0.1"
-    assert status["port"] == 8083
+    assert status["port"] == 18083
     assert status["loaded_model"] == "some-model"
     assert status["healthy"] is True
     assert status["swapping"] is False

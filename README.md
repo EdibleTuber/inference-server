@@ -16,17 +16,17 @@ A native llama.cpp inference server that fronts several llama-server backends ("
 │  │   OpenAI API     POST /v1/chat/completions, GET /v1/models     │  │
 │  │   Anthropic API  POST /v1/messages, /v1/messages/count_tokens  │  │
 │  │   Admin          POST /swap, GET /status, GET /health          │  │
-│  │   Retrieval      POST /v1/embeddings, /collections/*           │  │
+│  │   Retrieval      POST /collections/*                           │  │
 │  │                                                                │  │
 │  │   routes by model → one FIFO queue per slot                    │  │
 │  └──────┬─────────────────────────────────────┬───────────┬───────┘  │
 │         │                                     │           │          │
 │  ┌──────┴───────┐                    ┌────────┴─────┐  ┌──┴───────┐  │
-│  │ slot: main   │                    │ slot: re     │  │embeddings│  │
+│  │ slot: main   │                    │ slot: egpu   │  │embeddings│  │
 │  │ :8081        │                    │ :8084        │  │ :8082    │  │
 │  │ V100 32GB    │                    │ P40 24GB     │  │ CPU only │  │
 │  │ llama-server │                    │ llama-server │  │          │  │
-│  │ .service     │                    │ -re          │  │          │  │
+│  │ .service     │                    │ -egpu        │  │          │  │
 │  └──────┬───────┘                    └────────┬─────┘  └──┬───────┘  │
 │         └────────────────────────────┬────────┴───────────┘          │
 │                     user: _llama     │  all bound to 127.0.0.1       │
@@ -40,14 +40,14 @@ Which slots exist, and in what routing order, is set by `SLOTS` in `/etc/llama/m
 
 ### Why this design?
 
-**Two-layer architecture.** Clients talk only to the model manager on port 11434. The manager talks to each slot's llama-server on localhost (`:8081` main, `:8084` re). No llama-server is directly exposed to the network. This separation means:
+**Two-layer architecture.** Clients talk only to the model manager on port 11434. The manager talks to each slot's llama-server on localhost (`:8081` main, `:8084` egpu). No llama-server is directly exposed to the network. This separation means:
 
 - The manager can restart a slot's llama-server for a model swap while other slots keep serving, and clients never need to know which backend holds which model.
 - Privilege separation: llama-server only needs to read model files and access its GPU. The manager only needs to restart the slot units and update their env files. Neither service needs broad system access.
 
 **llama.cpp instead of Ollama.** Running llama-server natively (not in Docker) gives direct GPU access, no container overhead, and access to any GGUF on HuggingFace without waiting for Ollama to support it. The tradeoff is more setup — this repo contains the setup scripts and config templates to make it repeatable.
 
-**FIFO queue per slot instead of parallel inference.** Each slot runs one request at a time, so its GPU is fully dedicated to that request; parallel inference would split VRAM (and context) across requests and slow each one down. Each slot has its own queue, so a long job on `re` never waits behind `main`. Requests to a slot are processed in order, even during a swap on that slot.
+**FIFO queue per slot instead of parallel inference.** Each slot runs one request at a time, so its GPU is fully dedicated to that request; parallel inference would split VRAM (and context) across requests and slow each one down. Each slot has its own queue, so a long job on `egpu` never waits behind `main`. Requests to a slot are processed in order, even during a swap on that slot.
 
 **Dedicated system users.** `_llama` runs every llama-server with read-only access to model files. `_llama-mgr` runs the manager with write access to the slot env files and a narrow sudoers entry to restart the slot units. Neither user has a shell or home directory. If either service were compromised, the blast radius is minimal.
 
@@ -74,10 +74,10 @@ This script creates:
 - System users `_llama` and `_llama-mgr` (no shell, no home directory)
 - `/opt/llama/bin/`, `/opt/llama/models/`, `/opt/llama/manager/`
 - `/etc/llama/` (config files), `/var/log/llama/` (log files)
-- A narrow sudoers entry so `_llama-mgr` can restart `llama-server.service`
+- A narrow sudoers entry so `_llama-mgr` can restart `llama-server.service` and `llama-server-egpu.service`
 - The `llama-server`, `llama-manager` and `llama-embeddings` unit files (installed, not enabled — step 6 starts them)
 
-`setup.sh` covers the `main` slot only. The `re` slot's unit, env file and sudoers line are installed by hand — see [Adding the re slot](#adding-the-re-slot). The template `config/manager.env` lists both in `SLOTS`; drop `re` if you have not installed it, or the manager reports them as permanently unhealthy.
+`setup.sh` covers the `main` slot only, but writes the sudoers entries for both `llama-server.service` and `llama-server-egpu.service`. The `egpu` slot's unit and env file are installed by hand — see [Adding the egpu slot](#adding-the-egpu-slot). The template `config/manager.env` lists both in `SLOTS`; drop `egpu` if you have not installed it, or the manager reports it as permanently unhealthy.
 
 **2. Install the llama-server binary:**
 
@@ -228,7 +228,7 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "queue_limit": 20,
       "models": ["qwen2.5-7b-instruct-q4_k_m"]
     },
-    "re": {
+    "egpu": {
       "host": "127.0.0.1",
       "port": 8084,
       "loaded_model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL",
@@ -345,15 +345,15 @@ Configuration for the llama-server inference backend. **The manager updates `MOD
 | `DEVICE` | `CUDA0` | `--device` selector passed to llama-server. Names an enumeration position, not a physical card — unambiguous only in combination with `CUDA_VISIBLE_DEVICES` below. |
 | `CUDA_VISIBLE_DEVICES` | _(host-specific, no safe default)_ | Restricts this process to exactly one physical GPU by UUID (`GPU-<uuid>`), so `DEVICE=CUDA0` above always names the same card regardless of enumeration order. Get the UUID with `nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv`; never use a bare ordinal (`0`) here, since that reintroduces the same enumeration-order ambiguity. See the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). |
 | `SAMPLING_ARGS` | _(model-specific)_ | Extra llama-server flags for the model in `MODEL_PATH` — sampling (`--temp`, `--top-p`, …) and, where the GGUF supports it, speculative decoding. Lives next to `MODEL_PATH` because sampling tuned for one model is wrong for the next: **change both together**. Must stay unbraced (`$SAMPLING_ARGS`) in the unit's `ExecStart` so systemd word-splits it. Empty means llama.cpp's own defaults. |
-| `N_GPU_LAYERS` | `-1` | Number of model layers to offload to GPU. `-1` = all. Note that llama.cpp's load-time auto-fit can still move MoE expert tensors to system RAM while reporting every layer offloaded; check `nvidia-smi` after a start (see the comment in `config/llama-server-re.env`). |
+| `N_GPU_LAYERS` | `-1` | Number of model layers to offload to GPU. `-1` = all. Note that llama.cpp's load-time auto-fit can still move MoE expert tensors to system RAM while reporting every layer offloaded; check `nvidia-smi` after a start (see the comment in `config/llama-server-egpu.env`). |
 | `GGML_CUDA_DISABLE_GRAPHS` | `1` | Works around a CUDA-graph memory leak; see the comment in `config/llama-server.env`. |
 | `CTX_SIZE` | _(measured per model)_ | Context window size in tokens. Larger values use more VRAM. Derive this from the `llama_kv_cache` line in llama-server's own log (raise `-lv` until the line appears) after loading the target model — see the comments in `config/llama-server.env` — rather than guessing from a projection. Re-derive after any model change. |
 | `HOST` | `127.0.0.1` | Bind address for llama-server. Always localhost — never expose directly. |
 | `PORT` | `8081` | Port for llama-server. The manager connects here. |
 
-### `/etc/llama/llama-server-re.env`
+### `/etc/llama/llama-server-egpu.env`
 
-Configuration for the `re` slot's llama-server backend (Tesla P40). Same variables and semantics as `/etc/llama/llama-server.env` above, with `PORT=8084` and `CUDA_VISIBLE_DEVICES` set to the P40's UUID. See `config/llama-server-re.env` for the current model choice and how its `CTX_SIZE` was measured.
+Configuration for the `egpu` slot's llama-server backend (Tesla P40). Same variables and semantics as `/etc/llama/llama-server.env` above, with `PORT=8084` and `CUDA_VISIBLE_DEVICES` set to the P40's UUID. See `config/llama-server-egpu.env` for the current model choice and how its `CTX_SIZE` was measured.
 
 ### `/etc/llama/manager.env`
 
@@ -364,7 +364,6 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `HOST` | `0.0.0.0` | Bind address for the manager. Set to your LAN IP to restrict access, or `0.0.0.0` for all interfaces. |
 | `PORT` | `8080` | Port the manager listens on. The template sets `11434`, which is what every example in this README assumes. |
 | `LLAMA_SERVER_HOST` / `LLAMA_SERVER_PORT` / `LLAMA_SERVER_ENV` / `LLAMA_SERVER_UNIT` | `127.0.0.1` / `8081` / `/etc/llama/llama-server.env` / `llama-server.service` | The `main` slot's backend address, env file (the manager writes `MODEL_PATH` here during swaps) and systemd unit. |
-| `BATCH_SERVER_HOST` / `BATCH_SERVER_PORT` / `BATCH_SERVER_ENV` / `BATCH_SERVER_UNIT` / `BATCH_QUEUE_LIMIT` | `127.0.0.1` / `8083` / `/etc/llama/llama-server-batch.env` / `llama-server-batch.service` / `20` | Legacy names for a slot called `batch`, read only when `batch` is in `SLOTS` (it is in the code default, not the template). This host no longer runs a batch slot; the template does not set these. |
 | `MODELS_DIR` | `/opt/llama/models` | Directory containing GGUF model files. |
 | `QUEUE_LIMIT` | `20` | Maximum requests held in the `main` slot's FIFO queue (template: `50`). Requests beyond this get a 503. |
 | `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
@@ -374,9 +373,9 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `EMBEDDINGS_HOST` / `EMBEDDINGS_PORT` | `127.0.0.1` / `8082` | Where llama-embeddings listens. Always localhost. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
-| `SLOTS` | `main,batch` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,re`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
-| `SLOT_<NAME>_HOST` / `_PORT` / `_ENV` / `_UNIT` / `_QUEUE_LIMIT` / `_DEVICE` | `127.0.0.1` / _(required)_ / `/etc/llama/llama-server-<name>.env` / `llama-server-<name>.service` / `20` / _(unset)_ | Per-slot configuration, read by `manager/slot_config.py`. For `main` and `batch` a `SLOT_*` variable overrides the legacy `LLAMA_SERVER_*` / `BATCH_*` name; any other slot (e.g. `re`) must set at least `SLOT_<NAME>_PORT` or the manager refuses to start. The template sets `SLOT_RE_PORT=8084`. `SLOT_RE_DEVICE` mirrors the P40's UUID from `CUDA_VISIBLE_DEVICES` in `llama-server-re.env`; `_DEVICE` is not yet read by any code. |
-| `SLOT_<NAME>_MODELS` | _(unset)_ | Comma-separated models whose home is this slot. An untargeted `POST /swap` loads a model onto its home slot; a model listed on no slot is refused with 400 instead of landing on the first slot. A model may appear in only one slot's list, or the manager refuses to start. The template sets `SLOT_MAIN_MODELS` and `SLOT_RE_MODELS`. |
+| `SLOTS` | `main` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,egpu`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
+| `SLOT_<NAME>_HOST` / `_PORT` / `_ENV` / `_UNIT` / `_QUEUE_LIMIT` / `_DEVICE` | `127.0.0.1` / _(required)_ / `/etc/llama/llama-server-<name>.env` / `llama-server-<name>.service` / `20` / _(unset)_ | Per-slot configuration, read by `manager/slot_config.py`. For `main` a `SLOT_*` variable overrides the legacy `LLAMA_SERVER_*` name; any other slot (e.g. `egpu`) must set at least `SLOT_<NAME>_PORT` or the manager refuses to start. The template sets `SLOT_EGPU_PORT=8084`. `SLOT_EGPU_DEVICE` mirrors the P40's UUID from `CUDA_VISIBLE_DEVICES` in `llama-server-egpu.env`; `_DEVICE` is not yet read by any code. |
+| `SLOT_<NAME>_MODELS` | _(unset)_ | Comma-separated models whose home is this slot. An untargeted `POST /swap` loads a model onto its home slot; a model listed on no slot is refused with 400 instead of landing on the first slot. A model may appear in only one slot's list, or the manager refuses to start. The template sets `SLOT_MAIN_MODELS` and `SLOT_EGPU_MODELS`. |
 
 ---
 
@@ -390,7 +389,6 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/messages` | Anthropic Messages API. Byte passthrough to the slot's llama-server, with the same routing, queueing and status codes as chat completions; errors use the Anthropic error envelope. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
 | `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; without `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, else 400. Returns 200 if already loaded, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. |
-| `POST` | `/v1/embeddings` | Proxy to llama-embeddings instance. OpenAI-compatible. |
 | `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
 | `GET` | `/status` | Per-slot health, loaded model, and queue depth; GPU VRAM usage; uptime. Re-probes every slot before answering. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
@@ -498,22 +496,12 @@ curl -s http://LAN_IP:11434/collections/vault/reindex/<job_id> | jq
 
 Concurrent POSTs to the same collection return the in-flight `job_id` rather than stacking duplicate scans. Jobs are in-memory only and wiped on server restart (which already triggers a full reindex).
 
-
-**Generate embeddings directly:**
-
-```bash
-curl -s http://LAN_IP:11434/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"model": "nomic-embed-text", "input": "hello world"}' | jq
-```
-
 ### Architecture
 
 ```
 Manager (:11434)
 ├── /v1/chat/completions → llama-server (:8081, GPU)
-├── /v1/embeddings       → llama-embeddings (:8082, CPU)
-├── /collections/*/search → SQLite-vec (in-process)
+├── /collections/*/search → query vector from llama-embeddings (:8082, CPU) → SQLite-vec (in-process)
 └── /collections/*/docs/* → SQLite-vec (in-process)
 ```
 
@@ -529,25 +517,25 @@ change detection. Only new or modified files are re-embedded.
 | Unit | Slot / role |
 |---|---|
 | `llama-server` | `main` slot |
-| `llama-server-re` | `re` slot |
+| `llama-server-egpu` | `egpu` slot |
 | `llama-embeddings` | embeddings (CPU) |
 | `llama-manager` | the manager on `:11434` |
 
 ```bash
 # Start everything
-sudo systemctl start llama-server llama-server-re llama-embeddings llama-manager
+sudo systemctl start llama-server llama-server-egpu llama-embeddings llama-manager
 
 # Restart just the manager (e.g., after config change)
 sudo systemctl restart llama-manager
 
 # Restart one slot (reloads the model named in its env file)
-sudo systemctl restart llama-server-re
+sudo systemctl restart llama-server-egpu
 ```
 
 ### Check service status
 
 ```bash
-systemctl status llama-server llama-server-re llama-embeddings llama-manager
+systemctl status llama-server llama-server-egpu llama-embeddings llama-manager
 ```
 
 ### View logs
@@ -560,7 +548,7 @@ sudo journalctl -u llama-manager -f
 # llama-server and the manager both log to stderr, so the .err files are
 # the ones with content:
 tail -f /var/log/llama/llama-server.err
-tail -f /var/log/llama/llama-server-re.err
+tail -f /var/log/llama/llama-server-egpu.err
 tail -f /var/log/llama/manager.err
 ```
 
@@ -571,7 +559,7 @@ Logs rotate weekly via `config/llama-logrotate` (installed to `/etc/logrotate.d/
 ### Enable on boot
 
 ```bash
-sudo systemctl enable llama-server llama-server-re llama-embeddings llama-manager
+sudo systemctl enable llama-server llama-server-egpu llama-embeddings llama-manager
 ```
 
 ### Boot sequence
@@ -582,29 +570,29 @@ sudo systemctl enable llama-server llama-server-re llama-embeddings llama-manage
 
 If a slot's `MODEL_PATH` is empty or points to a nonexistent file on boot, that llama-server fails to start. The slot reports `"healthy": false` (with `"loaded_model": null`) in `/status`, and requests for it get 409 until you load a model with `POST /swap`.
 
-### Adding the re slot
+### Adding the egpu slot
 
-`scripts/setup.sh` installs only the `main` slot. For the `re` slot (any further slot is the same with its own names), and see the header comment of the unit file for host prerequisites:
+`scripts/setup.sh` installs only the `main` slot. For the `egpu` slot (any further slot is the same with its own names), and see the header comment of the unit file for host prerequisites:
 
 ```bash
-sudo cp systemd/llama-server-re.service /etc/systemd/system/
-sudo cp config/llama-server-re.env /etc/llama/llama-server-re.env
-sudo chown _llama-mgr:_llama-mgr /etc/llama/llama-server-re.env   # the manager rewrites MODEL_PATH on swap
+sudo cp systemd/llama-server-egpu.service /etc/systemd/system/
+sudo cp config/llama-server-egpu.env /etc/llama/llama-server-egpu.env
+sudo chown _llama-mgr:_llama-mgr /etc/llama/llama-server-egpu.env   # the manager rewrites MODEL_PATH on swap
 sudo systemctl daemon-reload
-sudo systemctl enable --now llama-server-re
+sudo systemctl enable --now llama-server-egpu
 ```
 
-Then make sure the slot is in `SLOTS` in `/etc/llama/manager.env`, and that `/etc/sudoers.d/llama-manager` lets `_llama-mgr` restart that unit — `manager/swap.py` runs `sudo systemctl restart <unit>` for whichever slot it swaps, and the entry `setup.sh` writes covers `llama-server.service` only. Edit it with `sudo visudo -f /etc/sudoers.d/llama-manager`. For `re`, also set the P40's UUID in `CUDA_VISIBLE_DEVICES` (see the next section) before starting it.
+Then make sure the slot is in `SLOTS` in `/etc/llama/manager.env`, and that `/etc/sudoers.d/llama-manager` lets `_llama-mgr` restart that unit — `manager/swap.py` runs `sudo systemctl restart <unit>` for whichever slot it swaps. `setup.sh` writes the entries for `llama-server.service` and `llama-server-egpu.service`; any further slot's entry is added by hand with `sudo visudo -f /etc/sudoers.d/llama-manager`. For `egpu`, also set the P40's UUID in `CUDA_VISIBLE_DEVICES` (see the next section) before starting it.
 
 ### Verify each GPU-backed slot is bound to the right physical card
 
-**Why this exists.** `--device CUDA0` names an enumeration position, not a physical card, and CUDA's default enumeration order is not guaranteed to match PCI bus order. Each GPU-backed unit's `CUDA_VISIBLE_DEVICES` (in its `/etc/llama/` env file) pins it to one card by UUID specifically to remove that ambiguity — see the comments in `config/llama-server.env` and `config/llama-server-re.env`, and the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). The failure mode if the pin is wrong is **silent**: the service starts, loads a model, and serves requests normally, while sitting on the wrong card. Run this procedure whenever a GPU-backed slot is added, after changing any `CUDA_VISIBLE_DEVICES` value, and once after any reboot.
+**Why this exists.** `--device CUDA0` names an enumeration position, not a physical card, and CUDA's default enumeration order is not guaranteed to match PCI bus order. Each GPU-backed unit's `CUDA_VISIBLE_DEVICES` (in its `/etc/llama/` env file) pins it to one card by UUID specifically to remove that ambiguity — see the comments in `config/llama-server.env` and `config/llama-server-egpu.env`, and the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). The failure mode if the pin is wrong is **silent**: the service starts, loads a model, and serves requests normally, while sitting on the wrong card. Run this procedure whenever a GPU-backed slot is added, after changing any `CUDA_VISIBLE_DEVICES` value, and once after any reboot.
 
 **The invariant this checks:** restarting any GPU-backed slot's service, in any order, with all its cards present, must never place a model on another slot's card.
 
 **How the mapping is read.** `nvidia-smi --query-compute-apps` reports, per running CUDA process, the PID and the **physical card UUID** it is actually using — the invariant's exact question, read directly from the driver rather than inferred from a log line. `ps -o unit=` then maps that PID to the systemd unit that owns it. Together these two commands answer "which physical card is this service on" independently of llama.cpp's version or log verbosity. (An earlier draft of this procedure grepped the log for `ggml_cuda_init`; on this host's current build that string appears only in a CUDA-init *failure* message, never on a successful startup, so the grep silently matched nothing regardless of whether the binding was right or wrong — exactly the failure mode this section exists to catch. Do not resurrect that check.)
 
-This procedure is written generically for however many CUDA-backed slots are active (on this host: `main` on the V100 and `re` on the P40) — substitute the real unit/env names.
+This procedure is written generically for however many CUDA-backed slots are active (on this host: `main` on the V100 and `egpu` on the P40) — substitute the real unit/env names.
 
 1. **Record each card's identity.** With all cards physically present:
 
@@ -614,7 +602,7 @@ This procedure is written generically for however many CUDA-backed slots are act
 
    Write down each row (name, UUID, bus id) somewhere durable — e.g. as a comment in the deployed env file that sets `CUDA_VISIBLE_DEVICES` for that card. The names alone are enough to tell cards apart here (e.g. `Tesla PG500-216` vs `Tesla P40`), but the UUID is what the config actually pins on, so record both.
 
-2. **Confirm each service's actual card, from the driver.** For every GPU-backed unit (e.g. `llama-server`, `llama-server-re`):
+2. **Confirm each service's actual card, from the driver.** For every GPU-backed unit (e.g. `llama-server`, `llama-server-egpu`):
 
    ```bash
    sudo systemctl restart llama-server        # repeat per GPU-backed unit
@@ -633,7 +621,7 @@ This procedure is written generically for however many CUDA-backed slots are act
 3. **Restart in reverse order and recheck.** Order-dependence is exactly the failure this guards against — a stale CUDA enumeration cached by one service should not leak into another's.
 
    ```bash
-   sudo systemctl restart llama-server-re     # reverse of the order used in step 2
+   sudo systemctl restart llama-server-egpu   # reverse of the order used in step 2
    sudo systemctl restart llama-server
    ```
 
@@ -671,7 +659,7 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 /etc/llama/
   ├── manager.env                   # runtime config for the model manager
   ├── llama-server.env              # main slot   (manager rewrites MODEL_PATH on swap)
-  ├── llama-server-re.env           # re slot     (installed by hand)
+  ├── llama-server-egpu.env         # egpu slot   (installed by hand)
   └── collections.json              # collection definitions for document retrieval
 
 /var/log/llama/                     # <unit>.log / <unit>.err per service, rotated weekly
@@ -679,7 +667,7 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 /etc/systemd/system/
   ├── llama-manager.service
   ├── llama-server.service          # main
-  ├── llama-server-re.service       # re    (installed by hand)
+  ├── llama-server-egpu.service     # egpu  (installed by hand)
   └── llama-embeddings.service
 ```
 
@@ -714,6 +702,6 @@ inference-server/
 - **No authentication.** This is intentional for an internal network. Use Tailscale for remote access (encrypted, authenticated at the network layer).
 - **Every llama-server is localhost-only.** No slot backend is exposed to the network. Only the manager can reach them.
 - **Dedicated system users.** `_llama` and `_llama-mgr` have no shell, no home directory, and minimal permissions. If a service were compromised, access is tightly scoped.
-- **Narrow sudoers.** `_llama-mgr` can only run `systemctl restart` on the slot units. `setup.sh` writes the entry for `llama-server.service`; each additional slot's unit is added by hand (see [Adding the re slot](#adding-the-re-slot)). Nothing else.
+- **Narrow sudoers.** `_llama-mgr` can only run `systemctl restart` on the slot units. `setup.sh` writes the entries for `llama-server.service` and `llama-server-egpu.service`; each further slot's entry is added by hand (see [Adding the egpu slot](#adding-the-egpu-slot)). Nothing else.
 - **llama-embeddings is localhost-only.** The embedding server on port 8082 is never exposed to the network.
 - **No TLS.** Acceptable on a trusted LAN or Tailscale tunnel. Do not expose port 11434 directly to the internet.

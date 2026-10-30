@@ -65,9 +65,9 @@ def tmp_env_file(tmp_path):
 
 
 @pytest.fixture
-def tmp_batch_env_file(tmp_path):
-    """Create a temporary llama-server-batch env file for testing batch swaps."""
-    env_file = tmp_path / "llama-server-batch.env"
+def tmp_egpu_env_file(tmp_path):
+    """Create a temporary llama-server-egpu env file for testing egpu swaps."""
+    env_file = tmp_path / "llama-server-egpu.env"
     env_file.write_text(
         "MODEL_PATH=\nSAMPLING_ARGS=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=18083\n"
     )
@@ -75,7 +75,7 @@ def tmp_batch_env_file(tmp_path):
 
 
 @pytest.fixture
-def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
+def test_config(tmp_models_dir, tmp_env_file, tmp_egpu_env_file):
     """Create a ManagerConfig pointing at temporary test paths."""
     from manager.config import ManagerConfig
     from manager.slot_config import SlotConfig
@@ -94,12 +94,6 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
         embeddings_port=18082,
         collections_config="/dev/null",
         skills_db_path="",
-        batch_server_host="127.0.0.1",
-        batch_server_port=18083,
-        batch_server_env=tmp_batch_env_file,
-        batch_server_unit="llama-server-batch.service",
-        batch_queue_limit=20,
-        batch_model_default="test-batch-model",
         slots=(
             SlotConfig(
                 name="main", host="127.0.0.1", port=18081,
@@ -107,8 +101,8 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
                 queue_limit=20,
             ),
             SlotConfig(
-                name="batch", host="127.0.0.1", port=18083,
-                env_file=tmp_batch_env_file, systemd_unit="llama-server-batch.service",
+                name="egpu", host="127.0.0.1", port=18083,
+                env_file=tmp_egpu_env_file, systemd_unit="llama-server-egpu.service",
                 queue_limit=20,
             ),
         ),
@@ -118,7 +112,7 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
 @pytest.fixture
 def tmp_re_env_file(tmp_path):
     """Create a temporary env file for a third ('re') slot, used to test N-slot
-    configs beyond the legacy main/batch pair."""
+    configs beyond the 'main' slot (the only one with built-in defaults)."""
     env_file = tmp_path / "llama-server-re.env"
     env_file.write_text(
         "MODEL_PATH=\nCTX_SIZE=8192\nHOST=127.0.0.1\nPORT=8085\n"
@@ -130,8 +124,8 @@ def tmp_re_env_file(tmp_path):
 def three_slot_config(test_config, tmp_re_env_file):
     """test_config extended with a third configured slot ('re').
 
-    A slot outside the legacy main/batch pair has no fallback port (see
-    slot_config.build_slots), so it is given one explicitly here.
+    A slot without built-in defaults (only 'main' has any) has no fallback
+    port (see slot_config.build_slots), so it is given one explicitly here.
     """
     import dataclasses
     from manager.slot_config import SlotConfig

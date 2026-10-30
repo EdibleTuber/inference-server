@@ -45,12 +45,6 @@ class ManagerConfig:
         embeddings_port: Port where the embeddings server listens.
         collections_config: Path to the collections configuration JSON file.
         skills_db_path: Path to the skills SQLite database file.
-        batch_server_host: Address where the batch llama-server is running.
-        batch_server_port: Port where the batch llama-server listens.
-        batch_server_env: Path to the batch llama-server's env file.
-        batch_server_unit: systemd unit name for the batch llama-server.
-        batch_queue_limit: Max number of requests to hold in the batch FIFO queue.
-        batch_model_default: Default model name for the batch slot.
         slots: Ordered slot list built from SLOTS and SLOT_<NAME>_* (or legacy) env vars.
         restart_timeout: Seconds to allow a systemctl restart before it fails.
         proxy_read_timeout: Seconds a proxied request may run before the
@@ -70,12 +64,6 @@ class ManagerConfig:
     embeddings_port: int
     collections_config: str
     skills_db_path: str
-    batch_server_host: str
-    batch_server_port: int
-    batch_server_env: str
-    batch_server_unit: str
-    batch_queue_limit: int
-    batch_model_default: str
     slots: tuple[SlotConfig, ...] = ()
     restart_timeout: int = 150
     proxy_read_timeout: int = 1800
@@ -89,11 +77,6 @@ class ManagerConfig:
     def embeddings_url(self) -> str:
         """Full URL for connecting to the embeddings server."""
         return f"http://{self.embeddings_host}:{self.embeddings_port}"
-
-    @property
-    def batch_server_url(self) -> str:
-        """Full URL for connecting to the batch llama-server."""
-        return f"http://{self.batch_server_host}:{self.batch_server_port}"
 
     @classmethod
     def from_env(cls) -> "ManagerConfig":
@@ -113,12 +96,6 @@ class ManagerConfig:
             embeddings_port=_int_env("EMBEDDINGS_PORT", 8082),
             collections_config=os.getenv("COLLECTIONS_CONFIG", "/etc/llama/collections.json"),
             skills_db_path=os.getenv("SKILLS_DB_PATH", "/opt/llama/data/skills.db"),
-            batch_server_host=os.getenv("BATCH_SERVER_HOST", "127.0.0.1"),
-            batch_server_port=_int_env("BATCH_SERVER_PORT", 8083),
-            batch_server_env=os.getenv("BATCH_SERVER_ENV", "/etc/llama/llama-server-batch.env"),
-            batch_server_unit=os.getenv("BATCH_SERVER_UNIT", "llama-server-batch.service"),
-            batch_queue_limit=_int_env("BATCH_QUEUE_LIMIT", 20),
-            batch_model_default=os.getenv("BATCH_MODEL_DEFAULT", "gemma-4-E4B-it-Q4_K_M"),
             slots=build_slots(),
             restart_timeout=_int_env("RESTART_TIMEOUT", 150),
             proxy_read_timeout=_int_env("PROXY_READ_TIMEOUT", 1800),

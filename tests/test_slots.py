@@ -297,7 +297,7 @@ def test_mark_swapped_sets_all_three_fields():
 
 def test_to_status_dict_shape():
     """to_status_dict returns exactly the 8 keys expected by the /status endpoint."""
-    slot = _make_slot(name="batch", port=18083)
+    slot = _make_slot(name="egpu", port=18083)
     slot.loaded_model = "some-model"
     slot.healthy = True
     slot.last_swap_utc = "2026-04-19T14:00:00+00:00"

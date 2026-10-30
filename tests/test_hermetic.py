@@ -1,4 +1,3 @@
-import dataclasses
 import socket
 import pytest
 from tests.live_ports import LIVE_PORTS, LivePortBlocked

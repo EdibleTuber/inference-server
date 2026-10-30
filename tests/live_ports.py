@@ -9,8 +9,9 @@ pytest.raises would never match. Both conftest.py and the tests import
 from tests.live_ports (the suite runs with PYTHONPATH=.).
 """
 
-# The live manager API (8080), the llama-server slots (8081-8084) and the
-# OpenAI-compatible front (11434) on the host. Tests must never reach them.
+# Ports in use on the host: SearXNG (8080), the llama-server slots and the
+# embeddings server (8081-8084), and the manager itself (11434). Tests must
+# never reach them.
 LIVE_PORTS: frozenset[int] = frozenset({8080, 8081, 8082, 8083, 8084, 11434})
 
 

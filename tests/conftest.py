@@ -1,10 +1,47 @@
 # tests/conftest.py
 """Shared test fixtures for the model manager test suite."""
 import json
+import socket
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
+from tests.live_ports import LIVE_PORTS, LivePortBlocked
+
+
+@pytest.fixture(autouse=True)
+def block_live_ports(monkeypatch):
+    """Block every connect to a live manager slot port, suite-wide (Q13).
+
+    Any connect to a port in LIVE_PORTS, on any host, raises
+    LivePortBlocked; all other connects pass through (AF_UNIX is left
+    alone). tests/test_consumer.py's no_network fixture is stricter and
+    stays in place: it fails on ANY real TCP connect.
+    """
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def _live_port(address):
+        # Address tuples are (host, port, ...); AF_UNIX is a path string
+        # or an abstract (b"\0name",) pair with no port at index 1 that
+        # could match.
+        return address[1] if isinstance(address, tuple) and len(address) > 1 else None
+
+    def _check(self, address):
+        port = _live_port(address)
+        if self.family in (socket.AF_INET, socket.AF_INET6) and port in LIVE_PORTS:
+            raise LivePortBlocked(f"test connected to a live port ({address[0]}:{port})")
+
+    def guarded_connect(self, address):
+        _check(self, address)
+        return real_connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        _check(self, address)
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
 
 
 @pytest.fixture
@@ -22,7 +59,7 @@ def tmp_env_file(tmp_path):
     """Create a temporary llama-server env file for testing model swaps."""
     env_file = tmp_path / "llama-server.env"
     env_file.write_text(
-        "MODEL_PATH=\nSAMPLING_ARGS=\nN_GPU_LAYERS=-1\nCTX_SIZE=4096\nHOST=127.0.0.1\nPORT=8081\n"
+        "MODEL_PATH=\nSAMPLING_ARGS=\nN_GPU_LAYERS=-1\nCTX_SIZE=4096\nHOST=127.0.0.1\nPORT=18081\n"
     )
     return str(env_file)
 
@@ -32,7 +69,7 @@ def tmp_batch_env_file(tmp_path):
     """Create a temporary llama-server-batch env file for testing batch swaps."""
     env_file = tmp_path / "llama-server-batch.env"
     env_file.write_text(
-        "MODEL_PATH=\nSAMPLING_ARGS=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=8083\n"
+        "MODEL_PATH=\nSAMPLING_ARGS=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=18083\n"
     )
     return str(env_file)
 
@@ -44,9 +81,9 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
     from manager.slot_config import SlotConfig
     return ManagerConfig(
         host="127.0.0.1",
-        port=8080,
+        port=18080,
         llama_server_host="127.0.0.1",
-        llama_server_port=8081,
+        llama_server_port=18081,
         models_dir=tmp_models_dir,
         llama_server_env=tmp_env_file,
         llama_server_unit="llama-server.service",
@@ -54,23 +91,23 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_batch_env_file):
         swap_timeout=5,
         log_file="/dev/null",
         embeddings_host="127.0.0.1",
-        embeddings_port=8082,
+        embeddings_port=18082,
         collections_config="/dev/null",
         skills_db_path="",
         batch_server_host="127.0.0.1",
-        batch_server_port=8083,
+        batch_server_port=18083,
         batch_server_env=tmp_batch_env_file,
         batch_server_unit="llama-server-batch.service",
         batch_queue_limit=20,
         batch_model_default="test-batch-model",
         slots=(
             SlotConfig(
-                name="main", host="127.0.0.1", port=8081,
+                name="main", host="127.0.0.1", port=18081,
                 env_file=tmp_env_file, systemd_unit="llama-server.service",
                 queue_limit=20,
             ),
             SlotConfig(
-                name="batch", host="127.0.0.1", port=8083,
+                name="batch", host="127.0.0.1", port=18083,
                 env_file=tmp_batch_env_file, systemd_unit="llama-server-batch.service",
                 queue_limit=20,
             ),

@@ -19,7 +19,7 @@ def batch_slot(tmp_path, tmp_batch_env_file):
     return SlotState(
         name="batch",
         host="127.0.0.1",
-        port=8083,
+        port=18083,
         env_file=tmp_batch_env_file,
         systemd_unit="llama-server-batch.service",
         queue=RequestQueue(max_size=20),
@@ -33,7 +33,7 @@ def main_slot(tmp_env_file):
     return SlotState(
         name="main",
         host="127.0.0.1",
-        port=8081,
+        port=18081,
         env_file=tmp_env_file,
         systemd_unit="llama-server.service",
         queue=RequestQueue(max_size=50),
@@ -288,4 +288,4 @@ async def test_swapper_health_polls_slot_url(test_config, batch_slot):
         ok = await swapper.wait_for_health()
     assert ok is True
     call_url = instance.get.call_args[0][0]
-    assert call_url == "http://127.0.0.1:8083/health"
+    assert call_url == "http://127.0.0.1:18083/health"

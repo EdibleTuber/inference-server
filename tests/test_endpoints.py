@@ -295,15 +295,15 @@ def test_chat_completions_409_when_not_loaded(client, monkeypatch):
     The probe is stubbed because this test asserts on the 409 MESSAGE, and the
     message is built from slot state this test sets by hand. The chat handler
     now re-probes before declaring a model unloaded (so a stale slot is not
-    reported as empty), and test_config points the slots at 127.0.0.1:8081/8083
-    -- which on a machine where the real backends are running is not a fixture,
-    it is production. Without this stub the probe replaced the fabricated state
-    with the live models and the assertion read
-    `main='gemma-4-26b-a4b-it-q4_k_m'`.
+    reported as empty). Without this stub the probe replaced the fabricated
+    state with the probed models; historically, when test_config still pointed
+    the slots at the live 127.0.0.1:8081/8083, those were the live models and
+    the assertion read `main='gemma-4-26b-a4b-it-q4_k_m'`.
 
     Worth knowing more broadly: TestClient runs the lifespan, so the startup
-    probe has always reached those ports. This stub makes one test hermetic; the
-    suite as a whole still depends on what happens to be listening.
+    probe has always reached those ports. The fixture's ports are no longer
+    live ports, and the suite-wide guard (tests/live_ports.py) fails any test
+    that connects to one.
     """
     from manager.slots import SlotState
 
@@ -826,14 +826,14 @@ def test_server_builds_every_configured_slot(test_config):
     from manager.app import ServerState
 
     cfg = replace(test_config, slots=(
-        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
-        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
-        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+        SlotConfig("main", "127.0.0.1", 18081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("batch", "127.0.0.1", 18083, "/tmp/batch.env", "batch.service", 20),
+        SlotConfig("re", "127.0.0.1", 18084, "/tmp/re.env", "re.service", 30),
     ))
     server = ServerState(cfg)
 
     assert list(server.slots) == ["main", "batch", "re"]
-    assert server.slots["re"].port == 8084
+    assert server.slots["re"].port == 18084
     assert server.slots["re"].queue.max_size == 30
     assert server.slots["re"].env_file == "/tmp/re.env"
     assert server.slots["re"].systemd_unit == "re.service"
@@ -851,9 +851,9 @@ def test_slot_count_follows_configuration(test_config):
     from manager.app import ServerState
 
     cfg = replace(test_config, slots=(
-        SlotConfig("main", "127.0.0.1", 8081, "/tmp/main.env", "main.service", 20),
-        SlotConfig("batch", "127.0.0.1", 8083, "/tmp/batch.env", "batch.service", 20),
-        SlotConfig("re", "127.0.0.1", 8084, "/tmp/re.env", "re.service", 30),
+        SlotConfig("main", "127.0.0.1", 18081, "/tmp/main.env", "main.service", 20),
+        SlotConfig("batch", "127.0.0.1", 18083, "/tmp/batch.env", "batch.service", 20),
+        SlotConfig("re", "127.0.0.1", 18084, "/tmp/re.env", "re.service", 30),
     ))
     server = ServerState(cfg)
     assert len(server.slots) == len(cfg.slots)
@@ -900,14 +900,14 @@ class _FakeV1ModelsServer:
 
     Narrow and local to test_status_survives_a_raising_slot_probe -- NOT
     the general fake-backend fixture for the whole endpoint suite (that is
-    deferred). Needed here specifically because the fixture's slot ports
-    otherwise collide with whatever is actually running on this machine
-    (see the module's other /status tests, which rely on that real
-    backend and are unaffected by this one using a fake instead): a test
-    asserting that a *healthy* sibling survives a concurrent reprobe needs
-    a backend whose health and response timing it actually controls,
-    independent of what happens to be listening on 127.0.0.1:8083 right
-    now.
+    deferred): a test asserting that a *healthy* sibling survives a
+    concurrent reprobe needs a backend whose health and response timing it
+    actually controls. (It was originally also needed because the
+    fixture's slot ports were the live 127.0.0.1:8081/8083; the phase-1
+    plan moved them to 18081/18083, and the guard in tests/live_ports.py
+    now fails any test that connects to a live port. The module's other
+    /status tests accept whatever the startup probe finds on the
+    fixture's ports and are unaffected by this one using a fake.)
     """
 
     def __init__(self):
@@ -994,11 +994,12 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
         down mid-request.
 
     The 'batch' slot is pointed at fake_v1_models_backend (a real HTTP
-    server this test controls) rather than test_config's real port, so
-    batch's baseline health/model is deterministic instead of depending on
-    "whatever happens to be running on 127.0.0.1:8083 right now" (see the
-    other /status tests in this module, which do rely on that real
-    backend and are unaffected by this one using a fake instead).
+    server this test controls) rather than test_config's port, so batch's
+    baseline health/model is deterministic instead of depending on
+    "whatever happens to be running on 127.0.0.1:18083 right now" (the
+    other /status tests in this module accept whatever the startup probe
+    finds on the fixture's ports and are unaffected by this one using a
+    fake instead).
 
     The final assertion checks loaded_model against a SECOND, distinct
     fake-backend body set just before the /status call (not the same
@@ -1108,8 +1109,9 @@ def test_status_survives_a_raising_slot_probe(test_config, fake_v1_models_backen
 #
 # Slot-state fabrication note (applies to every test in this section):
 # TestClient runs the lifespan, so the startup probe has already reached the
-# fixture's 127.0.0.1:8081/8083 ports -- which on this machine is not a
-# fixture, it is production. Every test below that sets slot state by hand
+# fixture's 127.0.0.1:18081/18083 ports -- moved off the live ones by the
+# phase-1 plan (the guard in tests/live_ports.py now fails any test that
+# connects to a live port). Every test below that sets slot state by hand
 # therefore stubs SlotState.probe to a no-op, exactly as
 # test_chat_completions_409_when_not_loaded does above.
 #
@@ -1162,7 +1164,7 @@ def test_messages_non_streaming_passthrough(test_config, monkeypatch):
         assert r.json() == backend_body
         mock_client.post.assert_awaited_once()
         url = mock_client.post.await_args.args[0]
-        assert url == "http://127.0.0.1:8081/v1/messages"
+        assert url == "http://127.0.0.1:18081/v1/messages"
         assert mock_client.post.await_args.kwargs["json"] == body
 
 
@@ -1224,7 +1226,7 @@ def test_messages_streaming_passthrough(test_config, monkeypatch):
         assert r.content == b"".join(chunks)
         method, url = mock_client.stream.call_args.args[:2]
         assert method == "POST"
-        assert url == "http://127.0.0.1:8081/v1/messages"
+        assert url == "http://127.0.0.1:18081/v1/messages"
         assert mock_client.stream.call_args.kwargs["json"] == body
 
 
@@ -1412,7 +1414,7 @@ def test_chat_completions_still_targets_openai_backend_path(test_config, monkeyp
 
         assert r.status_code == 200, r.text
         url = mock_client.post.await_args.args[0]
-        assert url == "http://127.0.0.1:8081/v1/chat/completions"
+        assert url == "http://127.0.0.1:18081/v1/chat/completions"
         assert mock_client.post.await_args.kwargs["json"] == body
 
 
@@ -1458,7 +1460,7 @@ def test_count_tokens_passthrough(test_config, monkeypatch):
         assert r.json() == {"input_tokens": 42}
         mock_client.post.assert_awaited_once()
         url = mock_client.post.await_args.args[0]
-        assert url == "http://127.0.0.1:8081/v1/messages/count_tokens"
+        assert url == "http://127.0.0.1:18081/v1/messages/count_tokens"
         assert mock_client.post.await_args.kwargs["json"] == body
         # Counting is direct passthrough: it never touches the GPU queue.
         assert server.slots["main"].queue.depth == 0

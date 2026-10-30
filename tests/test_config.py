@@ -7,9 +7,11 @@ from manager.config import ManagerConfig
 def test_config_loads_from_env(monkeypatch):
     """Config should load all values from environment variables."""
     monkeypatch.setenv("HOST", "192.168.1.50")
-    monkeypatch.setenv("PORT", "8080")
+    # Values deliberately differ from the from_env defaults below, so a
+    # broken env read cannot hide behind the fallback.
+    monkeypatch.setenv("PORT", "18080")
     monkeypatch.setenv("LLAMA_SERVER_HOST", "127.0.0.1")
-    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "18081")
     monkeypatch.setenv("MODELS_DIR", "/opt/llama/models")
     monkeypatch.setenv("LLAMA_SERVER_ENV", "/etc/llama/llama-server.env")
     monkeypatch.setenv("QUEUE_LIMIT", "20")
@@ -19,9 +21,9 @@ def test_config_loads_from_env(monkeypatch):
     config = ManagerConfig.from_env()
 
     assert config.host == "192.168.1.50"
-    assert config.port == 8080
+    assert config.port == 18080
     assert config.llama_server_host == "127.0.0.1"
-    assert config.llama_server_port == 8081
+    assert config.llama_server_port == 18081
     assert config.models_dir == "/opt/llama/models"
     assert config.llama_server_env == "/etc/llama/llama-server.env"
     assert config.queue_limit == 20
@@ -52,11 +54,11 @@ def test_config_defaults(monkeypatch):
 def test_config_llama_server_url(monkeypatch):
     """Config should provide a convenience URL for the llama-server."""
     monkeypatch.setenv("LLAMA_SERVER_HOST", "127.0.0.1")
-    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "18081")
 
     config = ManagerConfig.from_env()
 
-    assert config.llama_server_url == "http://127.0.0.1:8081"
+    assert config.llama_server_url == "http://127.0.0.1:18081"
 
 
 def test_config_embeddings_defaults(monkeypatch):
@@ -148,19 +150,19 @@ def test_from_env_batch_overrides(monkeypatch):
 def test_batch_server_url_property():
     """batch_server_url composes host and port."""
     cfg = ManagerConfig(
-        host="0.0.0.0", port=11434,
-        llama_server_host="127.0.0.1", llama_server_port=8081,
+        host="0.0.0.0", port=21434,
+        llama_server_host="127.0.0.1", llama_server_port=18081,
         models_dir="/tmp", llama_server_env="/tmp/env",
         llama_server_unit="llama-server.service",
         queue_limit=50, swap_timeout=60, log_file="/dev/null",
-        embeddings_host="127.0.0.1", embeddings_port=8082,
+        embeddings_host="127.0.0.1", embeddings_port=18082,
         collections_config="/dev/null", skills_db_path="",
-        batch_server_host="127.0.0.1", batch_server_port=8083,
+        batch_server_host="127.0.0.1", batch_server_port=18083,
         batch_server_env="/tmp/batch.env",
         batch_server_unit="llama-server-batch.service",
         batch_queue_limit=20, batch_model_default="gemma-4-E4B-it-Q4_K_M",
     )
-    assert cfg.batch_server_url == "http://127.0.0.1:8083"
+    assert cfg.batch_server_url == "http://127.0.0.1:18083"
 
 
 from manager.slot_config import SlotConfig
@@ -168,7 +170,7 @@ from manager.slot_config import SlotConfig
 
 def test_from_env_populates_slots_in_order(monkeypatch):
     monkeypatch.setenv("SLOTS", "main,re,batch")
-    monkeypatch.setenv("SLOT_RE_PORT", "8084")
+    monkeypatch.setenv("SLOT_RE_PORT", "18084")
     from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
     assert [s.name for s in cfg.slots] == ["main", "re", "batch"]
@@ -183,13 +185,13 @@ def test_from_env_defaults_to_the_legacy_two_slots(monkeypatch):
 
 def test_legacy_ports_flow_into_slots(monkeypatch):
     monkeypatch.delenv("SLOTS", raising=False)
-    monkeypatch.setenv("LLAMA_SERVER_PORT", "8081")
-    monkeypatch.setenv("BATCH_SERVER_PORT", "8083")
+    monkeypatch.setenv("LLAMA_SERVER_PORT", "18081")
+    monkeypatch.setenv("BATCH_SERVER_PORT", "18083")
     from manager.config import ManagerConfig
     cfg = ManagerConfig.from_env()
     by_name = {s.name: s for s in cfg.slots}
-    assert by_name["main"].port == 8081
-    assert by_name["batch"].port == 8083
+    assert by_name["main"].port == 18081
+    assert by_name["batch"].port == 18083
 
 
 def test_test_config_fixture_slots_match_its_own_ports_and_env_files(test_config):

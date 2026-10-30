@@ -8,7 +8,7 @@ def _slot(name: str, loaded_model=None) -> SlotState:
     return SlotState(
         name=name,
         host="127.0.0.1",
-        port=8081 if name == "main" else 8083,
+        port=18081 if name == "main" else 18083,
         env_file="/tmp/env",
         systemd_unit=f"llama-server-{name}.service" if name == "batch" else "llama-server.service",
         queue=RequestQueue(max_size=10),

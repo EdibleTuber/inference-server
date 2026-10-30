@@ -58,7 +58,7 @@ def test_slots_var_controls_membership_and_order():
     # SLOT_RE_PORT is required here: an unconfigured port raises (see
     # test_unconfigured_port_raises_and_names_the_variable below), and this
     # test is only about membership/order, not port validation.
-    slots = build_slots(_env({"SLOTS": "main,re,batch", "SLOT_RE_PORT": "8084"}))
+    slots = build_slots(_env({"SLOTS": "main,re,batch", "SLOT_RE_PORT": "18084"}))
     assert [s.name for s in slots] == ["main", "re", "batch"]
 
 
@@ -66,14 +66,14 @@ def test_new_slot_reads_prefixed_vars():
     slots = build_slots(_env({
         "SLOTS": "main,re",
         "SLOT_RE_HOST": "127.0.0.1",
-        "SLOT_RE_PORT": "8084",
+        "SLOT_RE_PORT": "18084",
         "SLOT_RE_ENV": "/etc/llama/llama-server-re.env",
         "SLOT_RE_UNIT": "llama-server-re.service",
         "SLOT_RE_QUEUE_LIMIT": "30",
         "SLOT_RE_DEVICE": "GPU-abc123",
     }))
     re_slot = slots[1]
-    assert re_slot.port == 8084
+    assert re_slot.port == 18084
     assert re_slot.env_file == "/etc/llama/llama-server-re.env"
     assert re_slot.systemd_unit == "llama-server-re.service"
     assert re_slot.queue_limit == 30
@@ -82,14 +82,14 @@ def test_new_slot_reads_prefixed_vars():
 
 def test_prefixed_var_overrides_legacy_for_main():
     """An explicit SLOT_MAIN_PORT wins over LLAMA_SERVER_PORT."""
-    slots = build_slots(_env({"LLAMA_SERVER_PORT": "8081", "SLOT_MAIN_PORT": "9999"}))
+    slots = build_slots(_env({"LLAMA_SERVER_PORT": "18081", "SLOT_MAIN_PORT": "9999"}))
     assert slots[0].port == 9999
 
 
 def test_slot_names_are_normalised_and_whitespace_tolerant():
     # SLOT_RE_PORT is required for the same reason as in
     # test_slots_var_controls_membership_and_order above.
-    slots = build_slots(_env({"SLOTS": " main , RE ", "SLOT_RE_PORT": "8084"}))
+    slots = build_slots(_env({"SLOTS": " main , RE ", "SLOT_RE_PORT": "18084"}))
     assert [s.name for s in slots] == ["main", "re"]
 
 
@@ -130,7 +130,7 @@ def test_slot_models_default_to_empty():
 def test_slot_models_parsed_and_whitespace_tolerant():
     slots = build_slots(_env({
         "SLOTS": "main,re",
-        "SLOT_RE_PORT": "8084",
+        "SLOT_RE_PORT": "18084",
         "SLOT_MAIN_MODELS": " model-a , model-b,",
         "SLOT_RE_MODELS": "model-c",
     }))

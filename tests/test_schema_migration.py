@@ -239,3 +239,45 @@ def test_a_failed_upsert_leaves_no_half_written_document(tmp_path):
         assert (docs, vecs) == (1, 1)
     finally:
         db.close()
+
+
+# Added after the Task 4 mutation run (T8, T11, T14 survived).
+
+def _schema(path) -> tuple:
+    conn = _raw(path)
+    try:
+        names = {(r[0], r[1]) for r in conn.execute("SELECT type, name FROM sqlite_master")}
+        columns = [tuple(r) for r in conn.execute("PRAGMA table_info(documents)")]
+        return names, columns
+    finally:
+        conn.close()
+
+
+def test_a_migrated_database_has_the_same_schema_as_a_fresh_one(legacy, tmp_path):
+    """The migration repeats the v1 DDL; this keeps it from drifting from
+    _create_v1, and catches a legacy table left behind or the
+    (collection, file_path) index missing (audit I1: 30s event-loop stall)."""
+    fresh = tmp_path / "fresh.db"
+    for path in (legacy, fresh):
+        db = VectorDB(str(path))
+        db.init_schema()
+        db.close()
+    assert _schema(legacy) == _schema(fresh)
+
+
+def test_a_failed_migration_leaves_no_transaction_open(legacy, monkeypatch):
+    """start_retrieval drops a VectorDB whose init_schema raised without
+    closing it, so the rollback must not depend on close()."""
+    from manager.vectordb import MigrationError
+
+    def boom(conn):
+        raise MigrationError("injected")
+
+    monkeypatch.setattr("manager.vectordb._verify_migration", boom)
+    db = VectorDB(str(legacy))
+    with pytest.raises(MigrationError):
+        db.init_schema()
+    try:
+        assert not db._conn.in_transaction
+    finally:
+        db.close()

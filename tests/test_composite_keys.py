@@ -117,3 +117,30 @@ def test_a_newer_schema_version_is_refused(tmp_path):
     with pytest.raises(SchemaVersionError):
         again.init_schema()
     again.close()
+
+
+# Added after the Task 4 mutation run: these two gaps let a vector-scope bug
+# through (U3: the delete lost its rowid; D2: delete_stale left the vector).
+
+def test_an_upsert_keeps_its_collection_siblings_vectors(db):
+    db.upsert_collection("c", "/c", "markdown")
+    db.upsert_document("one", "c", "One", {}, "s", "c", "/c/one.md", "h", unit(0))
+    db.upsert_document("two", "c", "Two", {}, "s", "c", "/c/two.md", "h", unit(1))
+    db.upsert_document("two", "c", "Two", {}, "s", "c", "/c/two.md", "h2", unit(1))   # update
+
+    assert db._conn.execute("SELECT count(*) FROM doc_vectors").fetchone()[0] == 2
+    [hit] = db.search("c", unit(0), limit=1)
+    assert (hit["id"], hit["score"]) == ("one", pytest.approx(1.0))
+
+
+def test_delete_stale_removes_the_stale_documents_vector(db):
+    db.upsert_collection("c", "/c", "markdown")
+    db.upsert_document("keep", "c", "K", {}, "s", "c", "/c/keep.md", "h", unit(0))
+    db.upsert_document("gone", "c", "G", {}, "s", "c", "/c/gone.md", "h", unit(1))
+    keep_pk = db._conn.execute("SELECT pk FROM documents WHERE id = 'keep'").fetchone()[0]
+
+    assert db.delete_stale("c", {"/c/keep.md"}) == 1
+
+    # Raw rowids: search() skips a vector whose document is gone, so a
+    # leaked vector is invisible to every query.
+    assert {r[0] for r in db._conn.execute("SELECT rowid FROM doc_vectors")} == {keep_pk}

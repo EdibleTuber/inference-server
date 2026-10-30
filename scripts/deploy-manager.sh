@@ -88,7 +88,7 @@ echo
 
 drift=0
 changed_reqs=0
-for src in "$REPO"/manager/*.py "$REPO"/manager/requirements.txt; do
+for src in "$REPO"/manager/*.py "$REPO"/manager/requirements.txt "$REPO"/manager/requirements.lock; do
   [ -e "$src" ] || continue
   base="$(basename "$src")"
   a=$(sha256sum "$src" | cut -c1-12)
@@ -100,7 +100,9 @@ for src in "$REPO"/manager/*.py "$REPO"/manager/requirements.txt; do
   else
     printf '  %-22s STALE (repo %s, deployed %s)\n' "$base" "$a" "${b:-absent}"
     drift=1
-    if [ "$base" = "requirements.txt" ]; then
+    # Either pin file stale: requirements.txt declares the bounds, the lock
+    # pins them; the reinstall below goes from the lock.
+    if [ "$base" = "requirements.txt" ] || [ "$base" = "requirements.lock" ]; then
       changed_reqs=1
     fi
   fi
@@ -136,15 +138,15 @@ if ! runuser -u "$TEST_USER" -- \
   exit 4
 fi
 
-# Only *.py and requirements.txt, explicitly. NOT `cp -r manager/`, which
+# Only *.py and the two pin files, explicitly. NOT `cp -r manager/`, which
 # nests, and not a wildcard that could sweep in a stray file from the checkout.
 install -m 644 -o "$OWNER" -g "$OWNER" "$REPO"/manager/*.py "$DEST"/
-install -m 644 -o "$OWNER" -g "$OWNER" "$REPO"/manager/requirements.txt "$DEST"/
-echo "  installed manager/*.py + requirements.txt"
+install -m 644 -o "$OWNER" -g "$OWNER" "$REPO"/manager/requirements.txt "$REPO"/manager/requirements.lock "$DEST"/
+echo "  installed manager/*.py + requirements.txt + requirements.lock"
 
 if [ "$changed_reqs" -eq 1 ]; then
-  echo "  requirements.txt changed — reinstalling dependencies"
-  "$DEST/venv/bin/pip" install -r "$DEST/requirements.txt" --quiet
+  echo "  requirements changed — reinstalling from the lock"
+  "$DEST/venv/bin/pip" install -r "$DEST/requirements.lock" --quiet
   chown -R "$OWNER:$OWNER" "$DEST/venv"
 fi
 

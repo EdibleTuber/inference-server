@@ -26,3 +26,12 @@ def test_no_live_file_names_the_old_re_slot():
         capture_output=True, text=True,
     )
     assert out.stdout == "", out.stdout
+
+def test_every_top_level_requirement_is_pinned_in_the_lock():
+    def name(line): return re.split(r"[<>=\[ ]", line.strip(), maxsplit=1)[0].lower().replace("_", "-")
+    reqs = [l for l in (REPO / "manager/requirements.txt").read_text().splitlines()
+            if l.strip() and not l.startswith("#")]
+    lock = {name(l): l for l in (REPO / "manager/requirements.lock").read_text().splitlines()
+            if l.strip() and not l.startswith("#")}
+    for r in reqs:
+        assert name(r) in lock and "==" in lock[name(r)], r

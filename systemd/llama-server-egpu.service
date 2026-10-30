@@ -10,14 +10,11 @@
 # updates MODEL_PATH in that file when swapping models on this slot, then
 # restarts this service via sudo systemctl restart.
 #
-# NOT YET DEPLOYED: the P40 is not installed on this host. This unit exists
-# ahead of the hardware so the wiring is ready when it arrives (see
-# docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md Phase 4).
-# Until then, do not install or enable this unit, and `egpu` is deliberately
-# left out of SLOTS in config/manager.env -- fronting a slot with no
-# running backend would make the manager report it as permanently unhealthy.
+# Only install this unit on a host with the P40 attached. The template
+# config/manager.env lists `egpu` in SLOTS; drop it on a host without this
+# backend, or the manager reports the slot as permanently unhealthy.
 #
-# Install (once the P40 is installed):
+# Install:
 #   1. Get its UUID: nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv
 #   2. sudo cp systemd/llama-server-egpu.service /etc/systemd/system/
 #   3. sudo cp config/llama-server-egpu.env /etc/llama/llama-server-egpu.env

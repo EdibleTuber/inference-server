@@ -825,6 +825,43 @@ def _anthropic_error_response(decision: _RouteDecision) -> JSONResponse:
     )
 
 
+class JsonOnlyMiddleware:
+    """Gate: every POST must declare Content-Type application/json (Q8/X1).
+
+    Deliberately plain ASGI rather than @app.middleware("http"):
+    BaseHTTPMiddleware wraps `receive` and re-streams every response,
+    which can break how a client disconnect closes the upstream stream,
+    and no app-level test would catch that. This gate only inspects
+    headers, then either short-circuits with 415 or forwards
+    (scope, receive, send) completely unwrapped.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST":
+            await self.app(scope, receive, send)
+            return
+        header = next(
+            (v for k, v in scope["headers"] if k == b"content-type"), None
+        )
+        if header is None:
+            media_type = b""
+        else:
+            media_type = header.split(b";", 1)[0].strip().lower()
+        if media_type == b"application/json":
+            await self.app(scope, receive, send)
+            return
+        await JSONResponse(
+            {"error": {
+                "type": "unsupported_media_type",
+                "message": "Content-Type must be application/json",
+            }},
+            status_code=415,
+        )(scope, receive, send)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -957,6 +994,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     app = FastAPI(title="llama-mgr", lifespan=lifespan)
     app.state.server = server
+    # Q8 (X1): refuse every POST whose Content-Type is not application/json.
+    app.add_middleware(JsonOnlyMiddleware)
 
     # ------------------------------------------------------------------
     # GET /health

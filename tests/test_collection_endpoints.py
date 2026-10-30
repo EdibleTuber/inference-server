@@ -80,7 +80,9 @@ def test_reindex_post_accepts_paths(collection_client):
 
 
 def test_reindex_post_missing_body_defaults_to_full_scan(collection_client):
-    resp = collection_client.post("/collections/skills/reindex")
+    # Q8: a bodyless POST carries no Content-Type and is refused with 415;
+    # the full-scan default is what an explicit empty JSON body gets.
+    resp = collection_client.post("/collections/skills/reindex", json={})
     assert resp.status_code == 202
     body = resp.json()
     assert body["paths"] is None

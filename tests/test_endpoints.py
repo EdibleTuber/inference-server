@@ -1537,3 +1537,54 @@ def test_embeddings_proxy_is_gone(client):
     """
     r = client.post("/v1/embeddings", json={"input": "x"})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Q8: every POST must declare Content-Type application/json (X1).
+# ---------------------------------------------------------------------------
+
+def test_text_plain_swap_is_refused_and_never_swaps(client, monkeypatch):
+    swapped = []
+
+    async def fake_swap(self, model_path, sampling_args=""):
+        swapped.append(self._slot.name)
+        return True
+    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
+
+    server = client.app.state.server
+    loaded_before = server.slots["main"].loaded_model
+
+    r = client.post(
+        "/swap", content=b'{"model":"test-model-q8","target":"main"}',
+        headers={"content-type": "text/plain"},
+    )
+    assert r.status_code == 415
+    assert r.json()["error"]["type"] == "unsupported_media_type"
+    assert r.json()["error"]["message"] == "Content-Type must be application/json"
+    # the swap path was not entered: no swap was scheduled, nothing loaded
+    assert swapped == []
+    assert server.slots["main"].loaded_model == loaded_before
+
+
+def test_text_plain_chat_is_refused_and_never_queued(client):
+    server = client.app.state.server
+
+    r = client.post(
+        "/v1/chat/completions",
+        content=b'{"model":"test-model-q4","messages":[]}',
+        headers={"content-type": "text/plain"},
+    )
+    assert r.status_code == 415
+    assert all(s.queue.depth == 0 for s in server.slots.values())
+
+
+def test_missing_content_type_on_reindex_is_refused(client):
+    r = client.post("/collections/skills/reindex", content=b"")
+    assert r.status_code == 415
+
+
+@pytest.mark.parametrize("ct", ["application/json; charset=utf-8", "Application/JSON"])
+def test_json_media_type_with_params_or_case_is_accepted(client, ct):
+    r = client.post("/swap", content=b'{"model":"no-such-model"}',
+                    headers={"content-type": ct})
+    assert r.status_code != 415

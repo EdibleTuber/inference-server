@@ -204,7 +204,7 @@ def collection_config(test_config, tmp_path, collections_config):
 @pytest.fixture
 def collection_app(collection_config):
     """Create app with collection support and mocked embeddings."""
-    with patch("manager.app.EmbeddingsClient") as MockEmbClient:
+    with patch("manager.retrieval.EmbeddingsClient") as MockEmbClient:
         mock_instance = AsyncMock()
         mock_instance.embed_text = AsyncMock(return_value=[0.1] * 768)
         mock_instance.embed_batch = AsyncMock(return_value=[[0.1] * 768])

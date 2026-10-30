@@ -45,7 +45,7 @@ def gated_app(collection_config, monkeypatch):
     monkeypatch.setattr(SlotState, "probe", _no_probe)   # startup probes stay off the network
     gate = threading.Event()
     record: list = []
-    with patch("manager.app.EmbeddingsClient") as client_cls:
+    with patch("manager.retrieval.EmbeddingsClient") as client_cls:
         client_cls.return_value = _gated_embeddings(gate, cap=3.0, record=record)
         from manager.app import create_app
         yield create_app(collection_config), gate, record
@@ -177,7 +177,7 @@ def test_unreadable_collections_config_does_not_stop_startup(
 
     monkeypatch.setattr(SlotState, "probe", _no_probe)
     Path(collection_config.collections_config).write_text("{ not json")
-    with patch("manager.app.EmbeddingsClient") as client_cls:
+    with patch("manager.retrieval.EmbeddingsClient") as client_cls:
         client_cls.return_value = _gated_embeddings(threading.Event(), 0.0, [])
         from manager.app import create_app
         with TestClient(create_app(collection_config)) as client:

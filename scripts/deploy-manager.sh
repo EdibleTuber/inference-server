@@ -123,8 +123,14 @@ fi
 # Gate the deploy on the suite, run as the invoking user, not root: a root
 # run would leave root-owned __pycache__/.pytest_cache in the checkout.
 # PYTHONDONTWRITEBYTECODE and -p no:cacheprovider keep it clean regardless.
-if ! runuser -u "${SUDO_USER:-root}" -- \
-     env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO" \
+# sudo leaves USER/LOGNAME=root and HOME=/root, and runuser -u keeps them:
+# pytest names its temp root from USER (/tmp/pytest-of-root, which fails its
+# ownership check if root ever created it), so reset all three.
+TEST_USER="${SUDO_USER:-root}"
+TEST_HOME="$(getent passwd "$TEST_USER" | cut -d: -f6)"
+if ! runuser -u "$TEST_USER" -- \
+     env HOME="$TEST_HOME" USER="$TEST_USER" LOGNAME="$TEST_USER" \
+     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO" \
      "$DEST/venv/bin/python" -m pytest "$REPO/tests" -q -p no:cacheprovider; then
   echo "test suite failed; not deploying"
   exit 4

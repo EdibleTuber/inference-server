@@ -8,7 +8,7 @@ with automatic model swapping and a FIFO queue for serial GPU access.
 Endpoints:
     GET  /health                              - Always 200, liveness check
     GET  /status                              - Server state, model, GPU, queue info
-    GET  /v1/models                           - List available GGUFs in OpenAI format
+    GET  /v1/models                           - List onboarded profiles in OpenAI format
     POST /v1/chat/completions                 - Proxy to llama-server (with model swap)
     POST /v1/messages                         - Anthropic API passthrough (same queue/swap semantics)
     POST /v1/messages/count_tokens            - Anthropic token counting passthrough
@@ -24,7 +24,6 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import httpx
@@ -35,13 +34,13 @@ from starlette.background import BackgroundTask
 from manager import retrieval
 from manager.config import ManagerConfig
 from manager.gpu import get_gpu_info_async
-from manager.names import display_name, match_key, same_model
-from manager.profiles import load_profiles, render_model_env
+from manager.names import same_model
+from manager.profiles import ProfileSet, load_profiles, render_model_env
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
 from manager.swap import ModelSwapper
-from manager.routing import home_slot, resolve_slot
+from manager.routing import resolve_slot
 
 if TYPE_CHECKING:
     # Named only in ServerState.__init__ annotations; the retrieval module
@@ -66,7 +65,7 @@ Readiness = Literal["ready", "wrong_model", "unavailable"]
 class ServerState:
     """Holds all mutable state for the model manager."""
 
-    def __init__(self, config: ManagerConfig):
+    def __init__(self, config: ManagerConfig, profiles: ProfileSet | None = None):
         self._config = config
 
         # Build slots dict from configuration, in configured order. Order is
@@ -90,12 +89,15 @@ class ServerState:
         for slot in self.slots.values():
             slot.swapper = ModelSwapper(config, slot=slot)
 
-        # Per-model profiles: the roster a swap renders from (Q29, Q32).
-        # load_profiles never raises -- a bad file goes into
-        # self.profiles.errors and is logged at ERROR, not fatal: one bad
-        # profile must not take inference down.
-        self.profiles = load_profiles(
-            config.profiles_dir, [sc.name for sc in config.slots], config.models_dir)
+        # Per-model profiles: the roster a swap renders from and /v1/models
+        # lists (Q13, Q29, Q32). A ProfileSet passed in is used as-is;
+        # otherwise load_profiles runs and never raises -- a bad file goes
+        # into self.profiles.errors and is logged at ERROR, not fatal: one
+        # bad profile must not take inference down.
+        if profiles is None:
+            profiles = load_profiles(
+                config.profiles_dir, [sc.name for sc in config.slots], config.models_dir)
+        self.profiles = profiles
         for error in self.profiles.errors.values():
             logger.error("profiles: %s", error)
 
@@ -104,44 +106,6 @@ class ServerState:
         self.embeddings_client: EmbeddingsClient | None = None
 
         self.reindex_registry = ReindexRegistry()
-
-    # ------------------------------------------------------------------
-    # Model path helpers
-    # ------------------------------------------------------------------
-
-    def model_path(self, model_name: str) -> str | None:
-        """Resolve a model name to its file path in MODELS_DIR.
-
-        Case- and .gguf-suffix-insensitive. An exact-case stem match wins;
-        otherwise a case-folded (match_key) match is used. NOTE: the glob is
-        case-sensitive, so on-disk files MUST use a lowercase '.gguf' extension.
-        """
-        requested = display_name(model_name)
-        if requested is None:
-            return None
-        models_dir = Path(self._config.models_dir)
-        if not models_dir.exists():
-            return None
-        by_key: dict[str, Path] = {}
-        for p in sorted(models_dir.glob("*.gguf")):
-            if p.stem == requested:                 # exact-case match wins
-                return str(p)
-            key = match_key(p.stem)
-            if key in by_key:
-                logger.warning(
-                    "model_path: case-collision on %r; keeping %s, ignoring %s",
-                    key, by_key[key].name, p.name,
-                )
-                continue
-            by_key[key] = p
-        match = by_key.get(match_key(model_name))
-        return str(match) if match is not None else None
-
-    def list_models(self) -> list[str]:
-        models_dir = Path(self._config.models_dir)
-        if not models_dir.exists():
-            return []
-        return sorted(p.stem for p in models_dir.glob("*.gguf"))
 
     # ------------------------------------------------------------------
     # Readiness (read-only; the queue consumer's only gate)
@@ -292,33 +256,40 @@ class ServerState:
                         "to never raise): %s", name, result,
                     )
 
-    async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
+    async def ensure_model_on_slot(self, slot_name: str, model_name: str,
+                                   *, force: bool = False) -> bool:
         """Ensure model_name is loaded on the named slot.
 
         Holds the slot's swap_lock for the duration. The model's profile
         section for the slot is rendered into the slot's generated model
-        env file, so no flag can carry over from the previous model. On
-        failure, drains the slot's queue with an error.
+        env file, so no flag can carry over from the previous model. A
+        healthy slot already holding the model needs no swap unless
+        force=True: a trial must really reload the model to verify it.
+
+        A model the profile set cannot render -- no profile, or no section
+        for this slot -- is a refusal, not a failed swap: nothing was
+        stopped, so the slot's health, loaded model and queue are left
+        alone and the old model keeps serving. A swap that starts and then
+        fails (raises or times out) took the backend down, so it still
+        takes the failure tail: unhealthy slot, drained queue, False.
         """
         slot = self.slots[slot_name]
         async with slot.swap_lock:
-            if slot.healthy and same_model(model_name, slot.loaded_model):
+            if not force and slot.healthy and same_model(model_name, slot.loaded_model):
                 return True
 
             profile = self.profiles.get(model_name)
             if profile is None:
-                msg = (f"No profile for model {model_name} in "
-                       f"{self._config.profiles_dir}; add a <name>.toml there")
-                slot.mark_unhealthy()
-                self._drain_slot_queue_with_error(slot_name, msg)
+                logger.error(
+                    "No profile for model %s in %s; add a <name>.toml there",
+                    model_name, self._config.profiles_dir)
                 return False
 
             section = profile.section(slot_name)
             if section is None:
-                msg = (f"Model {profile.name} has no [slots.{slot_name}] section; "
-                       f"it may run on: {', '.join(profile.sections)}")
-                slot.mark_unhealthy()
-                self._drain_slot_queue_with_error(slot_name, msg)
+                logger.error(
+                    "Model %s has no [slots.%s] section; it may run on: %s",
+                    profile.name, slot_name, ", ".join(profile.sections))
                 return False
 
             logger.info("slot=%s swapping to %s", slot_name, profile.name)
@@ -657,8 +628,9 @@ async def _validate_and_route(
             status=400, code="missing_model", message="model field is required"
         ), None
 
-    # Validate model exists.
-    if server.model_path(model_name) is None:
+    # Validate the model is in the roster: a GGUF with no profile is not a
+    # model this manager knows (Q13), so refuse it before routing.
+    if server.profiles.get(model_name) is None:
         return _RouteDecision(
             status=404, code="model_not_found",
             message=f"Model not found: {model_name}",
@@ -848,8 +820,10 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     _setup_logging(config)
 
     server = ServerState(config)
-    # Each slot's SLOT_<NAME>_MODELS list, for /status. Static: config is frozen.
-    home_models = {sc.name: list(sc.models) for sc in config.slots}
+    # Each slot's home models, for /status. Read once at startup from the
+    # roster: the ProfileSet is the config's view, and a profile edited
+    # later is picked up on restart.
+    home_models = server.profiles.home_models()
 
     # ------------------------------------------------------------------
     # Lifespan
@@ -935,6 +909,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             },
             "gpu": gpu,
             "uptime_seconds": int(time.time() - _start_time),
+            "profile_errors": server.profiles.errors,
         }
 
     # ------------------------------------------------------------------
@@ -943,18 +918,26 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models():
-        names = server.list_models()
+        # The onboarded profiles are the model list (Q13): a profile makes
+        # the manager aware of a model; a GGUF on disk without one is
+        # invisible. loaded_on names the slots whose loaded_model matches.
         now = int(time.time())
         return {
             "object": "list",
             "data": [
                 {
-                    "id": name,
+                    "id": profile.name,
                     "object": "model",
                     "created": now,
                     "owned_by": "local",
+                    "home_slot": profile.home,
+                    "verified_slots": list(profile.verified_slots()),
+                    "loaded_on": [
+                        name for name, slot in server.slots.items()
+                        if same_model(profile.name, slot.loaded_model)
+                    ],
                 }
-                for name in names
+                for profile in server.profiles.onboarded()
             ],
         }
 
@@ -1056,14 +1039,19 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     async def swap_slot(request: Request, background_tasks: BackgroundTasks):
         """Admin endpoint: swap a slot to a different model.
 
-        Body: {"model": str, "target": <slot name> (optional)}.
-        Without a target (absent or null) the model goes to its home slot from
-        SLOT_<NAME>_MODELS; a model with no home slot is refused with 400.
-        No auth; LAN-only is the trust boundary.
+        Body: {"model": str, "target": <slot name> (optional), "trial": bool
+        (optional, default false)}. Without a target (absent or null) the
+        model goes to its profile's home slot. A (model, slot) pair is
+        accepted only if the model's profile has a section for the slot,
+        and the section must be verified unless trial is true: trial is how
+        scripts/onboard.py verifies a pair, and it reloads even a model
+        that is already loaded, because a trial that skips the load would
+        verify nothing. No auth; LAN-only is the trust boundary.
 
-        Returns 200 if the model is already loaded, 202 if a swap was started.
-        Callers poll GET /status (the slot's ``swapping`` and ``loaded_model``
-        fields) to know when the swap lands.
+        Returns 200 if the model is already loaded and no trial was
+        requested, 202 if a swap was started. Callers poll GET /status
+        (the slot's ``swapping`` and ``loaded_model`` fields) to know when
+        the swap lands.
         """
         try:
             body = await request.json()
@@ -1080,42 +1068,67 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=400,
             )
 
+        # Checks run in this order: trial's type, the profile, the target,
+        # the section, the verification.
+        if "trial" in body and not isinstance(body["trial"], bool):
+            return JSONResponse(
+                {"error": {"type": "invalid_trial",
+                           "message": "'trial' must be a boolean"}},
+                status_code=400,
+            )
+        trial = body.get("trial", False)
+
+        profile = server.profiles.get(model_name)
+        if profile is None:
+            # A profile that failed validation is not in the roster either;
+            # GET /status's profile_errors says why.
+            return JSONResponse(
+                {"error": {"type": "model_not_found",
+                           "message": (f"no profile for model '{model_name}'; "
+                                       f"add config/models/{model_name}.toml")}},
+                status_code=404,
+            )
+
         valid = ", ".join(repr(n) for n in server.slots)
         target = body.get("target")
         if target is None:
-            # Untargeted: the operator's map decides, never "the first slot".
-            # agent_core clients send exactly this after a model_not_loaded
-            # 409; guessing a slot here is what used to evict main.
-            target = home_slot(model_name, config.slots)
-            if target is None:
-                return JSONResponse(
-                    {"error": {"type": "no_home_slot",
-                               "message": (
-                                   f"model '{model_name}' has no home slot; pass "
-                                   f"'target' (one of: {valid}) or list it in "
-                                   f"SLOT_<NAME>_MODELS")}},
-                    status_code=400,
-                )
-        elif not isinstance(target, str) or target not in server.slots:
+            # Untargeted: the profile's home slot decides, never "the first
+            # slot". agent_core clients send exactly this after a
+            # model_not_loaded 409; guessing a slot here is what used to
+            # evict main.
+            target = profile.home
+        if not isinstance(target, str) or target not in server.slots:
             return JSONResponse(
                 {"error": {"type": "invalid_target",
                            "message": f"'target' must be one of: {valid}"}},
                 status_code=400,
             )
 
-        if server.model_path(model_name) is None:
+        section = profile.section(target)
+        if section is None:
             return JSONResponse(
-                {"error": {"type": "model_not_found",
-                           "message": f"Model file not found: {model_name}"}},
-                status_code=404,
+                {"error": {"type": "slot_not_allowed",
+                           "message": (f"model '{profile.name}' has no "
+                                       f"[slots.{target}] section; it may run on: "
+                                       f"{', '.join(profile.sections)}")}},
+                status_code=400,
+            )
+
+        if section.verified is None and not trial:
+            return JSONResponse(
+                {"error": {"type": "not_verified",
+                           "message": (f"model '{profile.name}' is not verified on "
+                                       f"slot '{target}'; run scripts/onboard.py "
+                                       f"{profile.name} --slot {target}")}},
+                status_code=400,
             )
 
         slot = server.slots[target]
-        if slot.healthy and same_model(model_name, slot.loaded_model):
+        if not trial and slot.healthy and same_model(model_name, slot.loaded_model):
             return {"slot": target, "model": slot.loaded_model, "status": "ok"}
 
         async def _do_swap():
-            ok = await server.ensure_model_on_slot(target, model_name)
+            ok = await server.ensure_model_on_slot(target, model_name, force=trial)
             if not ok:
                 logger.error("background swap failed: %s on slot %s",
                              model_name, target)

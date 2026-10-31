@@ -264,6 +264,19 @@ llama_cpp_commit = "057494f93"
 
     Then re-load the file, confirm `<s>` is now in `verified_slots()`, and print: commit and deploy.
 
+**Pinned by the committed tests (2026-10-31, checked against a reference implementation; seventeen hand mutants all killed).** Three points correct the Interfaces block above, which this plan got wrong; deviating from it there is correct:
+- **When a swap has landed (correction).** `/swap` returns 202 before its background task takes the slot's lock, so the first polls can show the slot exactly as before. When the model is already loaded (onboarding the two live models in Task 7) that looks like success, and the chat would hit the old process. Read the slot's `last_swap_utc` just before each `POST /swap`; the swap has landed only when `/status` shows a *different* `last_swap_utc`, `healthy`, not `swapping`, and `loaded_model` matching via `names.same_model`.
+- **When a swap has failed.** Not `swapping` and not `healthy`, once `swapping` has been seen or if the slot was healthy before the POST. A slot that was already down is not a failed trial. Failure is recognised when `/status` shows it, not by running out `timeout`. A non-202 from `/swap` fails at once, with no polling.
+- **Exit 5 (new).** The model is already loaded on another slot. Chat goes to the first configured slot holding the model (`routing.resolve_slot`), so the chat would be answered there and verify nothing about the target. Checked before any swap.
+- **Default `--manager` (correction).** `manager_url_from_env(text: str) -> str` builds `http://<HOST>:<PORT>` from `/etc/llama/manager.env`; `HOST=0.0.0.0` or absent means `127.0.0.1`, `PORT` absent means `11434`. On this host the manager binds `192.168.1.14` and `127.0.0.1:11434` refuses connections, so the plan's default would fail every run.
+- Exit 2 also covers a missing repo profile, a slot the manager doesn't have, and a slot the profile has no section for.
+- Both swaps (trial and swap back) send `"trial": true` and use the same landed/failed rules. The swap back runs after a failed swap, a failed chat or a passed trial alike; a failed swap back is exit 1 and writes nothing.
+- The chat body is exactly `{"model", "max_tokens": 256, "messages": [...]}`; `choices: []` is a failure.
+- `parse_llama_version(text: str) -> tuple[int, str]`. The real `--version` output also prints a log line first (`version: 0.4.1-dev (build 11136, commit 057494f93)` on the host today); `main()` passes it stdout plus stderr.
+- The script puts the repo root on `sys.path`, so `python3 scripts/onboard.py` runs from any directory with no `PYTHONPATH`.
+- Untested: `main()`'s `httpx.Client` needs a long timeout (a cold load and the first chat can take minutes); use at least 600 s.
+- Test file in this task's test commit: `tests/test_onboard.py` (new).
+
 - [ ] Steps: run the tests (they fail) → implement → full suite passes → commit `feat(onboard): verify a profile with a trial load (Q25)`.
 
 ### Task 5: Deploy ships profiles; doctor checks the new layout

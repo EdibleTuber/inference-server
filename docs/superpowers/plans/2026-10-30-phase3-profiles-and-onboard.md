@@ -261,7 +261,7 @@ llama_cpp_commit = "057494f93"
 ### Task 5: Deploy ships profiles; doctor checks the new layout
 
 **Files:** Modify `scripts/deploy-manager.sh`, `scripts/doctor.sh`, `scripts/setup.sh` and `config/manager.env`.
-- In `config/manager.env`: drop `SLOT_*_MODELS`, and add `PROFILES_DIR=/etc/llama/models.d` and `MODEL_ENV_DIR=/var/lib/llama-manager`.
+- In `config/manager.env`: drop `SLOT_*_MODELS`, and add `PROFILES_DIR=/etc/llama/models.d` and `MODEL_ENV_DIR=/var/lib/llama-manager`. Also fix its comment at line 15, which still says the manager updates `MODEL_PATH` in the slot env file during swaps (found in the Task 2 review).
 - Tests, committed by Claude: additions to `tests/test_deploy_script.py` and `tests/test_doctor.py`.
 
 **Interfaces:**
@@ -285,7 +285,7 @@ llama_cpp_commit = "057494f93"
 
 **Files:**
 - Create `config/models/Qwen3.8-27B-UD-Q6_K.toml`, `config/models/Qwen3.6-35B-A3B-UD-IQ4_NL_XL.toml` and `config/models/gemma-4-26b-a4b-it-q4_k_m.toml`.
-- Update the `README.md` sections on swapping and configuration.
+- Update the `README.md` sections on swapping and configuration, and `manager/README.md`. The Task 2 review found stale `MODEL_PATH`/`SAMPLING_ARGS`/`CTX_SIZE`/`N_GPU_LAYERS` and regex-rewrite text around `README.md` lines 340–366, 571, 580 and 661; grep both files for those names rather than trusting the line numbers.
 - Tests: `tests/test_bootstrap_profiles.py`, committed by Claude. Each profile validates and renders the values below.
 
 Values come from the **live** sidecars and env files, read 2026-10-30. Wherever a sidecar was silent, the value is llama.cpp b11136's default. None of the profiles has a `verified` table; `onboard` adds it.
@@ -296,9 +296,10 @@ Values come from the **live** sidecars and env files, read 2026-10-30. Wherever 
 | Qwen3.6-35B-A3B-UD-IQ4_NL_XL | egpu | egpu | 131072 | -1 | 0.6, 20, 0.95, **0.05**, 0.0, 0.0, 1.0 | `--jinja --ctx-checkpoints 4 --n-predict 32768` |
 | gemma-4-26b-a4b-it-q4_k_m | egpu (Q42) | egpu | 131072 | -1 | 1.0, 64, 0.95, 0.0, 0.0, 0.0, 1.0 | `--jinja --ctx-checkpoints 4 --n-predict 32768` |
 
-Comments to carry into the profiles:
-- **Qwen3.8:** move the MTP measurement table and the KV-cache derivation from `config/llama-server.env` into comments.
-- **Qwen3.6:** note that `min_p` is llama.cpp's default, kept to preserve today's behaviour, and that the card says 0.0.
+Comments to carry into the profiles. Task 2 deleted them from the slot env templates and units, so take them from git: `git show 67a0f44:config/llama-server.env`, `git show 67a0f44:config/llama-server-egpu.env`, `git show 67a0f44:systemd/llama-server.service`.
+- **Every profile:** the `--ctx-checkpoints 4` rationale (ggml-org/llama.cpp#23181: the default of 32 grows unbounded and can OOM the P40's VRAM, and `--cache-ram 0` doesn't stop checkpoint creation), and `--jinja` being required for tool calling.
+- **Qwen3.8:** move the MTP measurement table, the KV-cache derivation and the thinking-mode sampling rationale (including the gemma `--temp 0.2` history) from `config/llama-server.env` into comments.
+- **Qwen3.6:** note that `min_p` is llama.cpp's default, kept to preserve today's behaviour, and that the card says 0.0. Also carry the model-selection rationale, the KV-cache derivation, the "precise coding" sampling note, and the `n_gpu_layers = -1` auto-fit warning (experts silently moved to RAM; check `nvidia-smi` and the `common_params_fit_impl` lines) from `config/llama-server-egpu.env`.
 - **gemma:** note that its sampling comes from the GGUF's `general.sampling.*` (temp 1.0, top_k 64, top_p 0.95). It has no MTP layer, so it carries no `--spec-*` flags: it's the Q42 regression case. Also note that its `ctx_size` on the P40 is unmeasured, and that `onboard`'s trial load is the measurement.
 
 - [ ] Steps: run the tests (they fail) → write the three files and the README sections → full suite passes → commit `feat(profiles): bootstrap profiles for the three kept models (Q34, Q42)`.

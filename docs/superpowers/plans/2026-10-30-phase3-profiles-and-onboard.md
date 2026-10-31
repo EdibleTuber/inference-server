@@ -180,6 +180,14 @@ llama_cpp_commit = "057494f93"
 
   `<slot>` is `main` or `egpu`. Keep the units' existing comments where they're still true. Comments about removed keys move to the profiles.
 
+**Pinned by the committed tests (2026-10-31, checked against a reference implementation; ten hand mutants all killed):**
+- `SlotConfig.model_env_file: str | None = None` and `SlotState.model_env_file: Optional[str] = None` (last field). The default keeps every hand-built `SlotConfig`/`SlotState` in the suite working; `build_slots` always sets it.
+- `write_model_env` calls `os.fsync`, `os.chmod` and `os.replace` through the `os` module (the tests patch `os.replace` and `os.fsync`). The temp file lives in the target's directory, and the target is never opened for writing.
+- `ServerState.__init__` loads `self.profiles = load_profiles(config.profiles_dir, [slot names], config.models_dir)` and logs each `errors` entry at ERROR.
+- `ensure_model_on_slot` looks up `self.profiles.get(model_name)` and its `section(slot_name)` in place of `model_path`. A missing profile or section takes the existing missing-file tail (unhealthy, drained queue, `False`) and never calls `swap_to`. On success it calls `swap_to(profile.name, render_model_env(profile, section, config.models_dir))` and `mark_swapped(profile.name)`.
+- `model_path` and `list_models` stay until Task 3; the chat routes still use them.
+- Test files in this task's test commit: `tests/test_model_env.py` (new), `tests/systemd_expand.py` (new), `tests/test_swap.py` (rewritten), `tests/conftest.py` (`profiles_dir`, `model_env_dir`, `write_test_profiles`, non-empty test GGUFs, model keys dropped from the fake slot env files, `three_slot_config` gets its own profiles with an `aux` section). Fakes in `tests/test_endpoints.py` keep their old parameter names; they take two positional arguments, so they still match.
+
 - [ ] **Step 1:** Run `tests/test_model_env.py tests/test_swap.py`. Expected: they fail. The discriminating test is `test_a_swap_passes_exactly_the_profiles_flags_to_llama_server`: it expands the **repo's** unit files, and today's `ExecStart` hardcodes `--ctx-checkpoints 4 --jinja`, which no profile in the test declares.
 - [ ] **Step 2:** Implement per the Interfaces block.
 - [ ] **Step 3:** Run the full suite. Expected: everything passes.

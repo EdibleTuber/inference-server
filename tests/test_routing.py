@@ -94,27 +94,3 @@ def test_unknown_model_across_three_slots_returns_none():
 def test_third_slot_comparison_is_normalised():
     slots = {"main": _slot("main", None), "aux": _slot("aux", "Gemma-4-26B")}
     assert resolve_slot("/models/gemma-4-26b.gguf", slots) == "aux"
-
-
-from manager.routing import home_slot
-from manager.slot_config import SlotConfig
-
-
-def _sc(name, *models):
-    return SlotConfig(name=name, host="127.0.0.1", port=1, env_file="/tmp/env",
-                      systemd_unit="u.service", queue_limit=1, models=tuple(models))
-
-
-def test_home_slot_finds_the_configured_slot():
-    scs = [_sc("main", "model-a"), _sc("egpu", "model-b")]
-    assert home_slot("model-b", scs) == "egpu"
-
-
-def test_home_slot_is_case_and_suffix_insensitive():
-    scs = [_sc("main"), _sc("egpu", "Model-B.gguf")]
-    assert home_slot("model-b", scs) == "egpu"
-
-
-def test_home_slot_none_for_unmapped_model():
-    scs = [_sc("main", "model-a"), _sc("egpu")]
-    assert home_slot("model-z", scs) is None

@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 
-_Path = Path  # alias used by model_path tests (brief requirement)
 
 
 @pytest.fixture
@@ -413,90 +412,6 @@ def test_swap_valid_egpu(client, monkeypatch):
     assert server.slots["egpu"].loaded_model == "test-model-q8"
 
 
-def _with_homes(config, **homes):
-    """Copy of config with SLOT_<NAME>_MODELS-equivalent home lists set."""
-    import dataclasses
-    slots = tuple(
-        dataclasses.replace(s, models=tuple(homes.get(s.name, ())))
-        for s in config.slots
-    )
-    return dataclasses.replace(config, slots=slots)
-
-
-def _homes_client(config, monkeypatch, **homes):
-    """Client with home lists set; records the name of each slot a swap hit."""
-    from manager.app import create_app
-    swapped = []
-
-    async def fake_swap(self, model_path, sampling_args=""):
-        swapped.append(self._slot.name)
-        return True
-    monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
-    return TestClient(create_app(_with_homes(config, **homes))), swapped
-
-
-def test_untargeted_swap_goes_to_the_models_home_slot(three_slot_config, monkeypatch):
-    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
-    r = client.post("/swap", json={"model": "test-model-q8"})
-    assert r.status_code == 202, r.text
-    assert r.json()["slot"] == "aux"
-    assert swapped == ["aux"]
-
-
-def test_untargeted_swap_matches_home_case_and_suffix_insensitively(
-        three_slot_config, monkeypatch):
-    client, swapped = _homes_client(
-        three_slot_config, monkeypatch, aux=["TEST-MODEL-Q8.gguf"])
-    r = client.post("/swap", json={"model": "test-model-q8"})
-    assert r.status_code == 202, r.text
-    assert swapped == ["aux"]
-
-
-def test_untargeted_swap_with_null_target_uses_the_map(three_slot_config, monkeypatch):
-    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
-    r = client.post("/swap", json={"model": "test-model-q8", "target": None})
-    assert r.status_code == 202, r.text
-    assert swapped == ["aux"]
-
-
-def test_untargeted_swap_of_unmapped_model_is_refused_and_touches_no_slot(
-        three_slot_config, monkeypatch):
-    # test-model-q4 exists on disk but no slot calls it home.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q8"])
-    r = client.post("/swap", json={"model": "test-model-q4"})
-    assert r.status_code == 400, r.text
-    body = r.json()
-    assert body["error"]["type"] == "no_home_slot"
-    assert "SLOT_<NAME>_MODELS" in body["error"]["message"]
-    assert swapped == []
-
-
-def test_untargeted_swap_of_mapped_but_missing_model_is_404(three_slot_config, monkeypatch):
-    # (pin) 404 before and after: proves the map lookup runs before, and does
-    # not replace, the model-file check.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["does-not-exist"])
-    r = client.post("/swap", json={"model": "does-not-exist"})
-    assert r.status_code == 404, r.text
-    assert r.json()["error"]["type"] == "model_not_found"
-    assert swapped == []
-
-
-def test_targeted_swap_ignores_the_map(three_slot_config, monkeypatch):
-    # (pin) An explicit target is an operator override, even against the map.
-    client, swapped = _homes_client(three_slot_config, monkeypatch, aux=["test-model-q4"])
-    r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
-    assert r.status_code == 202, r.text
-    assert swapped == ["main"]
-
-
-def test_status_reports_each_slots_home_models(three_slot_config):
-    from manager.app import create_app
-    client = TestClient(create_app(_with_homes(three_slot_config, aux=["test-model-q8"])))
-    slots = client.get("/status").json()["slots"]
-    assert slots["aux"]["models"] == ["test-model-q8"]
-    assert slots["main"]["models"] == []
-
-
 def test_swap_invalid_target(client):
     r = client.post("/swap", json={"model": "test-model-q4", "target": "xxx"})
     assert r.status_code == 400
@@ -646,46 +561,6 @@ async def test_ensure_model_skips_swap_on_case_variant(test_config):
     result = await server.ensure_model_on_slot("main", "TEST-MODEL-Q4")
     assert result is True
     server.slots["main"].swapper.swap_to.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# model_path resolution (Task 3)
-# ---------------------------------------------------------------------------
-
-def test_model_path_exact_and_suffix(test_config):
-    from manager.app import ServerState
-    server = ServerState(test_config)
-    assert server.model_path("test-model-q4").endswith("test-model-q4.gguf")
-    assert server.model_path("test-model-q4.gguf").endswith("test-model-q4.gguf")
-
-
-def test_model_path_case_insensitive(test_config):
-    from manager.app import ServerState
-    server = ServerState(test_config)
-    assert server.model_path("TEST-MODEL-Q4").endswith("test-model-q4.gguf")
-
-
-def test_model_path_unknown_is_none(test_config):
-    from manager.app import ServerState
-    server = ServerState(test_config)
-    assert server.model_path("nope") is None
-    assert server.model_path("") is None
-
-
-def test_model_path_collision_is_deterministic_and_warns(test_config, caplog):
-    from manager.app import ServerState
-    d = test_config.models_dir
-    _Path(d, "Dup-Model.gguf").touch()
-    _Path(d, "dup-model.gguf").touch()
-    server = ServerState(test_config)
-    # Exact-case match wins, no warning needed.
-    assert server.model_path("Dup-Model").endswith("Dup-Model.gguf")
-    assert server.model_path("dup-model").endswith("dup-model.gguf")
-    # A folded-only variant resolves to the sorted-first file ('D' < 'd') and warns.
-    with caplog.at_level("WARNING"):
-        resolved = server.model_path("DUP-MODEL")
-    assert resolved.endswith("Dup-Model.gguf")
-    assert any("collision" in r.message.lower() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

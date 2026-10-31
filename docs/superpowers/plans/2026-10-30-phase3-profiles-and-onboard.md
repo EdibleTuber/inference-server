@@ -205,7 +205,7 @@ llama_cpp_commit = "057494f93"
 - `ServerState.ensure_model_on_slot(self, slot_name: str, model_name: str, *, force: bool = False) -> bool`.
   - It renders from `self.profiles.get(model_name).section(slot_name)`.
   - Without `force`, a healthy slot already holding the model returns True with no restart. With `force`, it always swaps.
-  - A missing profile or section counts as a failed swap: mark the slot unhealthy, drain its queue, return False.
+  - A missing profile or section is a refusal, not a failed swap: log it at ERROR and return False, leaving the slot's health, loaded model and queue alone. Nothing was stopped, so the old model is still serving. (This replaces Task 2's pinned "missing-file tail", which this plan specified and which was wrong: it drained requests that the still-running model could serve. Deviating from Task 2's code here is correct.) After this task both paths are defensive, since `/swap` and chat refuse such models first.
 - **Chat requests:** `_validate_and_route` answers `model_not_found` (404, message `Model not found: <name>`) when `server.profiles.get(name)` is `None`.
 - **`POST /swap` body:** `{"model": str, "target": str | None, "trial": bool = false}`. It checks, in order:
   1. Existing body checks (`invalid_body`, `missing_model`).
@@ -223,6 +223,14 @@ llama_cpp_commit = "057494f93"
   - `verified_slots: list[str]`;
   - `loaded_on: list[str]`: slots whose `loaded_model` matches, via `same_model`.
 - **`GET /status`:** `slots.<name>.models` becomes `profiles.home_models().get(name, [])`. A new top-level `profile_errors: dict[str, str]`.
+
+**Pinned by the committed tests (2026-10-31, checked against a reference implementation; hand mutants and the Task 2 mutation survivors all killed):**
+- `"trial": null` is `invalid_trial`, unlike `"target": null`, which means absent. Any non-bool is rejected, ints included.
+- A profile that failed validation (it is in `profile_errors`) is not in the roster: chat and `/swap` answer 404.
+- `slot_not_allowed` comes before the `trial` check, so `trial` never runs a model on a slot it has no section for.
+- A leftover `SLOT_<NAME>_MODELS` line in `manager.env` is ignored, not an error: the host keeps those lines until cutover step 7.
+- `home_models()` and the roster are read once at startup; a profile edited later is picked up on restart.
+- Test files in this task's test commit: `tests/test_profile_roster.py` (new); `tests/test_model_env.py` (the two refusal tests now also check health, queue and log; a new test that the slot env file's `DEVICE=` beats the unit default, which already passes); the home-map, `SLOT_*_MODELS` and `model_path` tests deleted from `tests/test_endpoints.py`, `tests/test_routing.py` and `tests/test_slot_config.py`. `tests/test_consumer.py` needed no change.
 
 - [ ] **Step 1:** Run the suite. Expected: the tests Claude committed for this task fail, and nothing else does.
 - [ ] **Step 2:** Implement per the Interfaces block.

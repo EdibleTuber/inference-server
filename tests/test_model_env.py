@@ -6,7 +6,9 @@ The discriminating test expands the repo's real unit files the way systemd
 does (tests/systemd_expand.py), so it checks what llama-server would be
 exec'd with, not what the manager believes it wrote.
 """
+import asyncio
 import dataclasses
+import logging
 import os
 import stat
 from pathlib import Path
@@ -226,24 +228,50 @@ async def test_ensure_renders_the_section_for_the_target_slot(test_config, tmp_p
     assert server.slots["egpu"].loaded_model == "Mtp-Model-Q6"
 
 
+async def _refused(server, slot_name, model_name, caplog):
+    """Ask for a swap the profile can't serve, with the slot loaded, healthy
+    and one request queued; return (result, swap mock, queued item)."""
+    slot = server.slots[slot_name]
+    slot.loaded_model, slot.healthy = "test-model-q4", True
+    swap = slot.swapper.swap_to = AsyncMock(return_value=True)
+    item = {"event": asyncio.Event(), "error": None}
+    await slot.queue.enqueue(item)
+    with caplog.at_level(logging.ERROR, logger="manager.app"):
+        result = await server.ensure_model_on_slot(slot_name, model_name)
+    return result, swap, item
+
+
+def _assert_untouched(server, slot_name, swap, item):
+    """A refusal happens before anything is stopped, so the old model is
+    still serving: the slot stays healthy and its queue stays queued."""
+    slot = server.slots[slot_name]
+    swap.assert_not_called()
+    assert (slot.loaded_model, slot.healthy) == ("test-model-q4", True)
+    assert slot.queue.depth == 1
+    assert (item["error"], item["event"].is_set()) == (None, False)
+
+
 @pytest.mark.asyncio
-async def test_a_model_without_a_profile_is_not_swapped(test_config, tmp_path):
+async def test_a_model_without_a_profile_is_refused_and_the_slot_untouched(test_config, caplog):
     from manager.app import ServerState
     (Path(test_config.models_dir) / "no-profile-q4.gguf").write_bytes(b"GGUF")
     server = ServerState(test_config)
-    swap = server.slots["main"].swapper.swap_to = AsyncMock(return_value=True)
-    assert await server.ensure_model_on_slot("main", "no-profile-q4") is False
-    swap.assert_not_called()
+    result, swap, item = await _refused(server, "main", "no-profile-q4", caplog)
+    assert result is False
+    _assert_untouched(server, "main", swap, item)
+    assert "No profile for model no-profile-q4" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_a_profile_without_a_section_for_the_slot_is_not_swapped(test_config, tmp_path):
+async def test_a_profile_without_a_section_for_the_slot_is_refused_and_the_slot_untouched(
+        test_config, tmp_path, caplog):
     from manager.app import ServerState
     config = _config_with(test_config, tmp_path, {"Main-Only-Q4": MAIN_ONLY_TOML})
     server = ServerState(config)
-    swap = server.slots["egpu"].swapper.swap_to = AsyncMock(return_value=True)
-    assert await server.ensure_model_on_slot("egpu", "Main-Only-Q4") is False
-    swap.assert_not_called()
+    result, swap, item = await _refused(server, "egpu", "Main-Only-Q4", caplog)
+    assert result is False
+    _assert_untouched(server, "egpu", swap, item)
+    assert "Model Main-Only-Q4 has no [slots.egpu] section; it may run on: main" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -369,3 +397,22 @@ def test_the_slot_env_file_wins_over_the_model_env_file(slot, tmp_path):
     model_env = tmp_path / f"{slot}.env"
     model_env.write_text("MODEL_ARGS=--model /m/x.gguf\nHOST=0.0.0.0\nPORT=1\nDEVICE=CUDA1\n")
     assert _expand(slot, model_env) == _slot_prefix(slot) + ["--model", "/m/x.gguf"]
+
+
+@pytest.mark.parametrize("slot", ["main", "egpu"])
+def test_the_slot_env_files_device_wins_over_the_unit_default(slot, tmp_path):
+    """Environment=DEVICE=CUDA0 is only a default: a host whose slot env file
+    names another device must get that device."""
+    model_env = tmp_path / f"{slot}.env"
+    model_env.write_text("MODEL_ARGS=--model /m/x.gguf\n")
+    slot_env = (REPO / "config" / SLOT_ENV[slot]).read_text().replace("DEVICE=CUDA0", "DEVICE=CUDA1")
+    assert "DEVICE=CUDA1" in slot_env
+
+    def read(path: str) -> str:
+        if path == f"/var/lib/llama-manager/{slot}.env":
+            return model_env.read_text()
+        if path == f"/etc/llama/{SLOT_ENV[slot]}":
+            return slot_env
+        raise AssertionError(f"{UNIT[slot]} loads an unexpected env file: {path}")
+    argv = expand_exec_start((REPO / "systemd" / UNIT[slot]).read_text(), read)
+    assert argv[argv.index("--device") + 1] == "CUDA1"

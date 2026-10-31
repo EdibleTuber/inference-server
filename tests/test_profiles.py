@@ -214,6 +214,18 @@ def test_out_of_range_or_mistyped_numbers_are_errors(path, value):
     assert_rejected(data, path[-1])
 
 
+@pytest.mark.parametrize("key,value", [
+    ("temp", float("nan")),
+    ("top_p", float("inf")),
+    ("repeat_penalty", float("-inf")),
+])
+def test_non_finite_sampling_values_are_errors(key, value):
+    # TOML spells these nan/inf; rendered they become "--temp nan".
+    data = valid()
+    data["slots"]["main"]["sampling"][key] = value
+    assert_rejected(data, key)
+
+
 def test_integer_sampling_values_are_accepted_for_floats():
     data = valid()
     data["slots"]["main"]["sampling"]["temp"] = 1
@@ -269,6 +281,18 @@ def test_flag_tokens_that_could_inject_into_the_env_file_are_rejected(flags):
     data = valid()
     data["slots"]["main"]["flags"] = flags
     assert_rejected(data, "flags")
+
+
+@pytest.mark.parametrize("token", ["--x\x00y", "--x\x1by", "--x\x7fy"],
+                         ids=["nul", "esc", "del"])
+def test_control_characters_are_rejected_in_flags_and_env_values(token):
+    # TOML's \uXXXX escapes can smuggle these into a string.
+    data = valid()
+    data["slots"]["main"]["flags"] = [token]
+    assert_rejected(data, "flags")
+    data = valid()
+    data["slots"]["main"]["env"] = {"GGML_SOMETHING": token}
+    assert_rejected(data, "GGML_SOMETHING")
 
 
 def test_flags_must_be_a_list():
@@ -421,6 +445,18 @@ def test_names_that_collide_case_insensitively_are_both_errors(dirs):
         pytest.skip("case-insensitive filesystem")
     assert ps.profiles == {}
     assert set(ps.errors) == {"Model-Q4", "model-q4"}
+
+
+def test_three_names_that_collide_are_all_errors(dirs):
+    from manager.profiles import load_profiles
+    profiles, models = dirs
+    for stem in ("Model-Q4", "model-q4", "MODEL-Q4"):
+        write(profiles, models, stem)
+    if len(list(profiles.glob("*.toml"))) < 3:
+        pytest.skip("case-insensitive filesystem")
+    ps = load_profiles(str(profiles), SLOTS, str(models))
+    assert ps.profiles == {}
+    assert set(ps.errors) == {"Model-Q4", "model-q4", "MODEL-Q4"}
 
 
 def test_profile_set_lookup_and_rosters(dirs):

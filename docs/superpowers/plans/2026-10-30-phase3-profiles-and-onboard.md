@@ -142,7 +142,7 @@ llama_cpp_commit = "057494f93"
 - **Allowed keys:** top-level keys are exactly `home` and `slots`. Section keys are a subset of `ctx_size, n_gpu_layers, flags, sampling, env, verified`. An unknown key anywhere is an error; this is the typo guard.
 - **`home`** must name a section. Every section name must be in `slot_names`, and there must be at least one section.
 - **Integers:** `ctx_size` is an int above 0, `n_gpu_layers` an int of at least -1, and `top_k` an int of at least 0. Other sampling values are int or float. **`bool` is never accepted where a number is expected.**
-- **Tokens and values:** every flag token and env value is a non-empty str with no whitespace and none of `"'\$` or backtick. Env keys match `[A-Z_][A-Z0-9_]*` and aren't reserved.
+- **Tokens and values:** every flag token and env value is a non-empty str with no whitespace, no control character, and none of these: double quote, single quote, backslash, `$`, backtick. Sampling values must be finite (TOML allows `nan` and `inf`). Env keys match `[A-Z_][A-Z0-9_]*` and aren't reserved.
 - **`verified`**, when present, has exactly `date` (`YYYY-MM-DD` str), `llama_cpp_build` (int) and `llama_cpp_commit` (str).
 
 - [ ] **Step 1:** Run `tests/test_profiles.py`. Expected: everything fails, because `manager.profiles` doesn't exist yet.

@@ -20,6 +20,7 @@ files, and load_profiles never raises.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import tomllib
@@ -67,7 +68,7 @@ _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 #: Characters that would inject extra arguments or extra env lines into the
 #: generated file: whitespace splits tokens, quotes and '$' escape, backtick
-#: and backslash start expansions.
+#: and backslash start expansions. Control characters are rejected too.
 _FORBIDDEN = frozenset('"\'\\$`')
 
 
@@ -142,7 +143,7 @@ class ProfileSet:
 
 def _bad_char(token: str) -> str | None:
     for ch in token:
-        if ch.isspace() or ch in _FORBIDDEN:
+        if ch.isspace() or not ch.isprintable() or ch in _FORBIDDEN:
             return ch
     return None
 
@@ -240,6 +241,8 @@ def _parse_section(name: str, slot: str, slot_names: Collection[str], body: obje
             raise ProfileError(f"{where}.sampling.{key} must be a number, not a boolean")
         if not isinstance(value, (int, float)):
             raise ProfileError(f"{where}.sampling.{key} must be a number, got {value!r}")
+        if not math.isfinite(value):
+            raise ProfileError(f"{where}.sampling.{key} must be finite, got {value!r}")
         if key == "top_k":
             if not isinstance(value, int):
                 raise ProfileError(f"{where}.sampling.top_k must be an integer, got {value!r}")
@@ -344,6 +347,7 @@ def load_profiles(profiles_dir: str, slot_names: Collection[str], models_dir: st
     errors[profiles_dir]."""
     profiles: dict[str, Profile] = {}
     errors: dict[str, str] = {}
+    collided: dict[str, str] = {}  # match_key -> first stem seen
     pdir = Path(profiles_dir)
     if not pdir.is_dir():
         errors[str(profiles_dir)] = f"profiles directory {profiles_dir} does not exist"
@@ -361,8 +365,13 @@ def load_profiles(profiles_dir: str, slot_names: Collection[str], models_dir: st
         if key is None:
             errors[file.stem] = f"invalid profile name {profile.name!r}"
             continue
+        if key in collided:
+            errors[file.stem] = (
+                f"{file.stem} collides with {collided[key]!r} under case-insensitive matching")
+            continue
         if key in profiles:
             first = profiles.pop(key)
+            collided[key] = first.name
             errors[first.name] = (
                 f"{first.name} collides with {file.stem!r} under case-insensitive matching")
             errors[file.stem] = (

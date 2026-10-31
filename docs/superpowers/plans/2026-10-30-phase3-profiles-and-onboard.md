@@ -269,7 +269,7 @@ llama_cpp_commit = "057494f93"
 ### Task 5: Deploy ships profiles; doctor checks the new layout
 
 **Files:** Modify `scripts/deploy-manager.sh`, `scripts/doctor.sh`, `scripts/setup.sh` and `config/manager.env`.
-- In `config/manager.env`: drop `SLOT_*_MODELS`, and add `PROFILES_DIR=/etc/llama/models.d` and `MODEL_ENV_DIR=/var/lib/llama-manager`. Also fix its comment at line 15, which still says the manager updates `MODEL_PATH` in the slot env file during swaps (found in the Task 2 review).
+- In `config/manager.env`: drop `SLOT_*_MODELS` together with the "Home slot per model" comment above them (it cites `routing.home_slot`, deleted in Task 3), and add `PROFILES_DIR=/etc/llama/models.d` and `MODEL_ENV_DIR=/var/lib/llama-manager`. Also fix its comment at line 15, which still says the manager updates `MODEL_PATH` in the slot env file during swaps (found in the Task 2 review).
 - Tests, committed by Claude: additions to `tests/test_deploy_script.py` and `tests/test_doctor.py`.
 
 **Interfaces:**
@@ -294,6 +294,7 @@ llama_cpp_commit = "057494f93"
 **Files:**
 - Create `config/models/Qwen3.8-27B-UD-Q6_K.toml`, `config/models/Qwen3.6-35B-A3B-UD-IQ4_NL_XL.toml` and `config/models/gemma-4-26b-a4b-it-q4_k_m.toml`.
 - Update the `README.md` sections on swapping and configuration, and `manager/README.md`. The Task 2 review found stale `MODEL_PATH`/`SAMPLING_ARGS`/`CTX_SIZE`/`N_GPU_LAYERS` and regex-rewrite text around `README.md` lines 340–366, 571, 580 and 661; grep both files for those names rather than trusting the line numbers.
+- Task 3 changed the API, and `README.md` still describes the old one (found in the Task 3 review; grep for `SLOT_<NAME>_MODELS`, `no_home_slot` and `GGUF`): untargeted `/swap` goes to the profile's `home`; the `trial` field; the errors `invalid_trial`, `model_not_found` (no profile, not "no GGUF"), `slot_not_allowed` and `not_verified`; a trial reloads even a loaded model; `/v1/models` lists only onboarded profiles with `home_slot`, `verified_slots` and `loaded_on`; `/status` `slots.<name>.models` comes from the profiles, plus the top-level `profile_errors`. Drop the `SLOT_<NAME>_MODELS` row from the configuration table.
 - Tests: `tests/test_bootstrap_profiles.py`, committed by Claude. Each profile validates and renders the values below.
 
 Values come from the **live** sidecars and env files, read 2026-10-30. Wherever a sidecar was silent, the value is llama.cpp b11136's default. None of the profiles has a `verified` table; `onboard` adds it.

@@ -36,10 +36,11 @@ from manager import retrieval
 from manager.config import ManagerConfig
 from manager.gpu import get_gpu_info_async
 from manager.names import display_name, match_key, same_model
+from manager.profiles import load_profiles, render_model_env
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
-from manager.swap import ModelSwapper, sampling_args_for_model
+from manager.swap import ModelSwapper
 from manager.routing import home_slot, resolve_slot
 
 if TYPE_CHECKING:
@@ -81,12 +82,22 @@ class ServerState:
                 env_file=sc.env_file,
                 systemd_unit=sc.systemd_unit,
                 queue=RequestQueue(max_size=sc.queue_limit),
+                model_env_file=sc.model_env_file,
             )
 
         # One swapper per slot. Attach dynamically to avoid circular import
         # (SlotState does not reference ModelSwapper).
         for slot in self.slots.values():
             slot.swapper = ModelSwapper(config, slot=slot)
+
+        # Per-model profiles: the roster a swap renders from (Q29, Q32).
+        # load_profiles never raises -- a bad file goes into
+        # self.profiles.errors and is logged at ERROR, not fatal: one bad
+        # profile must not take inference down.
+        self.profiles = load_profiles(
+            config.profiles_dir, [sc.name for sc in config.slots], config.models_dir)
+        for error in self.profiles.errors.values():
+            logger.error("profiles: %s", error)
 
         # Collection retrieval (unchanged).
         self.db: VectorDB | None = None
@@ -284,35 +295,46 @@ class ServerState:
     async def ensure_model_on_slot(self, slot_name: str, model_name: str) -> bool:
         """Ensure model_name is loaded on the named slot.
 
-        Holds the slot's swap_lock for the duration. On failure, drains
-        the slot's queue with an error.
+        Holds the slot's swap_lock for the duration. The model's profile
+        section for the slot is rendered into the slot's generated model
+        env file, so no flag can carry over from the previous model. On
+        failure, drains the slot's queue with an error.
         """
         slot = self.slots[slot_name]
         async with slot.swap_lock:
             if slot.healthy and same_model(model_name, slot.loaded_model):
                 return True
 
-            path = self.model_path(model_name)
-            if path is None:
-                msg = f"Model file not found: {model_name}"
+            profile = self.profiles.get(model_name)
+            if profile is None:
+                msg = (f"No profile for model {model_name} in "
+                       f"{self._config.profiles_dir}; add a <name>.toml there")
                 slot.mark_unhealthy()
                 self._drain_slot_queue_with_error(slot_name, msg)
                 return False
 
-            sampling_args = sampling_args_for_model(path)
-            logger.info("slot=%s swapping to %s", slot_name, model_name)
+            section = profile.section(slot_name)
+            if section is None:
+                msg = (f"Model {profile.name} has no [slots.{slot_name}] section; "
+                       f"it may run on: {', '.join(profile.sections)}")
+                slot.mark_unhealthy()
+                self._drain_slot_queue_with_error(slot_name, msg)
+                return False
+
+            logger.info("slot=%s swapping to %s", slot_name, profile.name)
             msg: str | None = None
             try:
-                success = await slot.swapper.swap_to(path, sampling_args)
+                env_text = render_model_env(profile, section, self._config.models_dir)
+                success = await slot.swapper.swap_to(profile.name, env_text)
             except Exception as exc:
                 # A raising swap is a failed swap, not a crash: the same
                 # failure tail as the timeout case (unhealthy, drained
                 # queue, False) so no caller ever sees an exception here.
-                logger.exception("slot=%s swap to %s raised", slot_name, model_name)
+                logger.exception("slot=%s swap to %s raised", slot_name, profile.name)
                 success = False
-                msg = f"Model swap failed on slot {slot_name}: {model_name}: {exc}"
+                msg = f"Model swap failed on slot {slot_name}: {profile.name}: {exc}"
             if success:
-                slot.mark_swapped(display_name(path))   # store the real on-disk stem
+                slot.mark_swapped(profile.name)
                 return True
 
             if msg is None:

@@ -5,9 +5,11 @@
 # Runs llama-server as the _llama user, bound to localhost only.
 # The model manager proxy is the only thing that talks to this service.
 #
-# Configuration is in /etc/llama/llama-server.env. The model manager
-# updates MODEL_PATH in that file when swapping models, then restarts
-# this service via sudo systemctl restart.
+# Configuration is in /etc/llama/llama-server.env, plus one generated file
+# per model: /var/lib/llama-manager/main.env. The model manager rewrites
+# the generated file from the model's profile on every swap (the whole
+# MODEL_ARGS line: model path, context, GPU layers, sampling, flags), then
+# restarts this service via sudo systemctl restart.
 #
 # Install: sudo cp systemd/llama-server.service /etc/systemd/system/
 #          sudo systemctl daemon-reload && sudo systemctl enable llama-server
@@ -43,20 +45,22 @@ Group=_llama
 # that value is obtained and why an ordinal is not sufficient.
 Environment=DEVICE=CUDA0
 
+# The generated model env file: the manager renders this slot's section of
+# the current model's profile into it on every swap, so every model-specific
+# setting lives in one place and is rewritten whole -- nothing can carry over
+# from the previous model. Loaded BEFORE the static env file below, so a
+# stray HOST/PORT/DEVICE in it can never move the server: the static file's
+# values win.
+EnvironmentFile=/var/lib/llama-manager/main.env
+
 # Load runtime configuration. GGML_CUDA_DISABLE_GRAPHS=1 (workaround for a
 # CUDA-graph-cache host-RAM leak, llama.cpp issue #20315) lives in that env
 # file rather than here, so it's visible alongside the other tuning knobs.
 EnvironmentFile=/etc/llama/llama-server.env
 
-# Start llama-server with config from env file.
+# Start llama-server with config from the env files.
 # --host/--port: localhost only (manager handles external access)
-# --model: GGUF file path (updated by manager during swaps)
 # --device: explicit CUDA device selector (fail-loud; no silent iGPU fallback)
-# --n-gpu-layers: GPU offload (-1 = auto/all)
-# --ctx-size: context window in tokens
-# --ctx-checkpoints: cap GPU-side context-checkpoint accumulation (default 32 is
-#   too high for this card — see ggml-org/llama.cpp#23181, --cache-ram 0 does not
-#   disable checkpoint creation, and unbounded growth can OOM the P40's VRAM).
 # --parallel: explicit slot count. NOTE it DIVIDES the context: --ctx-size is
 #   the total, split evenly across slots, so --parallel 2 halves what any single
 #   conversation can use. Verified on b11136: --ctx-size 8192 --parallel 2 gives
@@ -71,32 +75,24 @@ EnvironmentFile=/etc/llama/llama-server.env
 #   this service (2026-07-04). Disabling it drops idle host RAM ~9.7GB -> ~250MB
 #   and makes memory grow-under-load / release-on-idle instead of leaking.
 #   Trade-off: no cross-conversation prompt reuse (minor prefill cost).
-# --jinja: enable Jinja2 chat-template parsing (required for tool-calling).
-# $SAMPLING_ARGS: sampling flags, supplied by the env file. Deliberately NOT
-#   hardcoded here: this is the SWAPPABLE slot -- the manager rewrites
-#   MODEL_PATH in the env file on every /swap -- so sampling tuned for one
-#   model must travel with the model, not with the service definition. A
-#   hardcoded "--temp 0.2" set for gemma-4-26b outlived it and was silently
-#   applied to Qwen3.8-27B, which asks for 1.0.
+# $MODEL_ARGS: the whole per-model argument list, rendered by the manager from
+#   the model's profile on every swap. Deliberately NOT hardcoded here: the
+#   model-specific settings must travel with the model, not with the service
+#   definition. A hardcoded "--temp 0.2" set for gemma-4-26b outlived it and
+#   was silently applied to Qwen3.8-27B, which asks for 1.0.
 #
 #   IT MUST STAY UNBRACED. systemd word-splits $VAR but NOT ${VAR}: the braced
 #   form passes the whole string as ONE argument and llama-server rejects it.
 #   Verified on this host:
 #     $SA   -> [--temp] [1.0] [--top-k] [20]
 #     ${SA} -> [--temp 1.0 --top-k 20]        (single arg, wrong)
-#   Empty or unset expands to no arguments at all, which is the safe default.
 ExecStart=/opt/llama/bin/llama-server \
     --host ${HOST} \
     --port ${PORT} \
-    --model ${MODEL_PATH} \
     --device ${DEVICE} \
-    --n-gpu-layers ${N_GPU_LAYERS} \
-    --ctx-size ${CTX_SIZE} \
-    --ctx-checkpoints 4 \
     --parallel 1 \
     --cache-ram 0 \
-    --jinja \
-    $SAMPLING_ARGS
+    $MODEL_ARGS
 
 # Auto-restart on crash with delay to prevent loops.
 Restart=on-failure

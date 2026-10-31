@@ -65,6 +65,7 @@ class SlotConfig:
     queue_limit: int
     device: str | None = None
     models: tuple[str, ...] = ()   # models whose home is this slot (SLOT_<NAME>_MODELS)
+    model_env_file: str | None = None   # generated model env file the swap rewrites
 
 
 def _lookup(getenv, name: str, field: str, default):
@@ -149,6 +150,7 @@ def build_slots(getenv=os.getenv) -> tuple[SlotConfig, ...]:
             queue_limit=_as_int(ql_raw, ql_src),
             device=getenv(f"SLOT_{name.upper()}_DEVICE"),
             models=_parse_models(getenv(f"SLOT_{name.upper()}_MODELS")),
+            model_env_file=f"{getenv('MODEL_ENV_DIR') or '/var/lib/llama-manager'}/{name}.env",
         ))
     _check_one_home_per_model(slots)
     return tuple(slots)

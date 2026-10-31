@@ -210,6 +210,22 @@ def test_an_unverified_pair_is_refused_without_trial(roster, trial_field):
     assert swaps == []
 
 
+def test_refusals_name_the_profile_not_the_request(roster):
+    """The not_verified hint is a command to paste, and onboard opens
+    config/models/<name>.toml by its exact name, so a case-variant request
+    must still get the profile's own name back."""
+    client, swaps = roster
+    r = client.post("/swap", json={"model": "home-egpu-q4.gguf", "target": "main"})
+    assert (r.status_code, _error(r)) == (400, "not_verified")
+    msg = r.json()["error"]["message"]
+    assert msg.startswith("model 'Home-Egpu-Q4' is not verified on slot 'main'"), msg
+    assert "scripts/onboard.py Home-Egpu-Q4 --slot main" in msg
+    r = client.post("/swap", json={"model": "unverified-q4", "target": "egpu"})
+    assert (r.status_code, _error(r)) == (400, "slot_not_allowed")
+    assert "model 'Unverified-Q4' has no [slots.egpu] section" in r.json()["error"]["message"]
+    assert swaps == []
+
+
 def test_an_untargeted_swap_to_an_unverified_home_is_refused(roster):
     client, swaps = roster
     r = client.post("/swap", json={"model": "Unverified-Q4"})

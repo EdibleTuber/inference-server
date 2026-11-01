@@ -296,7 +296,9 @@ def test_mark_swapped_sets_all_three_fields():
 
 
 def test_to_status_dict_shape():
-    """to_status_dict returns exactly the 8 keys expected by the /status endpoint."""
+    """to_status_dict keeps every key the /status endpoint has always had.
+
+    Responses may only gain fields; tests/test_slot_status.py pins the full set."""
     slot = _make_slot(name="egpu", port=18083)
     slot.loaded_model = "some-model"
     slot.healthy = True
@@ -304,7 +306,7 @@ def test_to_status_dict_shape():
 
     status = slot.to_status_dict()
 
-    assert set(status.keys()) == {
+    assert set(status.keys()) >= {
         "host", "port", "loaded_model", "healthy", "swapping",
         "last_swap_utc", "queue_depth", "queue_limit",
     }

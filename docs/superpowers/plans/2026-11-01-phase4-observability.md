@@ -200,6 +200,25 @@ Each item names the task whose tests pin it:
 - `test_last_error_is_set_by_slot_faults[backend_5xx|upstream_timeout|proxy_error|swap_failed|swap_raised|probe_failed]` and `test_last_error_is_not_set_by_client_faults[backend_4xx|queue_full|model_not_loaded|client_disconnected]`.
 - `test_status_keeps_every_existing_key`: every key from before this phase is present, with its old meaning.
 
+**Pinned by the committed tests** (added 2026-11-01, after validating them against a scratch reference and hand mutants):
+- **Time:** `manager/queue.py` and `manager/slots.py` each `import time` and call `time.monotonic()`. The tests replace each module's `time` attribute, so `from time import monotonic` would escape the clock.
+- **Queue stamps:** a refused enqueue (queue full) leaves no stamp. `drain()` clears them all.
+- **In flight:**
+  - `in_flight_count` is an int property.
+  - `oldest_in_flight_seconds(now)` measures the oldest entry.
+  - The request is already in flight when the backend is called: the backend sees `in_flight_count == 1`.
+  - A consumer cancelled mid-call still ends the request, so the end must sit in a `finally`, not an `except Exception`.
+  - A streamed request whose backend answers 5xx is not relayed, so the consumer ends it.
+- **`last_error` codes:**
+  - The slot faults are `backend_error` (stream or not), `upstream_timeout`, `proxy_error`, `queue_error` (the consumer's per-item catch), `swap_failed` (a swap that returns False or raises) and `probe_failed`. The `probe_failed` test uses a connect error.
+  - A swap refused for lack of a profile is not a fault.
+  - A later success never clears `last_error`.
+- **Keys:** `to_status_dict()` returns exactly the old keys plus the five new ones. Claude changed the exact-key-set asserts in `tests/test_endpoints.py::test_status_endpoint_has_slots` and `tests/test_slots.py::test_to_status_dict_shape` to "at least the old keys", since responses may only gain fields.
+- **Not pinned, use judgement:**
+  - Which other `probe` failure branches record `probe_failed`. Every branch that sets `healthy = False` is the obvious reading.
+  - What id an item with no record is counted under. A generated one is fine. It must still be counted and ended.
+  - Note: `/status` reprobes every slot on each call, so a down slot's `probe_failed` `at_utc` moves forward with each poll. That's expected.
+
 - [ ] **Step 1:** Run `tests/test_slot_status.py`. Expected: it fails.
 - [ ] **Step 2:** Implement per the Interfaces block. Then update README's `/status` table, including the note that `in_flight` can reach 2 until phase 5.
 - [ ] **Step 3:** Run the full suite. Expected: everything passes.

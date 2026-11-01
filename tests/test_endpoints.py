@@ -36,7 +36,9 @@ def test_status_endpoint_has_slots(client):
 
     for slot_name in ("main", "egpu"):
         slot = data["slots"][slot_name]
-        assert set(slot.keys()) == {
+        # Responses may only gain fields (phase 4 added state, in_flight and
+        # more; tests/test_slot_status.py pins the full set).
+        assert set(slot.keys()) >= {
             "host", "port", "loaded_model", "healthy", "swapping",
             "last_swap_utc", "queue_depth", "queue_limit", "models",
         }

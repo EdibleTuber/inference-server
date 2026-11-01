@@ -1,5 +1,8 @@
 import os, re, subprocess
 from pathlib import Path
+
+import pytest
+
 from manager.slot_config import build_slots
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,3 +39,45 @@ def test_every_top_level_requirement_is_pinned_in_the_lock():
             if l.strip() and not l.startswith("#")}
     for r in reqs:
         assert name(r) in lock and "==" in lock[name(r)], r
+
+
+def test_the_template_names_the_profile_and_model_env_dirs_the_code_defaults_to(monkeypatch):
+    """manager.env spells out PROFILES_DIR and MODEL_ENV_DIR, and they are the
+    code's own defaults, so the template and an unset key agree."""
+    from manager.config import ManagerConfig
+    env = _template_env()
+    for key in ("PROFILES_DIR", "MODEL_ENV_DIR", "SLOTS"):
+        monkeypatch.delenv(key, raising=False)
+    assert env["PROFILES_DIR"] == ManagerConfig.from_env().profiles_dir
+    default_main = build_slots(getenv=lambda k: None)[0]
+    assert default_main.model_env_file == f"{env['MODEL_ENV_DIR']}/main.env"
+
+
+def test_the_template_has_no_pre_profile_settings():
+    text = (REPO / "config/manager.env").read_text()
+    assert not [k for k in _template_env() if re.fullmatch(r"SLOT_\w+_MODELS", k)]
+    # The home map's comment and the in-place MODEL_PATH rewrite are both gone.
+    assert "home_slot" not in text
+    assert "MODEL_PATH" not in text
+
+
+READMES = ("README.md", "manager/README.md")
+
+
+@pytest.mark.parametrize("readme", READMES)
+def test_the_readme_names_no_pre_profile_mechanism(readme):
+    """The home map, the regex rewrite of the slot env file, and the per-model
+    keys that file used to hold are all gone (Tasks 2 and 3). Per-model
+    settings are described as the profile's, not by those names."""
+    text = (REPO / readme).read_text(encoding="utf-8")
+    stale = re.findall(r"SLOT_(?:<NAME>|[A-Z]+)_MODELS|no_home_slot|MODEL_PATH|"
+                       r"SAMPLING_ARGS|N_GPU_LAYERS|CTX_SIZE", text)
+    assert stale == [], sorted(set(stale))
+
+
+def test_the_readme_documents_the_profile_api():
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+    for term in ("config/models/", "onboard", '"trial"', "invalid_trial", "model_not_found",
+                 "slot_not_allowed", "not_verified", "home_slot", "verified_slots",
+                 "loaded_on", "profile_errors"):
+        assert term in text, term

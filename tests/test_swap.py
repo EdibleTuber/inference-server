@@ -9,11 +9,11 @@ import subprocess
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
-from manager.swap import ModelSwapper, sampling_args_for_model
+from manager.swap import ModelSwapper
 
 
 @pytest.fixture
-def egpu_slot(tmp_path, tmp_egpu_env_file):
+def egpu_slot(tmp_path, tmp_egpu_env_file, model_env_dir):
     from manager.slots import SlotState
     from manager.queue import RequestQueue
     return SlotState(
@@ -23,11 +23,12 @@ def egpu_slot(tmp_path, tmp_egpu_env_file):
         env_file=tmp_egpu_env_file,
         systemd_unit="llama-server-egpu.service",
         queue=RequestQueue(max_size=20),
+        model_env_file=str(model_env_dir / "egpu.env"),
     )
 
 
 @pytest.fixture
-def main_slot(tmp_env_file):
+def main_slot(tmp_env_file, model_env_dir):
     from manager.slots import SlotState
     from manager.queue import RequestQueue
     return SlotState(
@@ -37,78 +38,13 @@ def main_slot(tmp_env_file):
         env_file=tmp_env_file,
         systemd_unit="llama-server.service",
         queue=RequestQueue(max_size=50),
+        model_env_file=str(model_env_dir / "main.env"),
     )
 
 
 @pytest.fixture
 def swapper(test_config, main_slot):
     return ModelSwapper(test_config, slot=main_slot)
-
-
-def test_sampling_args_for_model_reads_sidecar(tmp_path):
-    """Should read the .args sidecar when it exists."""
-    gguf = tmp_path / "MyModel.gguf"
-    gguf.touch()
-    args = tmp_path / "MyModel.args"
-    args.write_text("--temp 1.0 --spec-type draft-mtp\n")
-    assert sampling_args_for_model(str(gguf)) == "--temp 1.0 --spec-type draft-mtp"
-
-
-def test_sampling_args_for_model_returns_empty_when_no_sidecar(tmp_path):
-    """Should return empty string when no .args file exists."""
-    gguf = tmp_path / "bare-model.gguf"
-    gguf.touch()
-    assert sampling_args_for_model(str(gguf)) == ""
-
-
-def test_update_env_file(swapper, tmp_env_file):
-    """Should replace MODEL_PATH with the new model."""
-    swapper.update_env_file("/opt/llama/models/new-model.gguf")
-
-    content = Path(tmp_env_file).read_text()
-    assert "MODEL_PATH=/opt/llama/models/new-model.gguf" in content
-    assert "HOST=127.0.0.1" in content
-
-
-def test_update_env_file_overwrites_existing(swapper, tmp_env_file):
-    """If MODEL_PATH already has a value, it should be replaced."""
-    swapper.update_env_file("/opt/llama/models/old-model.gguf")
-    swapper.update_env_file("/opt/llama/models/new-model.gguf")
-
-    content = Path(tmp_env_file).read_text()
-    assert "MODEL_PATH=/opt/llama/models/new-model.gguf" in content
-    assert "old-model" not in content
-
-
-def test_update_env_file_writes_sampling_args(swapper, tmp_env_file):
-    """Should write SAMPLING_ARGS alongside MODEL_PATH."""
-    swapper.update_env_file(
-        "/opt/llama/models/new.gguf",
-        sampling_args="--temp 0.7 --spec-type draft-mtp",
-    )
-    content = Path(tmp_env_file).read_text()
-    assert "SAMPLING_ARGS=--temp 0.7 --spec-type draft-mtp" in content
-    assert "MODEL_PATH=/opt/llama/models/new.gguf" in content
-
-
-def test_update_env_file_clears_sampling_args(swapper, tmp_env_file):
-    """Swapping to a model with no .args file should clear SAMPLING_ARGS."""
-    swapper.update_env_file("/opt/llama/models/a.gguf", "--spec-type draft-mtp")
-    swapper.update_env_file("/opt/llama/models/b.gguf")
-    content = Path(tmp_env_file).read_text()
-    assert "SAMPLING_ARGS=\n" in content
-    assert "draft-mtp" not in content
-
-
-def test_update_env_file_inserts_sampling_args_when_missing(swapper, tmp_path):
-    """If env file has no SAMPLING_ARGS line, one is added after MODEL_PATH."""
-    env_file = tmp_path / "bare.env"
-    env_file.write_text("MODEL_PATH=\nHOST=127.0.0.1\n")
-    swapper._slot.env_file = str(env_file)
-
-    swapper.update_env_file("/opt/llama/models/m.gguf", "--temp 0.5")
-    content = env_file.read_text()
-    assert "MODEL_PATH=/opt/llama/models/m.gguf\nSAMPLING_ARGS=--temp 0.5\n" in content
 
 
 @pytest.mark.asyncio
@@ -197,7 +133,7 @@ async def test_wait_for_health_times_out(swapper):
 
 @pytest.mark.asyncio
 async def test_swap_to_full_sequence(swapper):
-    """swap_to should chain env update, restart, and health poll."""
+    """swap_to should chain the model env write, restart, and health poll."""
     async def fake_executor(executor, fn):
         return fn()
 
@@ -214,9 +150,10 @@ async def test_swap_to_full_sequence(swapper):
     with patch("subprocess.run", return_value=mock_result), \
          patch.object(asyncio.get_event_loop(), "run_in_executor", side_effect=fake_executor), \
          patch("httpx.AsyncClient", return_value=mock_client):
-        result = await swapper.swap_to("/opt/llama/models/test.gguf")
+        result = await swapper.swap_to("test", "MODEL_ARGS=--model /opt/llama/models/test.gguf\n")
 
     assert result is True
+    assert Path(swapper._slot.model_env_file).read_text() == "MODEL_ARGS=--model /opt/llama/models/test.gguf\n"
 
 
 @pytest.mark.asyncio
@@ -236,25 +173,24 @@ async def test_swap_to_fails_on_health_timeout(swapper):
     with patch("subprocess.run", return_value=mock_result), \
          patch.object(asyncio.get_event_loop(), "run_in_executor", side_effect=fake_executor), \
          patch("httpx.AsyncClient", return_value=mock_client):
-        result = await swapper.swap_to("/opt/llama/models/test.gguf")
+        result = await swapper.swap_to("test", "MODEL_ARGS=--model /opt/llama/models/test.gguf\n")
 
     assert result is False
 
 
-def test_swapper_for_main_writes_main_env(test_config, main_slot):
+@pytest.mark.parametrize("slot_fixture", ["main_slot", "egpu_slot"])
+@pytest.mark.asyncio
+async def test_each_swapper_writes_its_own_slots_model_env(test_config, slot_fixture, request):
+    """Each slot's swapper writes that slot's model env file and leaves its slot env file alone."""
     from manager.swap import ModelSwapper
-    swapper = ModelSwapper(test_config, slot=main_slot)
-    swapper.update_env_file("/opt/llama/models/new.gguf")
-    content = Path(main_slot.env_file).read_text()
-    assert "MODEL_PATH=/opt/llama/models/new.gguf" in content
-
-
-def test_swapper_for_egpu_writes_egpu_env(test_config, egpu_slot):
-    from manager.swap import ModelSwapper
-    swapper = ModelSwapper(test_config, slot=egpu_slot)
-    swapper.update_env_file("/opt/llama/models/other.gguf")
-    content = Path(egpu_slot.env_file).read_text()
-    assert "MODEL_PATH=/opt/llama/models/other.gguf" in content
+    slot = request.getfixturevalue(slot_fixture)
+    slot_env_before = Path(slot.env_file).read_text()
+    swapper = ModelSwapper(test_config, slot=slot)
+    with patch.object(swapper, "restart_llama_server", AsyncMock()), \
+         patch.object(swapper, "wait_for_health", AsyncMock(return_value=True)):
+        assert await swapper.swap_to("m", f"MODEL_ARGS=--model /m/{slot.name}.gguf\n") is True
+    assert Path(slot.model_env_file).read_text() == f"MODEL_ARGS=--model /m/{slot.name}.gguf\n"
+    assert Path(slot.env_file).read_text() == slot_env_before
 
 
 @pytest.mark.asyncio

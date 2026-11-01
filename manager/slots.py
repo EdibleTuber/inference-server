@@ -42,6 +42,7 @@ class SlotState:
     last_swap_utc: Optional[str] = None
     queue_event: asyncio.Event = field(default_factory=asyncio.Event)
     swap_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    model_env_file: Optional[str] = None   # generated model env file; the swap's write target
 
     @property
     def url(self) -> str:

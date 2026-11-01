@@ -175,17 +175,17 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 
 ### Switch to a different model
 
-Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, and a model with no home slot is refused with 400. The call returns **202** as soon as the swap has started — the swap itself runs in the background and takes 30 seconds to several minutes for a large cold load. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up).
+Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its profile's `home` slot (every profile names exactly one). The call returns **202** as soon as the swap has started — the swap itself runs in the background and takes 30 seconds to several minutes for a large cold load. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up).
 
 ```bash
 curl http://YOUR_LAN_IP:11434/swap \
   -H "Content-Type: application/json" \
-  -d '{"model": "llama-3-8b-instruct-q5_k_m", "target": "main"}'
-# → 202, {"slot": "main", "model": "llama-3-8b-instruct-q5_k_m", "status": "swapping"}
-#   (or 200 with "status": "ok" if the model is already loaded)
+  -d '{"model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL"}'
+# → 202, {"slot": "egpu", "model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL", "status": "swapping"}
+#   (or 200 with "status": "ok" if it is already loaded there and no trial was requested)
 ```
 
-Errors: 400 for a missing `model` or unknown `target`, 400 `no_home_slot` for an untargeted swap of a model no slot lists in `SLOT_<NAME>_MODELS`, 404 if no such GGUF exists. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error; it leaves the slot `healthy: false` in `GET /status`.
+A model may only be swapped to a slot its profile names, and only once that pair has been verified; `"trial": true` relaxes the verification for one swap. That is how `scripts/onboard.py` verifies a new pair — and a trial reloads the model even when it is already loaded, so it really exercises the load. Errors: 400 for a missing `model`, a non-boolean `trial` (`invalid_trial`) or an unknown `target`; 404 `model_not_found` if no profile exists for the model (the message names the `config/models/<model>.toml` to add); 400 `slot_not_allowed` if the profile has no section for the target slot; 400 `not_verified` if the pair is not verified and no trial was requested. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error; it leaves the slot `healthy: false` in `GET /status`.
 
 ### Anthropic Messages API
 
@@ -287,7 +287,7 @@ print(response.choices[0].message.content)
 
 ## Model Management
 
-Models are GGUF files stored in `/opt/llama/models/`. The filename (without `.gguf`) is the model name used in API requests.
+Models are GGUF files stored in `/opt/llama/models/`; the filename without `.gguf` is the model name used in API requests. The manager's roster, however, is the set of TOML profiles in `config/models/` (deployed to `/etc/llama/models.d/`): one `config/models/<model>.toml` per model, named for the GGUF's stem. A GGUF on disk without a profile is invisible to the manager. A profile carries the model's `ctx_size`, `n_gpu_layers`, sampling values, extra `flags`, and the slots it may run on.
 
 ### Download a model
 
@@ -299,13 +299,21 @@ Models are GGUF files stored in `/opt/llama/models/`. The filename (without `.gg
 
 The file keeps its upstream name, and that stem is the model name clients use. Rename it afterwards if you want a shorter one.
 
+### Add a model to the roster
+
+1. Download the GGUF (above); its stem becomes the model name.
+2. Add `config/models/<stem>.toml` — copy an existing profile and change the values. The shipped profiles' comments record what each key means and how the value was measured.
+3. Commit and deploy: `scripts/deploy-manager.sh` validates every profile and refuses to ship one that fails (exit 5).
+4. Restart the manager, which reads the profiles at startup. The model is now known but verified on no slot, so `POST /swap` refuses it until step 5.
+5. Verify it with `scripts/onboard.py <model> --slot <slot>`: a trial load on that slot, a test chat, a swap back to the previous model, and a `[slots.<slot>.verified]` block appended to the profile. Commit the block and deploy again; afterwards `/swap` accepts the pair without a trial.
+
 ### List available models
 
 ```bash
 curl http://YOUR_LAN_IP:11434/v1/models
 ```
 
-New models are available immediately after download — no service restart needed. The manager scans the directory on every request to `/v1/models`.
+`GET /v1/models` lists the onboarded profiles — the models with at least one verified (model, slot) pair — in OpenAI-compatible format, with `home_slot`, `verified_slots` and `loaded_on` (the slots whose `loaded_model` matches) alongside the standard fields. It does not scan the models directory: a profile appears only after `scripts/onboard.py` has verified it on at least one slot, and the profiles are read once at manager startup, so a new or edited profile needs a deploy and a manager restart to show up.
 
 ### Manual download
 
@@ -337,23 +345,48 @@ returns **409**; load it first via `POST /swap`.
 
 ### `/etc/llama/llama-server.env`
 
-Configuration for the llama-server inference backend. **The manager updates `MODEL_PATH` automatically** during model swaps — do not edit this file while the services are running.
+Static configuration for the `main` slot's llama-server backend. Model-specific settings do not live here: on every swap the manager renders the current model's profile into the generated model env file `/var/lib/llama-manager/main.env` (the whole `MODEL_ARGS` line), which the slot's unit loads **before** this file, so the generated file wins any conflict. The manager never writes this file, so it is safe to edit while the service is running (a restart applies the change).
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL_PATH` | _(empty)_ | Absolute path to the currently loaded GGUF file. Leave empty on first boot; the manager sets it on the first request. |
 | `DEVICE` | `CUDA0` | `--device` selector passed to llama-server. Names an enumeration position, not a physical card — unambiguous only in combination with `CUDA_VISIBLE_DEVICES` below. |
 | `CUDA_VISIBLE_DEVICES` | _(host-specific, no safe default)_ | Restricts this process to exactly one physical GPU by UUID (`GPU-<uuid>`), so `DEVICE=CUDA0` above always names the same card regardless of enumeration order. Get the UUID with `nvidia-smi --query-gpu=uuid,pci.bus_id,name --format=csv`; never use a bare ordinal (`0`) here, since that reintroduces the same enumeration-order ambiguity. See the device-pinning section of [`docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md`](docs/superpowers/specs/2026-09-23-dual-gpu-three-slot-design.md). |
-| `SAMPLING_ARGS` | _(model-specific)_ | Extra llama-server flags for the model in `MODEL_PATH` — sampling (`--temp`, `--top-p`, …) and, where the GGUF supports it, speculative decoding. Lives next to `MODEL_PATH` because sampling tuned for one model is wrong for the next: **change both together**. Must stay unbraced (`$SAMPLING_ARGS`) in the unit's `ExecStart` so systemd word-splits it. Empty means llama.cpp's own defaults. |
-| `N_GPU_LAYERS` | `-1` | Number of model layers to offload to GPU. `-1` = all. Note that llama.cpp's load-time auto-fit can still move MoE expert tensors to system RAM while reporting every layer offloaded; check `nvidia-smi` after a start (see the comment in `config/llama-server-egpu.env`). |
 | `GGML_CUDA_DISABLE_GRAPHS` | `1` | Works around a CUDA-graph memory leak; see the comment in `config/llama-server.env`. |
-| `CTX_SIZE` | _(measured per model)_ | Context window size in tokens. Larger values use more VRAM. Derive this from the `llama_kv_cache` line in llama-server's own log (raise `-lv` until the line appears) after loading the target model — see the comments in `config/llama-server.env` — rather than guessing from a projection. Re-derive after any model change. |
 | `HOST` | `127.0.0.1` | Bind address for llama-server. Always localhost — never expose directly. |
 | `PORT` | `8081` | Port for llama-server. The manager connects here. |
 
+### `config/models/` (the profiles)
+
+One TOML profile per model, named for the GGUF's stem: `config/models/<model>.toml`, deployed to `/etc/llama/models.d/`. The profiles are the model roster: the manager reads them at startup, validates them, and renders the target slot's section into the generated model env file on every swap. A profile that fails validation is left out of the roster, logged at ERROR, and reported in `GET /status`'s top-level `profile_errors`.
+
+```toml
+home = "main"                    # required; the slot an untargeted /swap uses
+
+[slots.main]                     # one section per slot this model may run on
+ctx_size = 131072                # required, int > 0
+n_gpu_layers = -1                # required, int >= -1 (-1 = all)
+flags = ["--jinja", ...]         # optional; one token per list item, in order
+
+[slots.main.sampling]            # required; exactly these seven keys
+temp = 1.0
+top_k = 20
+top_p = 0.95
+min_p = 0.0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repeat_penalty = 1.0
+
+[slots.main.verified]            # added by scripts/onboard.py after a trial load
+date = "2026-11-01"
+llama_cpp_build = 11136
+llama_cpp_commit = "057494f93"
+```
+
+Every key of `[slots.<slot>]` renders into the `MODEL_ARGS` line of the generated file, so a flag the profile does not mention is absent — never inherited from the previous model. A `flags` item may not repeat a flag the slot or the renderer sets itself (device, context, GPU layers, sampling), and an optional `[slots.<slot>.env]` table may not name `HOST`, `PORT`, `DEVICE`, `CUDA_VISIBLE_DEVICES`, `MODEL_ARGS` or any `LLAMA_ARG_*` variable. The shipped profiles under `config/models/` are worked examples — their comments record how each value was measured.
+
 ### `/etc/llama/llama-server-egpu.env`
 
-Configuration for the `egpu` slot's llama-server backend (Tesla P40). Same variables and semantics as `/etc/llama/llama-server.env` above, with `PORT=8084` and `CUDA_VISIBLE_DEVICES` set to the P40's UUID. See `config/llama-server-egpu.env` for the current model choice and how its `CTX_SIZE` was measured.
+Configuration for the `egpu` slot's llama-server backend (Tesla P40). Same variables and semantics as `/etc/llama/llama-server.env` above, with `PORT=8084` and `CUDA_VISIBLE_DEVICES` set to the P40's UUID. See `config/llama-server-egpu.env` for the device pinning; the model choice and how its `ctx_size` was measured live in the model's profile under `config/models/`.
 
 ### `/etc/llama/manager.env`
 
@@ -363,8 +396,10 @@ Configuration for the model manager proxy service. The **Default** column is wha
 |---|---|---|
 | `HOST` | `0.0.0.0` | Bind address for the manager. Set to your LAN IP to restrict access, or `0.0.0.0` for all interfaces. |
 | `PORT` | `8080` | Port the manager listens on. The template sets `11434`, which is what every example in this README assumes. |
-| `LLAMA_SERVER_HOST` / `LLAMA_SERVER_PORT` / `LLAMA_SERVER_ENV` / `LLAMA_SERVER_UNIT` | `127.0.0.1` / `8081` / `/etc/llama/llama-server.env` / `llama-server.service` | The `main` slot's backend address, env file (the manager writes `MODEL_PATH` here during swaps) and systemd unit. |
+| `LLAMA_SERVER_HOST` / `LLAMA_SERVER_PORT` / `LLAMA_SERVER_ENV` / `LLAMA_SERVER_UNIT` | `127.0.0.1` / `8081` / `/etc/llama/llama-server.env` / `llama-server.service` | The `main` slot's backend address, static env file (the manager never writes it — per-model settings go to the generated model env file) and systemd unit. |
 | `MODELS_DIR` | `/opt/llama/models` | Directory containing GGUF model files. |
+| `PROFILES_DIR` | `/etc/llama/models.d` | Directory holding the per-model TOML profiles (the roster). `setup.sh` and `deploy-manager.sh` install `config/models/*.toml` here. |
+| `MODEL_ENV_DIR` | `/var/lib/llama-manager` | Directory holding the generated per-slot model env files (`<slot>.env`), rewritten by the manager on every swap and loaded by the slot's unit before its static env file. Owned by `_llama-mgr`. |
 | `QUEUE_LIMIT` | `20` | Maximum requests held in the `main` slot's FIFO queue (template: `50`). Requests beyond this get a 503. |
 | `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
 | `RESTART_TIMEOUT` | `150` | Upper bound, in seconds, on a `systemctl restart` of a slot's unit during a swap. Both slot units have `TimeoutStopUSec=1min 30s`, so a restart can legitimately take ~90s before the new process starts; 150s covers that. Exceeding it fails the swap. |
@@ -375,7 +410,6 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
 | `SLOTS` | `main` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,egpu`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
 | `SLOT_<NAME>_HOST` / `_PORT` / `_ENV` / `_UNIT` / `_QUEUE_LIMIT` / `_DEVICE` | `127.0.0.1` / _(required)_ / `/etc/llama/llama-server-<name>.env` / `llama-server-<name>.service` / `20` / _(unset)_ | Per-slot configuration, read by `manager/slot_config.py`. For `main` a `SLOT_*` variable overrides the legacy `LLAMA_SERVER_*` name; any other slot (e.g. `egpu`) must set at least `SLOT_<NAME>_PORT` or the manager refuses to start. The template sets `SLOT_EGPU_PORT=8084`. `SLOT_EGPU_DEVICE` mirrors the P40's UUID from `CUDA_VISIBLE_DEVICES` in `llama-server-egpu.env`; `_DEVICE` is not yet read by any code. |
-| `SLOT_<NAME>_MODELS` | _(unset)_ | Comma-separated models whose home is this slot. An untargeted `POST /swap` loads a model onto its home slot; a model listed on no slot is refused with 400 instead of landing on the first slot. A model may appear in only one slot's list, or the manager refuses to start. The template sets `SLOT_MAIN_MODELS` and `SLOT_EGPU_MODELS`. |
 
 ---
 
@@ -385,12 +419,12 @@ All endpoints are on `LAN_IP:11434`.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | OpenAI chat completions. Routes by the `model` field to the slot that has it loaded and queues there. 404 if no such GGUF, 409 if it is not loaded on any slot. Supports streaming (`"stream": true`). |
+| `POST` | `/v1/chat/completions` | OpenAI chat completions. Routes by the `model` field to the slot that has it loaded and queues there. 404 if no profile exists for the model, 409 if no slot has it loaded. Supports streaming (`"stream": true`). |
 | `POST` | `/v1/messages` | Anthropic Messages API. Byte passthrough to the slot's llama-server, with the same routing, queueing and status codes as chat completions; errors use the Anthropic error envelope. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
-| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>}`; without `target`, the model goes to its home slot from `SLOT_<NAME>_MODELS`, else 400. Returns 200 if already loaded, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. |
-| `GET` | `/v1/models` | Lists available GGUF files as an OpenAI-compatible model list. |
-| `GET` | `/status` | Per-slot health, loaded model, and queue depth; GPU VRAM usage; uptime. Re-probes every slot before answering. |
+| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>, "trial": <bool>}`; `target` defaults to the profile's home slot, and the pair must be verified unless `"trial"` is true (a trial reloads even a loaded model). Returns 200 if already loaded and no trial was requested, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. Errors: `invalid_trial`, 404 `model_not_found` (no profile), `invalid_target`, `slot_not_allowed`, `not_verified`. |
+| `GET` | `/v1/models` | Lists the onboarded profiles — models with at least one verified (model, slot) pair — as an OpenAI-compatible model list, each entry with `home_slot`, `verified_slots` and `loaded_on`. |
+| `GET` | `/status` | Per-slot health, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |
@@ -405,7 +439,7 @@ There is no single top-level readiness flag. Each entry under `/status`'s `slots
 
 - `healthy` (bool) — set from the outcome of the slot's most recent probe or swap attempt: `true` after a successful probe or swap, `false` at startup or after a failed one (backend unreachable, bad response, model file not found, or swap timeout). It is not updated while a swap is in progress — a slot that was healthy before a swap started still reports `healthy: true` until that swap resolves.
 - `loaded_model` — the model currently loaded on that slot, or `null` if none has loaded successfully yet. It generally lags behind a swap in progress, and is only cleared to `null` when a probe explicitly reports nothing loaded.
-- `models` — the slot's `SLOT_<NAME>_MODELS` list as configured (empty if unset): the models an untargeted `/swap` sends to this slot.
+- `models` — the models whose profile names this slot as `home` (empty if none): the models an untargeted `/swap` sends to this slot. It comes from the profiles, not from any per-slot setting.
 
 A chat request for a model that isn't loaded on any slot returns **409** rather than triggering an implicit swap; load it first via `POST /swap`. A request already queued when its model is swapped out gets the same 409, never a swap.
 
@@ -565,10 +599,10 @@ sudo systemctl enable llama-server llama-server-egpu llama-embeddings llama-mana
 ### Boot sequence
 
 1. System boots, NVIDIA drivers load
-2. Each slot unit starts with the model named in its `/etc/llama/llama-server*.env`
+2. Each slot unit starts with the model in its generated model env file (`/var/lib/llama-manager/<slot>.env`), the profile rendering the last swap left there
 3. `llama-manager.service` starts (`After=llama-server.service`), probes every slot in `SLOTS`, and begins accepting requests
 
-If a slot's `MODEL_PATH` is empty or points to a nonexistent file on boot, that llama-server fails to start. The slot reports `"healthy": false` (with `"loaded_model": null`) in `/status`, and requests for it get 409 until you load a model with `POST /swap`.
+If a slot's generated model env file is missing on boot, or names a GGUF that is not on disk, that llama-server fails to start. The slot reports `"healthy": false` (with `"loaded_model": null`) in `/status`, and requests for it get 409 until you load a model with `POST /swap`.
 
 ### Adding the egpu slot
 
@@ -577,10 +611,22 @@ If a slot's `MODEL_PATH` is empty or points to a nonexistent file on boot, that 
 ```bash
 sudo cp systemd/llama-server-egpu.service /etc/systemd/system/
 sudo cp config/llama-server-egpu.env /etc/llama/llama-server-egpu.env
-sudo chown _llama-mgr:_llama-mgr /etc/llama/llama-server-egpu.env   # the manager rewrites MODEL_PATH on swap
+# The unit loads its generated model env file (an EnvironmentFile= without a
+# leading "-") before its static env file and refuses to start without it,
+# so render the first one from the model's profile. The manager must be
+# deployed first (deploy-manager.sh installs profiles.py to
+# /opt/llama/manager/), and outside a repo checkout PYTHONPATH=/opt/llama
+# puts the package on the path:
+PYTHONPATH=/opt/llama /opt/llama/manager/venv/bin/python -m manager.profiles render \
+  /etc/llama/models.d Qwen3.6-35B-A3B-UD-IQ4_NL_XL egpu \
+  --slots main,egpu --models-dir /opt/llama/models \
+  | sudo tee /var/lib/llama-manager/egpu.env >/dev/null
+sudo chown _llama-mgr:_llama-mgr /var/lib/llama-manager/egpu.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now llama-server-egpu
 ```
+
+The manager never writes the static env file: on every swap it renders the model's profile into the generated one, and the unit loads that first. (`setup.sh` creates `/var/lib/llama-manager` but does not render `main.env` either — the same command above, with `main`'s model and slot, produces it.)
 
 Then make sure the slot is in `SLOTS` in `/etc/llama/manager.env`, and that `/etc/sudoers.d/llama-manager` lets `_llama-mgr` restart that unit — `manager/swap.py` runs `sudo systemctl restart <unit>` for whichever slot it swaps. `setup.sh` writes the entries for `llama-server.service` and `llama-server-egpu.service`; any further slot's entry is added by hand with `sudo visudo -f /etc/sudoers.d/llama-manager`. For `egpu`, also set the P40's UUID in `CUDA_VISIBLE_DEVICES` (see the next section) before starting it.
 
@@ -658,9 +704,13 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 
 /etc/llama/
   ├── manager.env                   # runtime config for the model manager
-  ├── llama-server.env              # main slot   (manager rewrites MODEL_PATH on swap)
-  ├── llama-server-egpu.env         # egpu slot   (installed by hand)
+  ├── llama-server.env              # main slot, static config only
+  ├── llama-server-egpu.env         # egpu slot, static config only (installed by hand)
+  ├── models.d/                     # per-model TOML profiles (roster; from config/models/)
   └── collections.json              # collection definitions for document retrieval
+
+/var/lib/llama-manager/             # generated per-slot model env files (<slot>.env),
+                                    # rewritten by the manager on every swap; _llama-mgr, 755
 
 /var/log/llama/                     # <unit>.log / <unit>.err per service, rotated weekly
 
@@ -679,17 +729,20 @@ inference-server/
 ├── manager/                        # model manager source (deployed to /opt/llama/manager/)
 │   ├── app.py                      # FastAPI app: endpoints, proxying, per-slot queue consumers
 │   ├── config.py, slot_config.py   # env-var configuration; slot list and per-slot settings
+│   ├── profiles.py                 # profile validation + MODEL_ARGS rendering (also a CLI)
 │   ├── slots.py, routing.py        # per-slot state; model → slot resolution
 │   ├── names.py                    # model-name normalization
-│   ├── queue.py, swap.py           # FIFO queue; env rewrite + systemd restart + health poll
+│   ├── queue.py, swap.py           # FIFO queue; model env file write + restart + health poll
 │   ├── gpu.py                      # GPU info via nvidia-smi
 │   ├── embeddings.py, vectordb.py, collections.py, reindex_jobs.py   # retrieval
 │   └── README.md                   # manager component documentation
 ├── systemd/                        # unit files (copied to /etc/systemd/system/)
 ├── config/                         # config templates (copied to /etc/llama/) + logrotate
+│   └── models/                     # per-model TOML profiles (installed to /etc/llama/models.d/)
 ├── scripts/
 │   ├── setup.sh                    # first install: users, dirs, permissions, sudoers, main-slot units
-│   ├── deploy-manager.sh           # ship manager code to an existing install (--check is read-only)
+│   ├── deploy-manager.sh           # ship manager code and profiles (--check is read-only)
+│   ├── onboard.py                  # trial-load a model on a slot, then record the pass
 │   └── download-model.sh           # GGUF download helper
 ├── docs/superpowers/               # design specs and implementation plans
 └── tests/                          # manager test suite: pip install -r manager/requirements.txt, then pytest tests/

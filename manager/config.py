@@ -49,6 +49,9 @@ class ManagerConfig:
         restart_timeout: Seconds to allow a systemctl restart before it fails.
         proxy_read_timeout: Seconds a proxied request may run before the
             manager answers 504 upstream_timeout (audit F4).
+        profiles_dir: Directory of per-model TOML profiles (the roster). Each
+            swap renders its profile's section for the slot into the slot's
+            generated model env file.
     """
     host: str
     port: int
@@ -67,6 +70,7 @@ class ManagerConfig:
     slots: tuple[SlotConfig, ...] = ()
     restart_timeout: int = 150
     proxy_read_timeout: int = 1800
+    profiles_dir: str = "/etc/llama/models.d"
 
     @property
     def llama_server_url(self) -> str:
@@ -99,4 +103,5 @@ class ManagerConfig:
             slots=build_slots(),
             restart_timeout=_int_env("RESTART_TIMEOUT", 150),
             proxy_read_timeout=_int_env("PROXY_READ_TIMEOUT", 1800),
+            profiles_dir=os.getenv("PROFILES_DIR", "/etc/llama/models.d"),
         )

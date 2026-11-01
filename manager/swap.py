@@ -2,16 +2,19 @@
 Model swap orchestration for one slot.
 
 A ModelSwapper instance is bound to one backing llama-server process via
-its SlotState and operates on that slot's env file and systemd unit. Which
-slots exist is configuration; the manager instantiates one swapper per
+its SlotState and operates on that slot's generated model env file and
+systemd unit. The caller renders the model's profile section for the slot
+into env text (see manager.profiles.render_model_env); a swap writes that
+file atomically, restarts the service, and polls for health. Which slots
+exist is configuration; the manager instantiates one swapper per
 configured slot at startup.
 """
 import asyncio
-import re
-import subprocess
 import logging
+import os
+import subprocess
+import tempfile
 import time
-from pathlib import Path
 
 import httpx
 
@@ -21,17 +24,30 @@ from manager.slots import SlotState
 logger = logging.getLogger(__name__)
 
 
-def sampling_args_for_model(model_path: str) -> str:
-    """Read per-model sampling args from a sidecar .args file next to the GGUF.
+def write_model_env(path: str, text: str) -> None:
+    """Atomically publish `text` at `path` (Q32).
 
-    Returns the file contents (stripped) or empty string if no sidecar exists.
-    An empty result means llama-server will use its built-in defaults — the safe
-    fallback for any model the operator hasn't explicitly configured.
+    The content goes to a temp file in the target's own directory, is
+    flushed and fsynced, chmodded 0644, and os.replace'd over the target,
+    so readers only ever see a complete file and the target is never
+    written in place. On any error the temp file is unlinked and the
+    exception re-raised: the old file stays intact.
     """
-    args_file = Path(model_path).with_suffix(".args")
-    if args_file.is_file():
-        return args_file.read_text().strip()
-    return ""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class ModelSwapper:
@@ -40,39 +56,6 @@ class ModelSwapper:
     def __init__(self, config: ManagerConfig, slot: SlotState):
         self._config = config
         self._slot = slot
-
-    def update_env_file(self, model_path: str, sampling_args: str = "") -> None:
-        """Rewrite MODEL_PATH and SAMPLING_ARGS in the slot's env file."""
-        with open(self._slot.env_file, "r") as f:
-            content = f.read()
-
-        content = re.sub(
-            r"^MODEL_PATH=.*$",
-            f"MODEL_PATH={model_path}",
-            content,
-            flags=re.MULTILINE,
-        )
-
-        if re.search(r"^SAMPLING_ARGS=", content, flags=re.MULTILINE):
-            content = re.sub(
-                r"^SAMPLING_ARGS=.*$",
-                f"SAMPLING_ARGS={sampling_args}",
-                content,
-                flags=re.MULTILINE,
-            )
-        else:
-            content = re.sub(
-                r"^(MODEL_PATH=.*)$",
-                rf"\1\nSAMPLING_ARGS={sampling_args}",
-                content,
-                flags=re.MULTILINE,
-            )
-
-        with open(self._slot.env_file, "w") as f:
-            f.write(content)
-
-        logger.info("slot=%s updated env file MODEL_PATH=%s SAMPLING_ARGS=%s",
-                     self._slot.name, model_path, sampling_args or "(defaults)")
 
     async def restart_llama_server(self) -> None:
         """Restart the slot's systemd unit via sudo."""
@@ -128,16 +111,22 @@ class ModelSwapper:
         logger.error("slot=%s health timed out after %ds", self._slot.name, timeout)
         return False
 
-    async def swap_to(self, model_path: str, sampling_args: str = "") -> bool:
-        """Full swap sequence. Returns True on success, False on health timeout."""
-        logger.info("slot=%s starting swap to %s", self._slot.name, model_path)
-        self.update_env_file(model_path, sampling_args)
+    async def swap_to(self, model_name: str, env_text: str) -> bool:
+        """Full swap sequence. Returns True on success, False on health timeout.
+
+        Writes the slot's generated model env file, restarts the service,
+        and polls health, in that order. If the write raises, no restart
+        happens and the exception propagates: the caller
+        (ensure_model_on_slot) turns a raising swap into a failed swap.
+        """
+        logger.info("slot=%s starting swap to %s", self._slot.name, model_name)
+        write_model_env(self._slot.model_env_file, env_text)
         await self.restart_llama_server()
         healthy = await self.wait_for_health()
 
         if healthy:
-            logger.info("slot=%s swap complete: %s", self._slot.name, model_path)
+            logger.info("slot=%s swap complete: %s", self._slot.name, model_name)
         else:
-            logger.error("slot=%s swap failed (health timeout): %s", self._slot.name, model_path)
+            logger.error("slot=%s swap failed (health timeout): %s", self._slot.name, model_name)
 
         return healthy

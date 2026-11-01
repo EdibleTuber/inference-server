@@ -61,7 +61,8 @@ fi
 echo "[3/8] Creating directories..."
 
 mkdir -p /opt/llama/bin /opt/llama/models /opt/llama/manager /opt/llama/data
-mkdir -p /etc/llama
+mkdir -p /etc/llama /etc/llama/models.d
+mkdir -p /var/lib/llama-manager
 mkdir -p /var/log/llama
 
 # -- 4. Permissions --
@@ -79,6 +80,10 @@ echo "  /opt/llama/manager → _llama-mgr 755"
 chown _llama-mgr:_llama-mgr /opt/llama/data
 chmod 755 /opt/llama/data
 echo "  /opt/llama/data → _llama-mgr 755"
+
+chown _llama-mgr:_llama-mgr /var/lib/llama-manager
+chmod 755 /var/lib/llama-manager
+echo "  /var/lib/llama-manager → _llama-mgr 755"
 
 chown root:root /opt/llama/bin
 chmod 755 /opt/llama/bin
@@ -111,6 +116,15 @@ install_config() {
 install_config "$REPO_DIR/config/llama-server.env" /etc/llama/llama-server.env
 install_config "$REPO_DIR/config/manager.env" /etc/llama/manager.env
 install_config "$REPO_DIR/config/collections.json" /etc/llama/collections.json
+
+# Per-model profiles: shipped like code (replaced on every deploy by
+# deploy-manager.sh), not like the config files above (backed up, never
+# clobbered).
+for src in "$REPO_DIR/config/models"/*.toml; do
+    [ -e "$src" ] || continue
+    install -m 644 -o root -g root "$src" /etc/llama/models.d/
+    echo "  Installed profile: $(basename "$src")"
+done
 
 # -- 6. Sudoers --
 echo "[6/8] Installing sudoers entry..."

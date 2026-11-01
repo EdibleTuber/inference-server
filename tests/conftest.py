@@ -49,9 +49,44 @@ def tmp_models_dir(tmp_path):
     """Create a temporary models directory with sample GGUF files."""
     models_dir = tmp_path / "models"
     models_dir.mkdir()
-    (models_dir / "test-model-q4.gguf").touch()
-    (models_dir / "test-model-q8.gguf").touch()
+    # Non-empty: profiles.load_profile rejects a missing or empty gguf.
+    (models_dir / "test-model-q4.gguf").write_bytes(b"GGUF")
+    (models_dir / "test-model-q8.gguf").write_bytes(b"GGUF")
     return str(models_dir)
+
+
+TEST_MODELS = ("test-model-q4", "test-model-q8")
+
+
+def write_test_profiles(profiles_dir: Path, slots) -> str:
+    """Write a verified profile for each TEST_MODELS entry, one section per slot, home main."""
+    profiles_dir.mkdir(exist_ok=True)
+    for name in TEST_MODELS:
+        text = 'home = "main"\n'
+        for slot in slots:
+            text += (
+                f"\n[slots.{slot}]\nctx_size = 4096\nn_gpu_layers = -1\nflags = [\"--jinja\"]\n"
+                f"\n[slots.{slot}.sampling]\ntemp = 1.0\ntop_k = 20\ntop_p = 0.95\nmin_p = 0.0\n"
+                "presence_penalty = 0.0\nfrequency_penalty = 0.0\nrepeat_penalty = 1.0\n"
+                f"\n[slots.{slot}.verified]\ndate = \"2026-10-30\"\nllama_cpp_build = 11136\n"
+                "llama_cpp_commit = \"057494f93\"\n"
+            )
+        (profiles_dir / f"{name}.toml").write_text(text)
+    return str(profiles_dir)
+
+
+@pytest.fixture
+def profiles_dir(tmp_path):
+    """Verified profiles for TEST_MODELS on main and egpu (test_config's slots)."""
+    return write_test_profiles(tmp_path / "models.d", ("main", "egpu"))
+
+
+@pytest.fixture
+def model_env_dir(tmp_path):
+    """Where the swap writes each slot's generated model env file."""
+    d = tmp_path / "model-env"
+    d.mkdir()
+    return d
 
 
 @pytest.fixture
@@ -59,7 +94,7 @@ def tmp_env_file(tmp_path):
     """Create a temporary llama-server env file for testing model swaps."""
     env_file = tmp_path / "llama-server.env"
     env_file.write_text(
-        "MODEL_PATH=\nSAMPLING_ARGS=\nN_GPU_LAYERS=-1\nCTX_SIZE=4096\nHOST=127.0.0.1\nPORT=18081\n"
+        "HOST=127.0.0.1\nPORT=18081\n"
     )
     return str(env_file)
 
@@ -69,13 +104,13 @@ def tmp_egpu_env_file(tmp_path):
     """Create a temporary llama-server-egpu env file for testing egpu swaps."""
     env_file = tmp_path / "llama-server-egpu.env"
     env_file.write_text(
-        "MODEL_PATH=\nSAMPLING_ARGS=\nDEVICE=Vulkan0\nCTX_SIZE=16384\nHOST=127.0.0.1\nPORT=18083\n"
+        "DEVICE=Vulkan0\nHOST=127.0.0.1\nPORT=18083\n"
     )
     return str(env_file)
 
 
 @pytest.fixture
-def test_config(tmp_models_dir, tmp_env_file, tmp_egpu_env_file):
+def test_config(tmp_models_dir, tmp_env_file, tmp_egpu_env_file, profiles_dir, model_env_dir):
     """Create a ManagerConfig pointing at temporary test paths."""
     from manager.config import ManagerConfig
     from manager.slot_config import SlotConfig
@@ -94,16 +129,17 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_egpu_env_file):
         embeddings_port=18082,
         collections_config="/dev/null",
         skills_db_path="",
+        profiles_dir=profiles_dir,
         slots=(
             SlotConfig(
                 name="main", host="127.0.0.1", port=18081,
                 env_file=tmp_env_file, systemd_unit="llama-server.service",
-                queue_limit=20,
+                queue_limit=20, model_env_file=str(model_env_dir / "main.env"),
             ),
             SlotConfig(
                 name="egpu", host="127.0.0.1", port=18083,
                 env_file=tmp_egpu_env_file, systemd_unit="llama-server-egpu.service",
-                queue_limit=20,
+                queue_limit=20, model_env_file=str(model_env_dir / "egpu.env"),
             ),
         ),
     )
@@ -115,17 +151,19 @@ def tmp_aux_env_file(tmp_path):
     configs beyond the 'main' slot (the only one with built-in defaults)."""
     env_file = tmp_path / "llama-server-aux.env"
     env_file.write_text(
-        "MODEL_PATH=\nCTX_SIZE=8192\nHOST=127.0.0.1\nPORT=8085\n"
+        "HOST=127.0.0.1\nPORT=8085\n"
     )
     return str(env_file)
 
 
 @pytest.fixture
-def three_slot_config(test_config, tmp_aux_env_file):
+def three_slot_config(test_config, tmp_aux_env_file, tmp_path, model_env_dir):
     """test_config extended with a third configured slot ('aux').
 
     A slot without built-in defaults (only 'main' has any) has no fallback
     port (see slot_config.build_slots), so it is given one explicitly here.
+    Its profiles get an aux section too: a profile may only name configured
+    slots, so the two-slot profiles_dir can't carry one.
     """
     import dataclasses
     from manager.slot_config import SlotConfig
@@ -133,9 +171,13 @@ def three_slot_config(test_config, tmp_aux_env_file):
     aux_slot = SlotConfig(
         name="aux", host="127.0.0.1", port=8085,
         env_file=tmp_aux_env_file, systemd_unit="llama-server-aux.service",
-        queue_limit=20,
+        queue_limit=20, model_env_file=str(model_env_dir / "aux.env"),
     )
-    return dataclasses.replace(test_config, slots=test_config.slots + (aux_slot,))
+    return dataclasses.replace(
+        test_config,
+        slots=test_config.slots + (aux_slot,),
+        profiles_dir=write_test_profiles(tmp_path / "models-3slot.d", ("main", "egpu", "aux")),
+    )
 
 
 @pytest.fixture
@@ -150,7 +192,7 @@ def client_with_three_slots(three_slot_config, monkeypatch):
     """
     from manager.app import create_app
 
-    async def fake_swap_to(self, model_path, sampling_args=""):
+    async def fake_swap_to(self, model_name, env_text):
         return True
 
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap_to)

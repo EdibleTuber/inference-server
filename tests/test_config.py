@@ -17,7 +17,6 @@ def test_config_loads_from_env(monkeypatch):
     monkeypatch.setenv("LLAMA_SERVER_ENV", "/etc/llama/llama-server.env")
     monkeypatch.setenv("QUEUE_LIMIT", "20")
     monkeypatch.setenv("SWAP_TIMEOUT", "120")
-    monkeypatch.setenv("LOG_FILE", "/var/log/llama/manager.log")
 
     config = ManagerConfig.from_env()
 
@@ -29,14 +28,13 @@ def test_config_loads_from_env(monkeypatch):
     assert config.llama_server_env == "/etc/llama/llama-server.env"
     assert config.queue_limit == 20
     assert config.swap_timeout == 120
-    assert config.log_file == "/var/log/llama/manager.log"
 
 
 def test_config_defaults(monkeypatch):
     """Config should use sensible defaults when env vars are missing."""
     for key in ["HOST", "PORT", "LLAMA_SERVER_HOST", "LLAMA_SERVER_PORT",
                 "MODELS_DIR", "LLAMA_SERVER_ENV", "QUEUE_LIMIT",
-                "SWAP_TIMEOUT", "LOG_FILE"]:
+                "SWAP_TIMEOUT"]:
         monkeypatch.delenv(key, raising=False)
 
     config = ManagerConfig.from_env()
@@ -49,7 +47,6 @@ def test_config_defaults(monkeypatch):
     assert config.llama_server_env == "/etc/llama/llama-server.env"
     assert config.queue_limit == 20
     assert config.swap_timeout == 120
-    assert config.log_file == "/var/log/llama/manager.log"
 
 
 def test_config_llama_server_url(monkeypatch):
@@ -167,3 +164,9 @@ def test_manager_config_has_no_batch_fields():
     assert not any(n.startswith("batch_") for n in names)
 
 
+
+
+def test_manager_config_has_no_log_file():
+    """Logs go to the journal only (Q27): there is no log file to configure."""
+    names = {f.name for f in dataclasses.fields(ManagerConfig)}
+    assert "log_file" not in names

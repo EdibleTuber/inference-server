@@ -3,7 +3,8 @@
 #
 #   doctor.sh               run all checks (must be root)
 #   doctor.sh --list-slots  print "<name> <systemd_unit> <env_file>" per slot
-#                           (no root needed; checks 2 and 3 consume this list)
+#                           (no root needed; checks 2, 3, 9 and 10 consume
+#                           this list, check 13 joins its names)
 #
 # Unit and env-file names are never derived in this script: the slot list
 # comes from manager.slot_config.build_slots, fed with the deployed
@@ -21,6 +22,9 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 MGR_ENV="${DOCTOR_MGR_ENV:-/etc/llama/manager.env}"
 PY="/opt/llama/manager/venv/bin/python"
 FAILED=0
+# The models dir, from the deployed manager env: checks 11 and 13 need it.
+MODELS_DIR="$(sed -n 's/^MODELS_DIR=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
+[ -n "$MODELS_DIR" ] || MODELS_DIR=/opt/llama/models
 
 pass() { printf 'PASS %s %s\n' "$1" "$2"; }
 fail() { printf 'FAIL %s %s\n' "$1" "$2"; FAILED=1; }
@@ -152,10 +156,98 @@ else
 fi
 
 # 7. The deploy script sees no drift between this checkout and the host.
+# (Since profiles validate in --check as well, a profile that no longer
+# validates also fails here.)
 if "$REPO/scripts/deploy-manager.sh" --check >/dev/null 2>&1; then
   pass 7 "deploy-manager.sh --check reports no drift"
 else
   fail 7 "deploy-manager.sh --check reports drift (run it for the details)"
+fi
+
+# 8. The model env dir the manager rewrites on every swap exists and is owned
+# by _llama-mgr (the slots' generated <slot>.env files live in it).
+env_owner="$(stat -c %U /var/lib/llama-manager 2>/dev/null || true)"
+if [ -d /var/lib/llama-manager ] && [ "$env_owner" = "_llama-mgr" ]; then
+  pass 8 "/var/lib/llama-manager exists and is owned by _llama-mgr"
+else
+  fail 8 "/var/lib/llama-manager missing or owned by ${env_owner:?}"
+fi
+
+# 9. Each slot's installed unit loads the generated model env file
+# (EnvironmentFile=/var/lib/llama-manager/<slot>.env) BEFORE its static env
+# file: systemd applies EnvironmentFile= in file order, so the static file's
+# values must win over anything the generated file carries.
+bad=""
+while read -r name unit env_file; do
+  installed="/etc/systemd/system/$unit"
+  [ -f "$installed" ] || { bad="slot $name: $installed missing"; break; }
+  gen_line="$(grep -nF "EnvironmentFile=/var/lib/llama-manager/$name.env" "$installed" | head -1 | cut -d: -f1)"
+  if [ -z "$gen_line" ]; then
+    bad="slot $name: unit has no EnvironmentFile=/var/lib/llama-manager/$name.env"
+    break
+  fi
+  env_line="$(grep -nF "EnvironmentFile=$env_file" "$installed" | head -1 | cut -d: -f1)"
+  if [ -z "$env_line" ]; then
+    bad="slot $name: unit names no EnvironmentFile=$env_file"
+    break
+  fi
+  if [ "$gen_line" -ge "$env_line" ]; then
+    bad="slot $name: generated model env file loaded after $env_file (line $gen_line vs $env_line)"
+    break
+  fi
+done <<< "$SLOTS"
+if [ -z "$bad" ]; then
+  pass 9 "every slot unit loads its generated model env file first"
+else
+  fail 9 "$bad"
+fi
+
+# 10. The static slot env files hold only static settings: the per-model
+# settings (MODEL_ARGS and friends) live in the generated files, which a swap
+# rewrites whole -- setting them in the static file would pin them in place.
+bad=""
+while read -r name unit env_file; do
+  [ -f "$env_file" ] || { bad="slot $name: $env_file missing"; break; }
+  hit="$(grep -E '^[[:space:]]*(MODEL_PATH|SAMPLING_ARGS|CTX_SIZE|N_GPU_LAYERS|MODEL_ARGS|LLAMA_ARG_[A-Za-z0-9_]*)=' "$env_file" | head -1 || true)"
+  if [ -n "$hit" ]; then
+    bad="slot $name: $env_file still sets per-model settings ($hit)"
+    break
+  fi
+done <<< "$SLOTS"
+if [ -z "$bad" ]; then
+  pass 10 "no slot env file sets per-model settings"
+else
+  fail 10 "$bad"
+fi
+
+# 11. No pre-profile *.args sidecars are left in the models dir.
+args_left=""
+for f in "$MODELS_DIR"/*.args; do
+  [ -e "$f" ] || continue
+  args_left="$f"
+  break
+done
+if [ -z "$args_left" ]; then
+  pass 11 "no *.args files in $MODELS_DIR"
+else
+  fail 11 "$args_left still present in $MODELS_DIR"
+fi
+
+# 12. The deployed manager.env has no pre-profile SLOT_*_MODELS home map.
+if grep -qE '^SLOT_[A-Za-z0-9_]+_MODELS=' "$MGR_ENV" 2>/dev/null; then
+  fail 12 "$MGR_ENV still sets SLOT_*_MODELS"
+else
+  pass 12 "$MGR_ENV has no SLOT_*_MODELS"
+fi
+
+# 13. The deployed profiles validate, with the manager's own validator,
+# against the deployed slot list and models dir.
+SLOT_CSV="$(cut -d' ' -f1 <<< "$SLOTS" | paste -sd, -)"
+if profile_err="$(PYTHONPATH="$REPO" "$PY" -m manager.profiles check /etc/llama/models.d \
+                  --slots "$SLOT_CSV" --models-dir "$MODELS_DIR" 2>&1 >/dev/null)"; then
+  pass 13 "profiles in /etc/llama/models.d validate"
+else
+  fail 13 "profiles in /etc/llama/models.d fail validation: $(head -1 <<< "$profile_err")"
 fi
 
 exit "$FAILED"

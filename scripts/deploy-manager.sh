@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Deploy the model manager from this checkout to /opt/llama/manager, with
-# provenance. For UPDATES -- scripts/setup.sh is the first-time installer.
+# Deploy the model manager from this checkout to /opt/llama/manager, and its
+# profiles to /etc/llama/models.d, with provenance. For UPDATES --
+# scripts/setup.sh is the first-time installer.
 #
 #   ./scripts/deploy-manager.sh --check    # read-only, no sudo, exits 1 on drift
 #   sudo ./scripts/deploy-manager.sh       # test, install, stamp, restart, verify
 #
 # Exit codes: 0 clean or healthy, 1 drift or other failure, 2 not a git
-# checkout, 3 dirty tree (refused; --check only reports), 4 test suite failed.
+# checkout, 3 dirty tree or untracked profile (refused; --check only reports),
+# 4 test suite failed, 5 profile validation failed.
 #
 # Why this exists: there was no update path. setup.sh is an 8-step installer
 # that creates users, a venv, sudoers entries and systemd units -- running it to
@@ -22,6 +24,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${DEPLOY_DEST:-/opt/llama/manager}"
+PROFILES_DEST="${DEPLOY_PROFILES_DEST:-/etc/llama/models.d}"
+# Validator python: the deployed venv, overridable for tests (which point the
+# four DEPLOY_* paths at tmp and have no venv of their own).
+PY="${DEPLOY_PYTHON:-$DEST/venv/bin/python}"
 OWNER=_llama-mgr
 UNIT=llama-manager
 HEALTH_WAIT="${HEALTH_WAIT:-60}"
@@ -42,6 +48,18 @@ if [ -z "$MGR_HOST" ] || [ "$MGR_HOST" = "0.0.0.0" ]; then
 fi
 if [ -z "$MGR_PORT" ]; then
   MGR_PORT=11434
+fi
+# Profile validation reads the deployed manager env the same way: the slot
+# list the profiles are checked against, and the models dir each profile's
+# gguf must be in. DEPLOY_MODELS_DIR wins over the env file, which wins over
+# the default.
+SLOTS="$(sed -n 's/^SLOTS=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
+if [ -z "$SLOTS" ]; then
+  SLOTS=main
+fi
+MODELS_DIR="${DEPLOY_MODELS_DIR:-$(sed -n 's/^MODELS_DIR=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)}"
+if [ -z "$MODELS_DIR" ]; then
+  MODELS_DIR=/opt/llama/models
 fi
 BASE="http://${MGR_HOST}:${MGR_PORT}"
 HEALTH="$BASE/health"
@@ -67,6 +85,17 @@ fi
 if [ "$CHECK_ONLY" -ne 1 ] && \
    [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
   echo "refusing: uncommitted changes in the checkout"
+  exit 3
+fi
+
+# The check above uses --untracked-files=no, so a profile dropped into
+# config/models/ but never committed would sail through it and ship
+# unreviewed. Only committed profiles ship; refuse the rest by name.
+if [ "$CHECK_ONLY" -ne 1 ] && \
+   [ -n "$(git -C "$REPO" ls-files --others --exclude-standard -- 'config/models/*.toml')" ]; then
+  echo "refusing: untracked profiles in config/models/ (never committed):"
+  git -C "$REPO" ls-files --others --exclude-standard -- 'config/models/*.toml' |
+    sed 's/^/  /'
   exit 3
 fi
 
@@ -107,8 +136,45 @@ for src in "$REPO"/manager/*.py "$REPO"/manager/requirements.txt "$REPO"/manager
     fi
   fi
 done
+# Profiles drift the same way the manager files do: the deployed copy in
+# PROFILES_DEST must match the committed profile byte for byte. A missing
+# PROFILES_DEST means every profile is absent, as on a first deploy.
+for src in "$REPO"/config/models/*.toml; do
+  [ -e "$src" ] || continue
+  base="$(basename "$src")"
+  a=$(sha256sum "$src" | cut -c1-12)
+  # || true: see the manager loop above -- a first deploy has no deployed
+  # profiles yet, and that is reported, not fatal.
+  b=$(sha256sum "$PROFILES_DEST/$base" 2>/dev/null | cut -c1-12 || true)
+  if [ "$a" = "$b" ]; then
+    printf '  %-22s current\n' "$base"
+  else
+    printf '  %-22s STALE (repo %s, deployed %s)\n' "$base" "$a" "${b:-absent}"
+    drift=1
+  fi
+done
+# A profile deleted from the repo but left in PROFILES_DEST would keep
+# serving: report it as drift, and the deploy below removes it.
+for dst in "$PROFILES_DEST"/*.toml; do
+  [ -e "$dst" ] || continue
+  base="$(basename "$dst")"
+  if [ ! -e "$REPO/config/models/$base" ]; then
+    printf '  %-22s EXTRA (removed on deploy)\n' "$base"
+    drift=1
+  fi
+done
 
 echo
+# Validate the committed profiles right after the drift report, before ANY
+# exit decision, in --check and deploy alike: a broken profile is not drift,
+# and neither mode may call the checkout clean or install it. The validator's
+# own per-profile error lines are shown, not swallowed.
+if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO" "$PY" \
+     -m manager.profiles check "$REPO/config/models" \
+     --slots "$SLOTS" --models-dir "$MODELS_DIR"; then
+  echo "profile validation failed; not deploying"
+  exit 5
+fi
 if [ "$drift" -eq 0 ]; then
   echo "Everything deployed matches $HEAD_SHA."
   exit 0
@@ -143,6 +209,22 @@ fi
 install -m 644 -o "$OWNER" -g "$OWNER" "$REPO"/manager/*.py "$DEST"/
 install -m 644 -o "$OWNER" -g "$OWNER" "$REPO"/manager/requirements.txt "$REPO"/manager/requirements.lock "$DEST"/
 echo "  installed manager/*.py + requirements.txt + requirements.lock"
+
+install -d -m 755 "$PROFILES_DEST"
+for src in "$REPO"/config/models/*.toml; do
+  [ -e "$src" ] || continue
+  install -m 644 -o root -g root "$src" "$PROFILES_DEST"/
+done
+echo "  installed config/models/*.toml -> $PROFILES_DEST"
+# A profile no longer in the repo would keep serving: remove it.
+for dst in "$PROFILES_DEST"/*.toml; do
+  [ -e "$dst" ] || continue
+  base="$(basename "$dst")"
+  if [ ! -e "$REPO/config/models/$base" ]; then
+    rm -f -- "$dst"
+    echo "  removed $base (no longer in the repo)"
+  fi
+done
 
 if [ "$changed_reqs" -eq 1 ]; then
   echo "  requirements changed — reinstalling from the lock"

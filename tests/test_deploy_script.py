@@ -46,6 +46,10 @@ def _clone(tmp_path):
     subprocess.run(["git", "clone", "-q", str(REPO), str(clone)], check=True)
     # The clone carries the committed tree (clean, known HEAD); the script
     # under test is the working tree's, so the tests track uncommitted edits.
+    # Its roster is GOOD alone: the shipped profiles have no gguf in tmp and
+    # name slots these tests do not configure.
+    subprocess.run(["git", "-C", str(clone), "rm", "-q", "-r", "--ignore-unmatch",
+                    "config/models"], check=True)
     _commit(clone, {
         "scripts/deploy-manager.sh": (REPO / "scripts" / "deploy-manager.sh").read_text(encoding="utf-8"),
         f"config/models/{GOOD}.toml": _profile("main"),

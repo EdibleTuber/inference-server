@@ -335,6 +335,23 @@ Comments to carry into the profiles. Task 2 deleted them from the slot env templ
 - **Qwen3.6:** note that `min_p` is llama.cpp's default, kept to preserve today's behaviour, and that the card says 0.0. Also carry the model-selection rationale, the KV-cache derivation, the "precise coding" sampling note, and the `n_gpu_layers = -1` auto-fit warning (experts silently moved to RAM; check `nvidia-smi` and the `common_params_fit_impl` lines) from `config/llama-server-egpu.env`.
 - **gemma:** note that its sampling comes from the GGUF's `general.sampling.*` (temp 1.0, top_k 64, top_p 0.95). It has no MTP layer, so it carries no `--spec-*` flags: it's the Q42 regression case. Also note that its `ctx_size` on the P40 is unmeasured, and that `onboard`'s trial load is the measurement.
 
+**Pinned by the committed tests (2026-11-01, checked against a reference implementation; twelve hand mutants all killed).** The table was re-read against the live sidecars, slot env files and unit ExecStart on 2026-11-01 and still holds.
+- Each profile has exactly one section, its `home`, and no `verified` or `env` table. The render test pins the whole generated file, so the profile must render today's command line token for token:
+  - `flags` holds one token per list item, in the table's order: `["--jinja", "--ctx-checkpoints", "4", "--n-predict", "32768"]`, and for Qwen3.8 also `"--spec-type", "draft-mtp", "--spec-draft-n-max", "1"`. `--jinja` and `--ctx-checkpoints 4` move here from the old ExecStart, because the Task 2 units no longer pass them. `--n-predict 32768` comes from the live sidecars (the repo's old env template lacked it; live wins).
+  - All seven sampling keys are present, and a value the table shows with a decimal point is a TOML float (`temp = 1.0`, not `1`). The renderer prints `repr`, and `--temp 1` would not match.
+- Comment anchors, in `#` lines. These are a floor, not the content:
+  - every profile mentions `23181` and `tool`;
+  - Qwen3.8 mentions `MTP` and `KV`;
+  - Qwen3.6 mentions `min_p`, `common_params_fit_impl` and `nvidia-smi`;
+  - gemma mentions `general.sampling` and `Q42`.
+- READMEs (`tests/test_repo_consistency.py`):
+  - Neither `README.md` nor `manager/README.md` may contain `SLOT_<NAME>_MODELS` or any `SLOT_*_MODELS`, `no_home_slot`, `MODEL_PATH`, `SAMPLING_ARGS`, `N_GPU_LAYERS` or `CTX_SIZE`. Describe per-model settings as the profile's (`ctx_size`, `n_gpu_layers`, `sampling`, `flags`) and the generated file as `MODEL_ARGS`.
+  - `README.md` must name `config/models/`, `onboard`, `"trial"`, `invalid_trial`, `model_not_found`, `slot_not_allowed`, `not_verified`, `home_slot`, `verified_slots`, `loaded_on` and `profile_errors`.
+  - These are anchors, not completeness: rewrite the sections the Files list names, and Claude reviews the prose.
+- `tests/test_deploy_script.py`: `_clone` now removes the clone's `config/models/` before committing its test profile. With the shipped profiles committed, the old helper fails 9 deploy tests: the clone's models dir has no gguf for them, and Qwen3.6 and gemma name `egpu` while those tests configure `SLOTS=main`.
+- Checked on the host: the reference profiles pass `python -m manager.profiles check config/models --slots main,egpu --models-dir /opt/llama/models` (`3 profiles OK`).
+- Test files in this task's test commit: `tests/test_bootstrap_profiles.py` (new), additions to `tests/test_repo_consistency.py`, and the `_clone` change in `tests/test_deploy_script.py`.
+
 - [ ] Steps: run the tests (they fail) → write the three files and the README sections → full suite passes → commit `feat(profiles): bootstrap profiles for the three kept models (Q34, Q42)`.
 
 ### Task 7: Host cutover (the user runs these; Claude verifies each step)

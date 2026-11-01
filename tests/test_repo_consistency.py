@@ -1,5 +1,8 @@
 import os, re, subprocess
 from pathlib import Path
+
+import pytest
+
 from manager.slot_config import build_slots
 
 REPO = Path(__file__).resolve().parent.parent
@@ -56,3 +59,25 @@ def test_the_template_has_no_pre_profile_settings():
     # The home map's comment and the in-place MODEL_PATH rewrite are both gone.
     assert "home_slot" not in text
     assert "MODEL_PATH" not in text
+
+
+READMES = ("README.md", "manager/README.md")
+
+
+@pytest.mark.parametrize("readme", READMES)
+def test_the_readme_names_no_pre_profile_mechanism(readme):
+    """The home map, the regex rewrite of the slot env file, and the per-model
+    keys that file used to hold are all gone (Tasks 2 and 3). Per-model
+    settings are described as the profile's, not by those names."""
+    text = (REPO / readme).read_text(encoding="utf-8")
+    stale = re.findall(r"SLOT_(?:<NAME>|[A-Z]+)_MODELS|no_home_slot|MODEL_PATH|"
+                       r"SAMPLING_ARGS|N_GPU_LAYERS|CTX_SIZE", text)
+    assert stale == [], sorted(set(stale))
+
+
+def test_the_readme_documents_the_profile_api():
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+    for term in ("config/models/", "onboard", '"trial"', "invalid_trial", "model_not_found",
+                 "slot_not_allowed", "not_verified", "home_slot", "verified_slots",
+                 "loaded_on", "profile_errors"):
+        assert term in text, term

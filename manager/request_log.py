@@ -146,15 +146,19 @@ class StreamTokens:
     Splits on \\n and keeps only the incomplete trailing line between
     feeds, so a line -- including the one that carries the counts --
     survives any write boundary. Only `data:` lines containing "timings"
-    or "usage" are parsed. A pending line longer than 1 MiB is dropped and
-    parsing resumes at the next newline, so a stream with no newline at all
-    cannot grow memory without bound. feed never raises.
+    or "usage" are parsed. A pending line longer than 1 MiB is dropped,
+    along with the rest of that line up to its newline, and parsing resumes
+    with the line after it, so a stream with no newline at all cannot grow
+    memory without bound. feed never raises.
     """
 
     def __init__(self, dialect: Literal["openai", "anthropic"]) -> None:
         self.dialect = dialect
         self.tokens = Tokens()
         self._pending = b""
+        # True while inside a dropped line: bytes up to and including its
+        # newline are still the dropped line, not a fresh one.
+        self._skipping = False
         # openai: the timings line wins; usage lines only count until it shows up.
         self._saw_timings = False
 
@@ -165,12 +169,23 @@ class StreamTokens:
             pass
 
     def _feed(self, chunk: bytes) -> None:
+        if self._skipping:
+            # The bytes up to the first newline are the tail of the dropped
+            # line; skip them and resume parsing with the line after it.
+            newline = chunk.find(b"\n")
+            if newline < 0:
+                return
+            self._skipping = False
+            chunk = chunk[newline + 1:]
+            if not chunk:
+                return
         parts = (self._pending + chunk).split(b"\n")
         self._pending = parts.pop()
         for line in parts:
             self._line(line)
         if len(self._pending) > _MAX_PENDING:
             self._pending = b""
+            self._skipping = True
 
     def _line(self, line: bytes) -> None:
         if not line.startswith(b"data:"):

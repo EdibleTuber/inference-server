@@ -428,16 +428,20 @@ def _relay_stream(resp, close, record=None, stream_tokens=None) -> StreamingResp
             await close()
 
     async def finish_stream() -> None:
-        await close()
-        if record is not None:
-            if stream_tokens is not None:
-                # The sniffed counts live on the StreamTokens until the
-                # stream ends; hand them to the record so the line has them.
-                record.tokens = stream_tokens.tokens
-            record.finish(
-                resp.status_code,
-                "ok" if state["completed"] else "client_disconnected",
-            )
+        try:
+            await close()
+        finally:
+            # The line is written even if close() raises; the exception
+            # propagates afterwards.
+            if record is not None:
+                if stream_tokens is not None:
+                    # The sniffed counts live on the StreamTokens until the
+                    # stream ends; hand them to the record so the line has them.
+                    record.tokens = stream_tokens.tokens
+                record.finish(
+                    resp.status_code,
+                    "ok" if state["completed"] else "client_disconnected",
+                )
 
     return StreamingResponse(
         gen(),
@@ -1131,12 +1135,18 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         # backend call itself, so queue_wait_ms stays null on the line.
         record.slot = slot_name
         record.backend_started_at = time.monotonic()
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{slot.url}/v1/messages/count_tokens",
-                json=body,
-                timeout=30,
-            )
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{slot.url}/v1/messages/count_tokens",
+                    json=body,
+                    timeout=30,
+                )
+        except Exception:
+            # The exception still escapes (the client gets a 500, exactly as
+            # before); the line is the only new thing here.
+            record.finish(500, "proxy_error")
+            raise
         record.tokens = tokens_from_body(resp.content, "count_tokens")
         response = Response(
             content=resp.content,

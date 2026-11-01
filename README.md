@@ -73,7 +73,7 @@ sudo bash scripts/setup.sh
 This script creates:
 - System users `_llama` and `_llama-mgr` (no shell, no home directory)
 - `/opt/llama/bin/`, `/opt/llama/models/`, `/opt/llama/manager/`
-- `/etc/llama/` (config files), `/var/log/llama/` (log files)
+- `/etc/llama/` (config files)
 - A narrow sudoers entry so `_llama-mgr` can restart `llama-server.service` and `llama-server-egpu.service`
 - The `llama-server`, `llama-manager` and `llama-embeddings` unit files (installed, not enabled — step 6 starts them)
 
@@ -404,7 +404,6 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
 | `RESTART_TIMEOUT` | `150` | Upper bound, in seconds, on a `systemctl restart` of a slot's unit during a swap. Both slot units have `TimeoutStopUSec=1min 30s`, so a restart can legitimately take ~90s before the new process starts; 150s covers that. Exceeding it fails the swap. |
 | `PROXY_READ_TIMEOUT` | `1800` | The longest, in seconds, the manager waits for the next bytes from the backend. For a non-streaming request that is effectively the whole generation; for a stream it is the longest silence, such as prefill before the first token. A read or write timeout answers 504 `upstream_timeout` and leaves the slot healthy. |
-| `LOG_FILE` | `/var/log/llama/manager.log` | Log file path for the model manager. |
 | `EMBEDDINGS_HOST` / `EMBEDDINGS_PORT` | `127.0.0.1` / `8082` | Where llama-embeddings listens. Always localhost. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
@@ -574,21 +573,22 @@ systemctl status llama-server llama-server-egpu llama-embeddings llama-manager
 
 ### View logs
 
-```bash
-# Live log from systemd journal
-sudo journalctl -u llama-manager -f
+Every service logs to the journal only; there are no per-service log files.
+Read a unit's logs with `journalctl -u <unit>`, adding `-f` to follow:
 
-# Each unit appends stdout/stderr to /var/log/llama/<name>.{log,err}.
-# llama-server and the manager both log to stderr, so the .err files are
-# the ones with content:
-tail -f /var/log/llama/llama-server.err
-tail -f /var/log/llama/llama-server-egpu.err
-tail -f /var/log/llama/manager.err
+```bash
+journalctl -u llama-server -f
+journalctl -u llama-server-egpu -f
+journalctl -u llama-embeddings -f
+journalctl -u llama-manager -f
 ```
 
-The manager also tries to write `LOG_FILE` (`/var/log/llama/manager.log`); if `_llama-mgr` cannot create it, it logs a `Could not open log file` warning to `manager.err` and carries on.
+The manager writes one structured JSON line per inference request and per
+`/swap` on the `manager.requests` logger. Extract just those lines with:
 
-Logs rotate weekly via `config/llama-logrotate` (installed to `/etc/logrotate.d/llama`), using `copytruncate` because systemd holds each file open for the life of the process.
+```bash
+journalctl -u llama-manager -o cat | sed -n 's/^INFO manager.requests: //p' | jq
+```
 
 ### Enable on boot
 
@@ -712,8 +712,6 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 /var/lib/llama-manager/             # generated per-slot model env files (<slot>.env),
                                     # rewritten by the manager on every swap; _llama-mgr, 755
 
-/var/log/llama/                     # <unit>.log / <unit>.err per service, rotated weekly
-
 /etc/systemd/system/
   ├── llama-manager.service
   ├── llama-server.service          # main
@@ -737,7 +735,7 @@ inference-server/
 │   ├── embeddings.py, vectordb.py, collections.py, reindex_jobs.py   # retrieval
 │   └── README.md                   # manager component documentation
 ├── systemd/                        # unit files (copied to /etc/systemd/system/)
-├── config/                         # config templates (copied to /etc/llama/) + logrotate
+├── config/                         # config templates (copied to /etc/llama/)
 │   └── models/                     # per-model TOML profiles (installed to /etc/llama/models.d/)
 ├── scripts/
 │   ├── setup.sh                    # first install: users, dirs, permissions, sudoers, main-slot units

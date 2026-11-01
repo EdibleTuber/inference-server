@@ -21,6 +21,7 @@ Endpoints:
 """
 import asyncio
 import logging
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -333,26 +334,17 @@ class ServerState:
 # ---------------------------------------------------------------------------
 
 def _setup_logging(config: ManagerConfig) -> None:
-    """Configure console + file logging."""
-    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    formatter = logging.Formatter(fmt)
+    """Configure logging: exactly one handler, on stderr, which systemd
+    ships to the journal (Q27). journald timestamps every line, so the
+    format carries no asctime."""
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(message)s")
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    root.addHandler(console_handler)
-
-    # File handler (skip if /dev/null — used in tests)
-    if config.log_file:
-        try:
-            file_handler = logging.FileHandler(config.log_file)
-            file_handler.setFormatter(formatter)
-            root.addHandler(file_handler)
-        except (OSError, PermissionError) as exc:
-            logger.warning("Could not open log file %s: %s", config.log_file, exc)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(formatter)
+    root.addHandler(handler)
 
 
 # ---------------------------------------------------------------------------

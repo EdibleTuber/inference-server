@@ -123,7 +123,6 @@ export MODELS_DIR=/tmp/models        # create this and put some .gguf files in i
 export PROFILES_DIR=/tmp/models.d    # per-model TOML profiles; copy one from config/models/
 export MODEL_ENV_DIR=/tmp/model-env  # generated per-slot model env files; create this
 export LLAMA_SERVER_ENV=/tmp/llama-server.env  # the slot's static env file; touch it first
-export LOG_FILE=                     # empty = log to console only
 ```
 
 Or create a `.env` file and source it:
@@ -136,7 +135,6 @@ MODELS_DIR=/tmp/models
 PROFILES_DIR=/tmp/models.d
 MODEL_ENV_DIR=/tmp/model-env
 LLAMA_SERVER_ENV=/tmp/llama-server.env
-LOG_FILE=
 ```
 
 ```bash

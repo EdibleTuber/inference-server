@@ -63,7 +63,6 @@ echo "[3/8] Creating directories..."
 mkdir -p /opt/llama/bin /opt/llama/models /opt/llama/manager /opt/llama/data
 mkdir -p /etc/llama /etc/llama/models.d
 mkdir -p /var/lib/llama-manager
-mkdir -p /var/log/llama
 
 # -- 4. Permissions --
 echo "[4/8] Setting permissions..."
@@ -87,9 +86,6 @@ echo "  /var/lib/llama-manager → _llama-mgr 755"
 
 chown root:root /opt/llama/bin
 chmod 755 /opt/llama/bin
-
-chown root:llama /var/log/llama
-chmod 775 /var/log/llama
 
 # -- 5. Config files --
 echo "[5/8] Installing config files..."
@@ -164,9 +160,6 @@ cp "$REPO_DIR/systemd/llama-server.service" /etc/systemd/system/
 cp "$REPO_DIR/systemd/llama-manager.service" /etc/systemd/system/
 cp "$REPO_DIR/systemd/llama-embeddings.service" /etc/systemd/system/
 systemctl daemon-reload
-
-# Logrotate
-cp "$REPO_DIR/config/llama-logrotate" /etc/logrotate.d/llama
 
 echo ""
 echo "=== Setup Complete ==="

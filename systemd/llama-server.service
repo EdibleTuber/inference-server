@@ -98,9 +98,5 @@ ExecStart=/opt/llama/bin/llama-server \
 Restart=on-failure
 RestartSec=5
 
-# Persistent file logs (also in journal via journalctl -u llama-server)
-StandardOutput=append:/var/log/llama/llama-server.log
-StandardError=append:/var/log/llama/llama-server.err
-
 [Install]
 WantedBy=multi-user.target

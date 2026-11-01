@@ -170,7 +170,7 @@ echo
 # and neither mode may call the checkout clean or install it. The validator's
 # own per-profile error lines are shown, not swallowed.
 if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO" "$PY" \
-     -m manager.profiles check "$REPO/config/models" \
+     -P -m manager.profiles check "$REPO/config/models" \
      --slots "$SLOTS" --models-dir "$MODELS_DIR"; then
   echo "profile validation failed; not deploying"
   exit 5
@@ -199,7 +199,7 @@ TEST_HOME="$(getent passwd "$TEST_USER" | cut -d: -f6)"
 if ! runuser -u "$TEST_USER" -- \
      env HOME="$TEST_HOME" USER="$TEST_USER" LOGNAME="$TEST_USER" \
      PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO" \
-     "$DEST/venv/bin/python" -m pytest "$REPO/tests" -q -p no:cacheprovider; then
+     "$DEST/venv/bin/python" -P -m pytest "$REPO/tests" -q -p no:cacheprovider; then
   echo "test suite failed; not deploying"
   exit 4
 fi

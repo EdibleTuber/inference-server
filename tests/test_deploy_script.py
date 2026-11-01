@@ -191,6 +191,23 @@ def test_an_invalid_profile_exits_5_before_the_root_check(tmp_path):
     assert not (tmp_path / "models.d").exists()
 
 
+def test_validation_ignores_a_manager_package_in_the_callers_cwd(tmp_path):
+    """`python -m` puts the cwd ahead of PYTHONPATH, so run from a directory
+    holding another manager/ (the main checkout, on this host) the script
+    validated with that copy's code: no profiles.py there failed every deploy
+    with exit 5, and a stale one would pass profiles it should refuse."""
+    clone = _clone(tmp_path)
+    _commit(clone, {f"config/models/{GOOD}.toml": _profile("main").replace("ctx_size = 4096\n", "")})
+    decoy = tmp_path / "manager"                     # _run_script's cwd is tmp_path
+    decoy.mkdir()
+    (decoy / "__init__.py").write_text("")
+    (decoy / "profiles.py").write_text("raise SystemExit(0)\n")
+    _deploy_everything(clone, tmp_path)
+    r = _run_script(clone, "--check", tmp_path=tmp_path)
+    assert r.returncode == 5, r.stdout + r.stderr
+    assert "ctx_size" in r.stdout + r.stderr
+
+
 def test_validation_uses_the_slots_from_manager_env(tmp_path):
     clone = _clone(tmp_path)
     _commit(clone, {f"config/models/{GOOD}.toml": _profile("main", "egpu")})

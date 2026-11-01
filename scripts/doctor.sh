@@ -34,7 +34,7 @@ fail() { printf 'FAIL %s %s\n' "$1" "$2"; FAILED=1; }
 # A missing env file means "no overrides": build_slots falls back to its
 # defaults (main).
 list_slots() {
-  PYTHONPATH="$REPO" "$PY" - "$MGR_ENV" <<'PYEOF'
+  PYTHONPATH="$REPO" "$PY" -P - "$MGR_ENV" <<'PYEOF'
 import sys
 from manager.slot_config import build_slots
 
@@ -243,7 +243,7 @@ fi
 # 13. The deployed profiles validate, with the manager's own validator,
 # against the deployed slot list and models dir.
 SLOT_CSV="$(cut -d' ' -f1 <<< "$SLOTS" | paste -sd, -)"
-if profile_err="$(PYTHONPATH="$REPO" "$PY" -m manager.profiles check /etc/llama/models.d \
+if profile_err="$(PYTHONPATH="$REPO" "$PY" -P -m manager.profiles check /etc/llama/models.d \
                   --slots "$SLOT_CSV" --models-dir "$MODELS_DIR" 2>&1 >/dev/null)"; then
   pass 13 "profiles in /etc/llama/models.d validate"
 else

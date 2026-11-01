@@ -170,7 +170,7 @@ env_owner="$(stat -c %U /var/lib/llama-manager 2>/dev/null || true)"
 if [ -d /var/lib/llama-manager ] && [ "$env_owner" = "_llama-mgr" ]; then
   pass 8 "/var/lib/llama-manager exists and is owned by _llama-mgr"
 else
-  fail 8 "/var/lib/llama-manager missing or owned by ${env_owner:?}"
+  fail 8 "/var/lib/llama-manager missing or owned by ${env_owner:-nobody}"
 fi
 
 # 9. Each slot's installed unit loads the generated model env file
@@ -181,12 +181,12 @@ bad=""
 while read -r name unit env_file; do
   installed="/etc/systemd/system/$unit"
   [ -f "$installed" ] || { bad="slot $name: $installed missing"; break; }
-  gen_line="$(grep -nF "EnvironmentFile=/var/lib/llama-manager/$name.env" "$installed" | head -1 | cut -d: -f1)"
+  gen_line="$(grep -nF "EnvironmentFile=/var/lib/llama-manager/$name.env" "$installed" | head -1 | cut -d: -f1 || true)"
   if [ -z "$gen_line" ]; then
     bad="slot $name: unit has no EnvironmentFile=/var/lib/llama-manager/$name.env"
     break
   fi
-  env_line="$(grep -nF "EnvironmentFile=$env_file" "$installed" | head -1 | cut -d: -f1)"
+  env_line="$(grep -nF "EnvironmentFile=$env_file" "$installed" | head -1 | cut -d: -f1 || true)"
   if [ -z "$env_line" ]; then
     bad="slot $name: unit names no EnvironmentFile=$env_file"
     break

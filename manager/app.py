@@ -34,6 +34,13 @@ from starlette.background import BackgroundTask
 
 from manager import retrieval
 from manager.config import ManagerConfig
+from manager.request_log import (
+    RequestRecord,
+    StreamTokens,
+    log_swap,
+    request_context,
+    tokens_from_body,
+)
 from manager.gpu import get_gpu_info_async
 from manager.names import same_model
 from manager.profiles import ProfileSet, load_profiles, render_model_env
@@ -57,6 +64,14 @@ _start_time = time.time()
 # the only thing it is allowed to do with the answer is proxy (ready) or
 # answer an error (wrong_model, unavailable) -- never swap.
 Readiness = Literal["ready", "wrong_model", "unavailable"]
+
+# Token dialect for each backend path the queue consumer proxies, so the
+# request line's token fields come from the backend's own body fields.
+# count_tokens never queues, so it is not here.
+_STREAM_DIALECTS = {
+    "v1/chat/completions": "openai",
+    "v1/messages": "anthropic",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +399,7 @@ def _stream_close(ctx, client):
     return close
 
 
-def _relay_stream(resp, close) -> StreamingResponse:
+def _relay_stream(resp, close, record=None, stream_tokens=None) -> StreamingResponse:
     """Relay an already-opened backend stream (status < 400) to the client.
 
     `close` runs from the generator's finally and again from the background
@@ -392,20 +407,43 @@ def _relay_stream(resp, close) -> StreamingResponse:
     end, client gone mid-stream (generator aborted -> finally), and client
     gone before the first chunk (the generator never starts, so the
     background task is the only closer).
+
+    When the item carries a request record (phase 4, Q27), each relayed
+    chunk is also fed, unchanged, to stream_tokens -- the sniffing never
+    touches or buffers the bytes -- and the background task, the stream's
+    closer, writes the line: ok when the relay reached the end of the
+    stream, client_disconnected otherwise. finish is idempotent, so the
+    closer and the endpoint can never double-write a relayed stream's line.
     """
+    state = {"completed": False}
 
     async def gen():
         try:
             async for chunk in resp.aiter_bytes():
+                if stream_tokens is not None:
+                    stream_tokens.feed(chunk)
                 yield chunk
+            state["completed"] = True
         finally:
             await close()
+
+    async def finish_stream() -> None:
+        await close()
+        if record is not None:
+            if stream_tokens is not None:
+                # The sniffed counts live on the StreamTokens until the
+                # stream ends; hand them to the record so the line has them.
+                record.tokens = stream_tokens.tokens
+            record.finish(
+                resp.status_code,
+                "ok" if state["completed"] else "client_disconnected",
+            )
 
     return StreamingResponse(
         gen(),
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "text/event-stream"),
-        background=BackgroundTask(close),
+        background=BackgroundTask(finish_stream),
     )
 
 
@@ -442,11 +480,22 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
         while not slot.queue.empty():
             item = await slot.queue.dequeue()
             event: asyncio.Event = item["event"]
+            record = item.get("record")
+            if record is not None:
+                # The endpoint stamped enqueued_at; the consumer stamps the
+                # dequeue (queue_wait_ms) and, below, backend_started_at.
+                record.slot = slot_name
+                record.dequeued_at = time.monotonic()
 
             try:
                 body: dict = item["body"]
                 model_name: str = body.get("model", "")
-                backend_url = f"{slot.url}/{item.get('backend_path', 'v1/chat/completions')}"
+                backend_path = item.get("backend_path", "v1/chat/completions")
+                backend_url = f"{slot.url}/{backend_path}"
+                # Token dialect to sniff the backend body with, keyed off
+                # the path the endpoint stamped (count_tokens never
+                # queues). An unknown path sniffs nothing.
+                dialect = _STREAM_DIALECTS.get(backend_path)
 
                 readiness = await server.ready_for(slot_name, model_name)
                 if readiness == "wrong_model":
@@ -461,6 +510,11 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                     continue
 
                 is_streaming = body.get("stream", False)
+                if record is not None:
+                    # backend_ms runs from the backend call to the line. A
+                    # request refused before the call (wrong_model,
+                    # slot_unavailable) leaves it null.
+                    record.backend_started_at = time.monotonic()
                 try:
                     if is_streaming:
                         # The consumer opens the backend stream itself so it
@@ -489,6 +543,8 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                             if resp.status_code >= 500:
                                 slot.mark_unhealthy()
                                 asyncio.create_task(_reprobe_for(slot))
+                            if record is not None and dialect is not None:
+                                record.tokens = tokens_from_body(content, dialect)
                             item["response"] = Response(
                                 content=content,
                                 status_code=resp.status_code,
@@ -497,7 +553,15 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                                 ),
                             )
                         else:
-                            item["response"] = _relay_stream(resp, close)
+                            stream_tokens = (
+                                StreamTokens(dialect)
+                                if record is not None and dialect is not None
+                                else None
+                            )
+                            item["response"] = _relay_stream(
+                                resp, close, record=record,
+                                stream_tokens=stream_tokens,
+                            )
                     else:
                         async with httpx.AsyncClient() as client:
                             resp = await client.post(
@@ -509,6 +573,8 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                         if resp.status_code >= 500:
                             slot.mark_unhealthy()
                             asyncio.create_task(_reprobe_for(slot))
+                        if record is not None and dialect is not None:
+                            record.tokens = tokens_from_body(resp.content, dialect)
                         item["response"] = Response(
                             content=resp.content,
                             status_code=resp.status_code,
@@ -676,11 +742,16 @@ async def _validate_and_route(
 
 async def _route_and_wait(
     server: "ServerState", body: dict, backend_path: str,
+    record: RequestRecord | None = None,
 ) -> _RouteDecision:
     """Validate, route, enqueue and wait -- the core of the queued endpoints.
 
     `backend_path` is stamped on the queued item so the slot's consumer
     proxies it to the right backend endpoint (see _queue_consumer).
+
+    When the endpoint passes a request record (phase 4, Q27), it is stamped
+    with enqueued_at and travels with the item as item["record"]; the
+    consumer stamps the rest and the closer or the endpoint finishes it.
     """
     decision, slot_name = await _validate_and_route(server, body)
     if decision is not None:
@@ -691,6 +762,9 @@ async def _route_and_wait(
         "body": body, "event": event, "response": None, "error": None,
         "error_code": None, "backend_path": backend_path,
     }
+    if record is not None:
+        record.enqueued_at = time.monotonic()
+        item["record"] = record
     slot = server.slots[slot_name]
 
     try:
@@ -942,16 +1016,34 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse(
-                {"error": "Invalid JSON body"}, status_code=400
+            body = None
+        record = RequestRecord.from_request(request, "/v1/chat/completions", body)
+        if body is None:
+            response = JSONResponse(
+                {"error": "Invalid JSON body"}, status_code=400,
+                headers={"x-request-id": record.id},
             )
+            record.finish(400, "invalid_body")
+            return response
 
         decision = await _route_and_wait(
-            server, body, backend_path="v1/chat/completions"
+            server, body, backend_path="v1/chat/completions", record=record
         )
         if decision.response is not None:
-            return decision.response
-        return _openai_error_response(decision)
+            response = decision.response
+            response.headers["x-request-id"] = record.id
+            # The endpoint finishes every response except a relayed stream,
+            # whose line the stream's closer writes (phase 4, Q27).
+            if not isinstance(response, StreamingResponse):
+                record.finish(
+                    response.status_code,
+                    "ok" if response.status_code < 400 else "backend_error",
+                )
+            return response
+        response = _openai_error_response(decision)
+        response.headers["x-request-id"] = record.id
+        record.finish(decision.status, decision.code)
+        return response
 
     # ------------------------------------------------------------------
     # POST /v1/messages
@@ -969,15 +1061,34 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         try:
             body = await request.json()
         except Exception:
-            return _anthropic_error_response(
+            body = None
+        record = RequestRecord.from_request(request, "/v1/messages", body)
+        if body is None:
+            response = _anthropic_error_response(
                 _RouteDecision(status=400, code="invalid_body",
                                message="Invalid JSON body")
             )
+            response.headers["x-request-id"] = record.id
+            record.finish(400, "invalid_body")
+            return response
 
-        decision = await _route_and_wait(server, body, backend_path="v1/messages")
+        decision = await _route_and_wait(server, body, backend_path="v1/messages",
+                                         record=record)
         if decision.response is not None:
-            return decision.response
-        return _anthropic_error_response(decision)
+            response = decision.response
+            response.headers["x-request-id"] = record.id
+            # The endpoint finishes every response except a relayed stream,
+            # whose line the stream's closer writes (phase 4, Q27).
+            if not isinstance(response, StreamingResponse):
+                record.finish(
+                    response.status_code,
+                    "ok" if response.status_code < 400 else "backend_error",
+                )
+            return response
+        response = _anthropic_error_response(decision)
+        response.headers["x-request-id"] = record.id
+        record.finish(decision.status, decision.code)
+        return response
 
     # ------------------------------------------------------------------
     # POST /v1/messages/count_tokens
@@ -995,27 +1106,49 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         try:
             body = await request.json()
         except Exception:
-            return _anthropic_error_response(
+            body = None
+        record = RequestRecord.from_request(
+            request, "/v1/messages/count_tokens", body,
+        )
+        if body is None:
+            response = _anthropic_error_response(
                 _RouteDecision(status=400, code="invalid_body",
                                message="Invalid JSON body")
             )
+            response.headers["x-request-id"] = record.id
+            record.finish(400, "invalid_body")
+            return response
 
         decision, slot_name = await _validate_and_route(server, body)
         if decision is not None:
-            return _anthropic_error_response(decision)
+            response = _anthropic_error_response(decision)
+            response.headers["x-request-id"] = record.id
+            record.finish(decision.status, decision.code)
+            return response
 
         slot = server.slots[slot_name]
+        # count_tokens never queues: the endpoint stamps the slot and the
+        # backend call itself, so queue_wait_ms stays null on the line.
+        record.slot = slot_name
+        record.backend_started_at = time.monotonic()
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{slot.url}/v1/messages/count_tokens",
                 json=body,
                 timeout=30,
             )
-        return Response(
+        record.tokens = tokens_from_body(resp.content, "count_tokens")
+        response = Response(
             content=resp.content,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
+            headers={"x-request-id": record.id},
         )
+        record.finish(
+            resp.status_code,
+            "ok" if resp.status_code < 400 else "backend_error",
+        )
+        return response
 
     # ------------------------------------------------------------------
     # Collection retrieval routes (Q28: defined in manager/retrieval.py)
@@ -1044,41 +1177,56 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         requested, 202 if a swap was started. Callers poll GET /status
         (the slot's ``swapping`` and ``loaded_model`` fields) to know when
         the swap lands.
+
+        Every response -- refusal, the already-loaded 200, and the 202 --
+        carries X-Request-Id and writes one swap line (never a request
+        line) to the manager.requests logger (phase 4, Q27).
         """
+        rid, client_host, user_agent = request_context(request)
+        headers = {"x-request-id": rid}
+
+        # The swap line's trial field: False until the body says otherwise.
+        # A non-bool trial is refused before it is read, so the line can
+        # never carry a non-bool.
+        trial = False
+
+        def refuse(status: int, err_type: str, message: str,
+                   model: str | None, slot_name: str | None) -> JSONResponse:
+            # A refused swap logs its line at once; nothing ran, so
+            # duration_ms is null.
+            log_swap(rid, client_host, user_agent, slot_name, model, trial,
+                     status, err_type, None)
+            return JSONResponse(
+                {"error": {"type": err_type, "message": message}},
+                status_code=status, headers=headers,
+            )
+
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse(
-                {"error": {"type": "invalid_body", "message": "Invalid JSON"}},
-                status_code=400,
-            )
+            return refuse(400, "invalid_body", "Invalid JSON", None, None)
 
         model_name = body.get("model")
         if not model_name:
-            return JSONResponse(
-                {"error": {"type": "missing_model", "message": "'model' is required"}},
-                status_code=400,
-            )
+            return refuse(400, "missing_model", "'model' is required",
+                          None, None)
 
         # Checks run in this order: trial's type, the profile, the target,
         # the section, the verification.
         if "trial" in body and not isinstance(body["trial"], bool):
-            return JSONResponse(
-                {"error": {"type": "invalid_trial",
-                           "message": "'trial' must be a boolean"}},
-                status_code=400,
-            )
+            return refuse(400, "invalid_trial", "'trial' must be a boolean",
+                          model_name, None)
         trial = body.get("trial", False)
 
         profile = server.profiles.get(model_name)
         if profile is None:
             # A profile that failed validation is not in the roster either;
             # GET /status's profile_errors says why.
-            return JSONResponse(
-                {"error": {"type": "model_not_found",
-                           "message": (f"no profile for model '{model_name}'; "
-                                       f"add config/models/{model_name}.toml")}},
-                status_code=404,
+            return refuse(
+                404, "model_not_found",
+                (f"no profile for model '{model_name}'; "
+                 f"add config/models/{model_name}.toml"),
+                model_name, None,
             )
 
         valid = ", ".join(repr(n) for n in server.slots)
@@ -1090,45 +1238,55 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             # evict main.
             target = profile.home
         if not isinstance(target, str) or target not in server.slots:
-            return JSONResponse(
-                {"error": {"type": "invalid_target",
-                           "message": f"'target' must be one of: {valid}"}},
-                status_code=400,
-            )
+            return refuse(400, "invalid_target", f"'target' must be one of: {valid}",
+                          model_name, None)
 
         section = profile.section(target)
         if section is None:
-            return JSONResponse(
-                {"error": {"type": "slot_not_allowed",
-                           "message": (f"model '{profile.name}' has no "
-                                       f"[slots.{target}] section; it may run on: "
-                                       f"{', '.join(profile.sections)}")}},
-                status_code=400,
+            return refuse(
+                400, "slot_not_allowed",
+                (f"model '{profile.name}' has no [slots.{target}] section; "
+                 f"it may run on: {', '.join(profile.sections)}"),
+                model_name, target,
             )
 
         if section.verified is None and not trial:
-            return JSONResponse(
-                {"error": {"type": "not_verified",
-                           "message": (f"model '{profile.name}' is not verified on "
-                                       f"slot '{target}'; run scripts/onboard.py "
-                                       f"{profile.name} --slot {target}")}},
-                status_code=400,
+            return refuse(
+                400, "not_verified",
+                (f"model '{profile.name}' is not verified on slot '{target}'; "
+                 f"run scripts/onboard.py {profile.name} --slot {target}"),
+                model_name, target,
             )
 
         slot = server.slots[target]
         if not trial and slot.healthy and same_model(model_name, slot.loaded_model):
-            return {"slot": target, "model": slot.loaded_model, "status": "ok"}
+            # Already loaded and no trial: answer now and log at once. A
+            # JSONResponse (not a plain dict) so the X-Request-Id header
+            # rides along.
+            log_swap(rid, client_host, user_agent, target, model_name, trial,
+                     200, "already_loaded", None)
+            return JSONResponse(
+                {"slot": target, "model": slot.loaded_model, "status": "ok"},
+                status_code=200, headers=headers,
+            )
+
+        started = time.monotonic()
 
         async def _do_swap():
             ok = await server.ensure_model_on_slot(target, model_name, force=trial)
             if not ok:
                 logger.error("background swap failed: %s on slot %s",
                              model_name, target)
+            # The swap line lands when the background task ends; the
+            # duration runs from the 202 to that end.
+            log_swap(rid, client_host, user_agent, target, model_name, trial,
+                     202, "ok" if ok else "failed",
+                     round((time.monotonic() - started) * 1000))
 
         background_tasks.add_task(_do_swap)
         return JSONResponse(
             {"slot": target, "model": model_name, "status": "swapping"},
-            status_code=202,
+            status_code=202, headers=headers,
         )
 
     return app

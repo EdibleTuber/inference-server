@@ -287,7 +287,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "short chat, swap the slot back, and record the pass in the repo "
                     "profile, which you then commit and deploy.")
     parser.add_argument("model",
-                        help="the model to verify (the profile stem; case-insensitive)")
+                        help="the model to verify: its profile's file name without .toml, exactly")
     parser.add_argument("--slot", default=None,
                         help="slot to verify on (default: the profile's home slot)")
     parser.add_argument("--manager", default=None,

@@ -146,13 +146,13 @@ def env(tmp_path):
     return {"repo": repo, "deployed": deployed, "models": models, "put": put}
 
 
-def _run(env, fake, model=NEW, slot="main", *, timeout=5.0):
+def _run(env, fake, model=NEW, slot="main", *, timeout=5.0, poll=0):
     client = httpx.Client(transport=httpx.MockTransport(fake.handler), base_url="http://manager")
     return onboard_mod.onboard(
         model, slot, client=client, repo_profiles=str(env["repo"]),
         deployed_profiles=str(env["deployed"]), models_dir=str(env["models"]),
         llama_version=lambda: (11136, "057494f93"), today=lambda: "2026-10-31",
-        timeout=timeout, poll=0)
+        timeout=timeout, poll=poll)
 
 
 def _two_slots(main_model="Old-Model-Q4", egpu_model="Egpu-Model-Q4"):
@@ -226,6 +226,23 @@ def test_a_slot_that_starts_unhealthy_is_not_mistaken_for_a_failed_trial(env):
     assert _run(env, fake) == 0
 
 
+def test_a_non_home_slot_is_verified_under_its_own_section(env):
+    fake = FakeManager(_two_slots())
+    assert _run(env, fake, slot="egpu") == 0
+    assert (env["repo"] / f"{NEW}.toml").read_text() == PROFILE + VERIFIED_BLOCK.replace(
+        "[slots.main.verified]", "[slots.egpu.verified]")
+    assert [s["target"] for s in fake.swaps] == ["egpu", "egpu"]
+
+
+def test_the_poll_loop_sleeps_poll_seconds_between_polls(env, monkeypatch):
+    """Against a real manager a loop without the sleep is a tight CPU spin."""
+    slept = []
+    monkeypatch.setattr(onboard_mod.time, "sleep", slept.append)
+    fake = FakeManager(_two_slots(), stale=2)
+    assert _run(env, fake, poll=0.5) == 0
+    assert slept and set(slept) == {0.5}
+
+
 # --- trial failures: exit 1, nothing written, swap back still runs -------------
 
 @pytest.mark.parametrize("outcome", ["fail", "fast-fail"])
@@ -271,7 +288,17 @@ def test_a_refused_swap_exits_1_without_polling(env):
             return httpx.Response(400, json={"error": {"type": "slot_not_allowed"}})
         return real(request)
     fake.handler = refuse
+    log = []
+    counted = fake.handler
+
+    def logged(request):
+        log.append(request.url.path)
+        return counted(request)
+    fake.handler = logged
     assert _run(env, fake) == 1
+    # After each refused POST: at most the next swap's one pre-read, never a poll.
+    after = log[log.index("/swap"):]
+    assert after in (["/swap"], ["/swap", "/status", "/swap"]), log
     assert fake.chats == []
     assert (env["repo"] / f"{NEW}.toml").read_text() == PROFILE
 
@@ -387,3 +414,15 @@ def test_the_default_manager_url_comes_from_manager_env(text, url):
     """The manager binds HOST from manager.env; on this host that is the LAN
     address, and 127.0.0.1:11434 refuses connections."""
     assert onboard_mod.manager_url_from_env(text) == url
+
+
+
+def test_the_llama_version_is_read_from_stderr(monkeypatch):
+    """llama-server prints --version to stderr only (checked on the host,
+    2026-11-01: stdout is empty). _llama_version is main()'s probe."""
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr=(
+            "0.00.000.533 I srv  llama_server: initializing ...\n"
+            "version: 0.4.1-dev (build 11136, commit 057494f93)\n"))
+    monkeypatch.setattr(onboard_mod.subprocess, "run", fake_run)
+    assert onboard_mod._llama_version() == (11136, "057494f93")

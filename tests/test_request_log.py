@@ -175,6 +175,17 @@ def test_an_oversized_line_is_dropped_and_parsing_resumes():
     assert _tokens(st.tokens) == (12, 0, 8)
 
 
+def test_the_rest_of_a_dropped_line_is_not_parsed_as_a_line():
+    """Review round 1: once an oversized line is dropped, the bytes up to its
+    newline are still that line, not a fresh one. A counts-shaped tail must
+    not be read, and the next real line must be."""
+    st = StreamTokens("openai")
+    st.feed(b"x" * (1024 * 1024 + 10))
+    st.feed(b'data: {"timings":{"prompt_n":5,"cache_n":0,"predicted_n":7}}\n')
+    assert _tokens(st.tokens) == (None, None, None)
+    st.feed(b"\n" + OPENAI_LAST_CHUNK)
+    assert _tokens(st.tokens) == (12, 0, 8)
+
 def test_a_line_with_no_newline_cannot_grow_memory_without_bound():
     """Review Focus 3: 32 MiB with no newline must not be held in memory."""
     import tracemalloc

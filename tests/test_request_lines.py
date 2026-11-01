@@ -339,3 +339,44 @@ def test_swap_lines(client, caplog, swap_result, case):
     else:
         assert line["duration_ms"] is None
     assert lines(caplog) == []                  # a swap is not also a request line
+
+
+# --- review round 1: a line even when the request path raises ---------------
+
+def test_a_count_tokens_backend_failure_still_writes_a_line(test_config, backend, caplog):
+    """The endpoint's pre-existing behavior on an unreachable backend (the
+    exception escapes, the client gets a 500) is kept; it must still log."""
+    caplog.set_level(logging.INFO, logger="manager.requests")
+
+    def handler(request):
+        raise httpx.ConnectError("down", request=request)
+    backend.handler = handler
+    app = app_mod.create_app(test_config)
+    with TestClient(app, raise_server_exceptions=False) as c:
+        main = app.state.server.slots["main"]
+        main.loaded_model, main.healthy = "test-model-q4", True
+        r = c.post("/v1/messages/count_tokens", json={"model": "test-model-q4", "messages": MSGS})
+    assert r.status_code == 500
+    (line,) = lines(caplog)
+    assert (line["endpoint"], line["status"], line["outcome"], line["slot"]) == (
+        "/v1/messages/count_tokens", 500, "proxy_error", "main")
+
+
+@pytest.mark.asyncio
+async def test_a_raising_stream_closer_still_writes_the_line(caplog):
+    """Client gone before the first chunk: the background task is the only
+    closer. If closing the backend stream raises, the line is still written."""
+    caplog.set_level(logging.INFO, logger="manager.requests")
+
+    async def close():
+        raise RuntimeError("aexit failed")
+    resp = httpx.Response(200, content=b"data: x\n\n",
+                          headers={"content-type": "text/event-stream"})
+    record = _record()
+    relayed = app_mod._relay_stream(resp, close, record=record)
+    try:
+        await relayed.background()
+    except RuntimeError:
+        pass                                    # propagating it is allowed
+    (line,) = lines(caplog)
+    assert (line["id"], line["outcome"]) == ("r1", "client_disconnected")

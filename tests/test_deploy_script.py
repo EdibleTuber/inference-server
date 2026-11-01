@@ -67,9 +67,13 @@ def _run_script(clone, *args, tmp_path, mgr_env="SLOTS=main\n", **overrides):
     env.update({k: str(v) for k, v in overrides.items() if v is not None})
     for k in [k for k, v in overrides.items() if v is None]:
         env.pop(k)
+    # cwd is tmp_path, not pytest's: `python -m` puts the cwd ahead of
+    # PYTHONPATH, so from this checkout the validator would import its
+    # manager/ instead of the clone's, and a script that dropped
+    # PYTHONPATH="$REPO" would still pass.
     return subprocess.run(
         ["bash", str(clone / "scripts/deploy-manager.sh"), *args],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, cwd=tmp_path,
     )
 
 

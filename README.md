@@ -226,7 +226,12 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "last_swap_utc": "2026-09-23T14:02:11+00:00",
       "queue_depth": 0,
       "queue_limit": 20,
-      "models": ["qwen2.5-7b-instruct-q4_k_m"]
+      "models": ["qwen2.5-7b-instruct-q4_k_m"],
+      "state": "idle",
+      "in_flight": 0,
+      "in_flight_age_seconds": null,
+      "oldest_queue_wait_seconds": null,
+      "last_error": null
     },
     "egpu": {
       "host": "127.0.0.1",
@@ -236,7 +241,12 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "last_swap_utc": "2026-10-04T09:12:40+00:00",
       "queue_depth": 1,
       "queue_limit": 20,
-      "models": ["Qwen3.6-35B-A3B-UD-IQ4_NL_XL"]
+      "models": ["Qwen3.6-35B-A3B-UD-IQ4_NL_XL"],
+      "state": "serving",
+      "in_flight": 1,
+      "in_flight_age_seconds": 12.4,
+      "oldest_queue_wait_seconds": 3.1,
+      "last_error": null
     }
   },
   "gpu": {
@@ -263,6 +273,23 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
 ```
 
 `name`, `vram_total_mb`, and `vram_used_mb` at the top of `gpu` always mirror `gpus[0]`, for any consumer that only expects a single GPU.
+
+Per slot (`slots.<name>`):
+
+| Field | Meaning |
+|---|---|
+| `state` | What the slot is doing right now, most pressing first: `swapping` (a swap holds the slot's lock), then `unhealthy` (the last probe failed), then `serving` (a request is in flight), else `idle`. |
+| `in_flight` | Requests the slot is currently serving or relaying. The consumer starts the next queued request while a relayed stream is still running, so this can reach 2 until phase 5. |
+| `in_flight_age_seconds` | Age in seconds (rounded to 1 decimal) of the oldest in-flight request; `null` when none. |
+| `oldest_queue_wait_seconds` | How long in seconds (rounded to 1 decimal) the request at the head of the queue has been waiting; `null` when the queue is empty. |
+| `last_error` | The last slot fault, as `{"code", "message", "at_utc"}` with `code` one of `backend_error` (the backend answered 5xx), `upstream_timeout`, `proxy_error`, `queue_error`, `swap_failed` or `probe_failed`. Set only by slot faults — never by client errors — and never cleared: a later success leaves it in place, so it is the last thing that went wrong, not necessarily something happening now. `null` until a fault. |
+| `host`, `port` | The slot's backend address. |
+| `loaded_model` | What the backend reports loaded; `null` when nothing is. |
+| `healthy` | Whether the most recent probe reached the backend and found a loaded model. |
+| `swapping` | Whether a swap currently holds the slot's lock. |
+| `last_swap_utc` | ISO-8601 UTC time of the slot's last successful swap; `null` if it has never succeeded. |
+| `queue_depth`, `queue_limit` | Requests waiting / the queue's capacity. |
+| `models` | The onboarded models whose profile names this slot as their `home`. |
 
 ### Using with OpenAI Python client
 
@@ -423,7 +450,7 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
 | `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>, "trial": <bool>}`; `target` defaults to the profile's home slot, and the pair must be verified unless `"trial"` is true (a trial reloads even a loaded model). Returns 200 if already loaded and no trial was requested, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. Errors: `invalid_trial`, 404 `model_not_found` (no profile), `invalid_target`, `slot_not_allowed`, `not_verified`. |
 | `GET` | `/v1/models` | Lists the onboarded profiles — models with at least one verified (model, slot) pair — as an OpenAI-compatible model list, each entry with `home_slot`, `verified_slots` and `loaded_on`. |
-| `GET` | `/status` | Per-slot health, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
+| `GET` | `/status` | Per-slot state, health, in-flight and queue-wait ages, last fault, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |

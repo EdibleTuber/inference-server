@@ -39,6 +39,7 @@ from manager.request_log import (
     StreamTokens,
     log_swap,
     request_context,
+    request_id_from,
     tokens_from_body,
 )
 from manager.gpu import get_gpu_info_async
@@ -327,6 +328,7 @@ class ServerState:
             if msg is None:
                 msg = f"Model swap timed out on slot {slot_name}: {model_name}"
             slot.mark_unhealthy()
+            slot.record_error("swap_failed", msg)
             self._drain_slot_queue_with_error(slot_name, msg)
             return False
 
@@ -399,7 +401,8 @@ def _stream_close(ctx, client):
     return close
 
 
-def _relay_stream(resp, close, record=None, stream_tokens=None) -> StreamingResponse:
+def _relay_stream(resp, close, record=None, stream_tokens=None,
+                  on_close=None) -> StreamingResponse:
     """Relay an already-opened backend stream (status < 400) to the client.
 
     `close` runs from the generator's finally and again from the background
@@ -414,6 +417,10 @@ def _relay_stream(resp, close, record=None, stream_tokens=None) -> StreamingResp
     closer, writes the line: ok when the relay reached the end of the
     stream, client_disconnected otherwise. finish is idempotent, so the
     closer and the endpoint can never double-write a relayed stream's line.
+
+    `on_close`, when given, runs from the same background task as the
+    closer: a relayed stream stays in flight on its slot until that moment,
+    never before the stream closes.
     """
     state = {"completed": False}
 
@@ -431,8 +438,11 @@ def _relay_stream(resp, close, record=None, stream_tokens=None) -> StreamingResp
         try:
             await close()
         finally:
-            # The line is written even if close() raises; the exception
-            # propagates afterwards.
+            # The request the relay carries ends here, on every exit path,
+            # even if close() raises; the line is written the same way and
+            # the exception propagates afterwards.
+            if on_close is not None:
+                on_close()
             if record is not None:
                 if stream_tokens is not None:
                     # The sniffed counts live on the StreamTokens until the
@@ -514,12 +524,21 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                     continue
 
                 is_streaming = body.get("stream", False)
-                if record is not None:
-                    # backend_ms runs from the backend call to the line. A
-                    # request refused before the call (wrong_model,
-                    # slot_unavailable) leaves it null.
-                    record.backend_started_at = time.monotonic()
+                # Q27: the request is in flight from just before the backend
+                # call until the response is complete; a request refused
+                # before the call (wrong_model, slot_unavailable) never gets
+                # here. The record's id when there is one, a generated id
+                # otherwise -- an item without a record is still counted and
+                # ended.
+                request_id = (
+                    record.id if record is not None else request_id_from(None)
+                )
+                slot.begin_request(request_id)
+                handed_off = False
                 try:
+                    if record is not None:
+                        # backend_ms runs from the backend call to the line.
+                        record.backend_started_at = time.monotonic()
                     if is_streaming:
                         # The consumer opens the backend stream itself so it
                         # can see the status before the first byte: a 4xx/5xx
@@ -547,6 +566,11 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                             if resp.status_code >= 500:
                                 slot.mark_unhealthy()
                                 asyncio.create_task(_reprobe_for(slot))
+                                slot.record_error(
+                                    "backend_error",
+                                    f"backend returned {resp.status_code} "
+                                    f"on {backend_path}",
+                                )
                             if record is not None and dialect is not None:
                                 record.tokens = tokens_from_body(content, dialect)
                             item["response"] = Response(
@@ -562,10 +586,17 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                                 if record is not None and dialect is not None
                                 else None
                             )
+                            # The relay owns this request's end: its closer
+                            # runs when the stream closes, never before. The
+                            # default argument pins request_id to THIS item
+                            # -- the loop rebinds the name for the next item.
                             item["response"] = _relay_stream(
                                 resp, close, record=record,
                                 stream_tokens=stream_tokens,
+                                on_close=lambda rid=request_id:
+                                    slot.end_request(rid),
                             )
+                            handed_off = True
                     else:
                         async with httpx.AsyncClient() as client:
                             resp = await client.post(
@@ -577,6 +608,11 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                         if resp.status_code >= 500:
                             slot.mark_unhealthy()
                             asyncio.create_task(_reprobe_for(slot))
+                            slot.record_error(
+                                "backend_error",
+                                f"backend returned {resp.status_code} "
+                                f"on {backend_path}",
+                            )
                         if record is not None and dialect is not None:
                             record.tokens = tokens_from_body(resp.content, dialect)
                         item["response"] = Response(
@@ -595,11 +631,23 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                         f"{config.proxy_read_timeout}s"
                     )
                     item["error_code"] = "upstream_timeout"
+                    slot.record_error("upstream_timeout", item["error"])
                 except Exception as exc:
                     logger.exception("slot=%s proxy error: %s", slot_name, exc)
                     item["error"] = f"Proxy error: {exc}"
                     slot.mark_unhealthy()
                     asyncio.create_task(_reprobe_for(slot))
+                    slot.record_error("proxy_error", item["error"])
+                finally:
+                    # Q27: every exit path ends the request, cancellation
+                    # included -- CancelledError skips the except clauses
+                    # above but not a finally, so a cancelled consumer
+                    # cannot leak an entry that would show the slot serving
+                    # forever. The one exception is a stream handed to a
+                    # relay (handed_off): its closer ends it, never before
+                    # the stream closes.
+                    if not handed_off:
+                        slot.end_request(request_id)
 
             except Exception as exc:
                 # A per-item failure must never end the consumer (F2 part 2):
@@ -609,6 +657,7 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 logger.exception("slot=%s internal error: %s", slot_name, exc)
                 item["error"] = f"Internal error on slot {slot_name}: {exc}"
                 item["error_code"] = "queue_error"
+                slot.record_error("queue_error", item["error"])
                 event.set()
                 continue
 

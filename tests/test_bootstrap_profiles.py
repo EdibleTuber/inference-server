@@ -37,7 +37,9 @@ EXPECTED = {
     },
     "gemma-4-26b-a4b-it-q4_k_m": {
         "home": "egpu",
-        "sampling": "--temp 1.0 --top-k 64 --top-p 0.95 --min-p 0.0 "
+        # The GGUF's general.sampling.* sets only temp, top_k and top_p, so
+        # min_p is b11136's default, as for Qwen3.6.
+        "sampling": "--temp 1.0 --top-k 64 --top-p 0.95 --min-p 0.05 "
                     "--presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0",
         "flags": COMMON,
     },

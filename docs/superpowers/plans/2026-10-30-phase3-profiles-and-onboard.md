@@ -327,7 +327,7 @@ Values come from the **live** sidecars and env files, read 2026-10-30. Wherever 
 |---|---|---|---|---|---|---|
 | Qwen3.8-27B-UD-Q6_K | main | main | 131072 | -1 | 1.0, 20, 0.95, 0.0, 0.0, 0.0, 1.0 | `--jinja --ctx-checkpoints 4 --n-predict 32768 --spec-type draft-mtp --spec-draft-n-max 1` |
 | Qwen3.6-35B-A3B-UD-IQ4_NL_XL | egpu | egpu | 131072 | -1 | 0.6, 20, 0.95, **0.05**, 0.0, 0.0, 1.0 | `--jinja --ctx-checkpoints 4 --n-predict 32768` |
-| gemma-4-26b-a4b-it-q4_k_m | egpu (Q42) | egpu | 131072 | -1 | 1.0, 64, 0.95, 0.0, 0.0, 0.0, 1.0 | `--jinja --ctx-checkpoints 4 --n-predict 32768` |
+| gemma-4-26b-a4b-it-q4_k_m | egpu (Q42) | egpu | 131072 | -1 | 1.0, 64, 0.95, **0.05**, 0.0, 0.0, 1.0 | `--jinja --ctx-checkpoints 4 --n-predict 32768` |
 
 Comments to carry into the profiles. Task 2 deleted them from the slot env templates and units, so take them from git: `git show 67a0f44:config/llama-server.env`, `git show 67a0f44:config/llama-server-egpu.env`, `git show 67a0f44:systemd/llama-server.service`.
 - **Every profile:** the `--ctx-checkpoints 4` rationale (ggml-org/llama.cpp#23181: the default of 32 grows unbounded and can OOM the P40's VRAM, and `--cache-ram 0` doesn't stop checkpoint creation), and `--jinja` being required for tool calling.
@@ -361,7 +361,7 @@ Claude hands over each command once it has run its read-only half. Before starti
 1. **Backups:** the two units, the two slot env files and `manager.env`, to `/root/phase3/`.
 2. **Directory:** `sudo install -d -o _llama-mgr -g _llama-mgr -m 755 /var/lib/llama-manager`
 3. **Deploy:** run `deploy-manager.sh`. It installs the code and profiles. The old units keep running until step 5. Nothing is verified yet, so `/swap` refuses everything that isn't a trial, which keeps swaps from landing mid-cutover.
-4. **Initial model env files:** as `_llama-mgr`, run `python -m manager.profiles render /etc/llama/models.d <model> <slot> --write /var/lib/llama-manager/<slot>.env` for Qwen3.8 on main and for Qwen3.6 on egpu.
+4. **Initial model env files:** for Qwen3.8 on main and for Qwen3.6 on egpu, run `sudo -u _llama-mgr env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/llama /opt/llama/manager/venv/bin/python -m manager.profiles render /etc/llama/models.d <model> <slot> --slots main,egpu --models-dir /opt/llama/models | sudo -u _llama-mgr tee /var/lib/llama-manager/<slot>.env`. (Corrected 2026-11-01: the CLI has no `--write`, `--slots` and `--models-dir` are required, and without `PYTHONPATH=/opt/llama` the module is not found outside the repo. Untested until step 3's deploy puts `profiles.py` in `/opt/llama/manager/`.)
 5. **New units:** install the new units and the stripped slot env files, keeping each host's real `CUDA_VISIBLE_DEVICES`. Then run `daemon-reload` and restart both llama-servers.
    - **Claude verifies** that each backend's `/proc/<pid>/cmdline` equals the slot flags followed by the rendered `MODEL_ARGS`.
 6. **Onboard, then deploy:**

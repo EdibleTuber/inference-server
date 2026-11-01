@@ -59,7 +59,7 @@ n_gpu_layers = -1
 #   default of 32 is too high for this card and grows unbounded
 #   (ggml-org/llama.cpp#23181), and --cache-ram 0 in the unit's ExecStart
 #   does NOT disable checkpoint creation -- unbounded growth can OOM the
-#   P40's VRAM.
+#   V100's VRAM.
 #
 # --n-predict 32768: cap on generated tokens; carried over from the live
 #   sidecar.

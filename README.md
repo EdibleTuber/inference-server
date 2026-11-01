@@ -613,8 +613,11 @@ sudo cp systemd/llama-server-egpu.service /etc/systemd/system/
 sudo cp config/llama-server-egpu.env /etc/llama/llama-server-egpu.env
 # The unit loads its generated model env file (an EnvironmentFile= without a
 # leading "-") before its static env file and refuses to start without it,
-# so render the first one from the model's profile:
-/opt/llama/manager/venv/bin/python -m manager.profiles render \
+# so render the first one from the model's profile. The manager must be
+# deployed first (deploy-manager.sh installs profiles.py to
+# /opt/llama/manager/), and outside a repo checkout PYTHONPATH=/opt/llama
+# puts the package on the path:
+PYTHONPATH=/opt/llama /opt/llama/manager/venv/bin/python -m manager.profiles render \
   /etc/llama/models.d Qwen3.6-35B-A3B-UD-IQ4_NL_XL egpu \
   --slots main,egpu --models-dir /opt/llama/models \
   | sudo tee /var/lib/llama-manager/egpu.env >/dev/null
@@ -623,7 +626,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now llama-server-egpu
 ```
 
-The manager never writes the static env file: on every swap it renders the model's profile into the generated one, and the unit loads that first. (`setup.sh` creates `/var/lib/llama-manager` but does not render `main.env` either — the same `render` command with `main`'s model and slot produces it.)
+The manager never writes the static env file: on every swap it renders the model's profile into the generated one, and the unit loads that first. (`setup.sh` creates `/var/lib/llama-manager` but does not render `main.env` either — the same command above, with `main`'s model and slot, produces it.)
 
 Then make sure the slot is in `SLOTS` in `/etc/llama/manager.env`, and that `/etc/sudoers.d/llama-manager` lets `_llama-mgr` restart that unit — `manager/swap.py` runs `sudo systemctl restart <unit>` for whichever slot it swaps. `setup.sh` writes the entries for `llama-server.service` and `llama-server-egpu.service`; any further slot's entry is added by hand with `sudo visudo -f /etc/sudoers.d/llama-manager`. For `egpu`, also set the P40's UUID in `CUDA_VISIBLE_DEVICES` (see the next section) before starting it.
 

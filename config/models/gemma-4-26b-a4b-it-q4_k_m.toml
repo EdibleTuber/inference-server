@@ -55,16 +55,17 @@ flags = ["--jinja", "--ctx-checkpoints", "4", "--n-predict", "32768"]
 
 # Sampling: every sampler llama.cpp applies, all keys required.
 #
-# temp, top_k and top_p come from the GGUF's general.sampling.* metadata
-# (temp 1.0, top_k 64, top_p 0.95) -- the values llama-server would apply
-# from the file itself. min_p and the three penalties are not part of that
-# metadata; every profile must spell out all seven keys, so they are written
-# out here, at the values this model ran with before profiles.
+# The GGUF's general.sampling.* metadata sets only temp, top_k and top_p
+# (temp 1.0, top_k 64, top_p 0.95) -- the values llama-server applies from
+# the file itself. With no sidecar, the model ran at llama.cpp b11136's
+# defaults for the rest: min_p 0.05, presence and frequency penalty 0.0,
+# repeat penalty 1.0. The profile keeps those to preserve its behaviour, as
+# the Qwen3.6 profile does.
 [slots.egpu.sampling]
 temp = 1.0
 top_k = 64
 top_p = 0.95
-min_p = 0.0
+min_p = 0.05
 presence_penalty = 0.0
 frequency_penalty = 0.0
 repeat_penalty = 1.0

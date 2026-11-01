@@ -14,9 +14,9 @@
 # the unit's ExecStart on 2026-10-30. Where the old config was silent, the
 # value is llama.cpp b11136's own default.
 #
-# There is no [slots.main.verified] table yet: scripts/onboard.py adds it
-# after a successful trial load. Until then /swap refuses the model unless
-# "trial" is true.
+# The [slots.main.verified] table at the end is written by
+# scripts/onboard.py after a successful trial load. Without it /swap
+# refuses the model unless "trial" is true; delete it to re-verify.
 
 home = "main"
 

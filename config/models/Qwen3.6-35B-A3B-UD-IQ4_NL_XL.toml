@@ -21,9 +21,9 @@
 # P40. Consumers request it by this profile's name (PARE's default model,
 # opencode's editor agent).
 #
-# There is no [slots.egpu.verified] table yet: scripts/onboard.py adds it
-# after a successful trial load. Until then /swap refuses the model unless
-# "trial" is true.
+# The [slots.egpu.verified] table at the end is written by
+# scripts/onboard.py after a successful trial load. Without it /swap
+# refuses the model unless "trial" is true; delete it to re-verify.
 
 home = "egpu"
 

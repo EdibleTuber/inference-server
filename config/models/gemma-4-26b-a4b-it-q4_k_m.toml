@@ -16,20 +16,19 @@
 # swap to gemma leaves the previous model's --spec-* flags off the command
 # line.
 #
-# There is no [slots.egpu.verified] table yet: scripts/onboard.py adds it
-# after a successful trial load. Until then /swap refuses the model unless
-# "trial" is true.
+# The [slots.egpu.verified] table at the end is written by
+# scripts/onboard.py after a successful trial load. Without it /swap
+# refuses the model unless "trial" is true; delete it to re-verify.
 
 home = "egpu"
 
 [slots.egpu]
 # Context window size in tokens.
 #
-# NOT measured on the P40 for this model. The other egpu profile's ctx_size
-# came from llama-server's own accounting after a real load; this one is a
-# starting point at the slot's usual 131072. The trial load
-# scripts/onboard.py runs is the measurement: if it OOMs the P40, lower this
-# before the pair can be verified.
+# The slot's usual 131072, confirmed by a real load on the P40 on
+# 2026-11-01 (llama.cpp build 11136): n_ctx_slot = 131072 with no auto-fit
+# warning, and nvidia-smi showed 19370 of 23040 MiB in use once loaded. Re-run
+# that check after changing this value, the model or the build.
 ctx_size = 131072
 
 # Number of model layers to offload to GPU. -1 = all (auto-fit). Same

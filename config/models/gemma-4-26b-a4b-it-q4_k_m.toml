@@ -1,0 +1,70 @@
+# config/models/gemma-4-26b-a4b-it-q4_k_m.toml
+# Profile for gemma-4-26b-a4b-it-q4_k_m, a candidate model for the `egpu`
+# slot (Tesla P40 eGPU).
+#
+# This file is the roster entry for the model. `manager/profiles.py`
+# validates it; on every swap the manager renders its [slots.egpu] section
+# into the slot's generated model env file (/var/lib/llama-manager/egpu.env)
+# as the whole MODEL_ARGS line, and the slot's unit loads that file before
+# its static env file. Every model flag the slot runs comes from this
+# profile: a flag it does not mention is absent, never inherited from the
+# previous model.
+#
+# This is the Q42 regression case. gemma has no MTP layer, so it carries no
+# --spec-* flags (there is nothing for speculative decoding to draft with).
+# Rendering the whole MODEL_ARGS line from this profile is what guarantees a
+# swap to gemma leaves the previous model's --spec-* flags off the command
+# line.
+#
+# There is no [slots.egpu.verified] table yet: scripts/onboard.py adds it
+# after a successful trial load. Until then /swap refuses the model unless
+# "trial" is true.
+
+home = "egpu"
+
+[slots.egpu]
+# Context window size in tokens.
+#
+# NOT measured on the P40 for this model. The other egpu profile's ctx_size
+# came from llama-server's own accounting after a real load; this one is a
+# starting point at the slot's usual 131072. The trial load
+# scripts/onboard.py runs is the measurement: if it OOMs the P40, lower this
+# before the pair can be verified.
+ctx_size = 131072
+
+# Number of model layers to offload to GPU. -1 = all (auto-fit). Same
+# auto-fit caveat as the Qwen3.6 profile: check nvidia-smi after a start.
+n_gpu_layers = -1
+
+# Extra llama-server flags, one token per list item, in order.
+#
+# --jinja: enable Jinja2 chat-template parsing. Required for tool calling;
+#   without it the model's tool-calling template never applies.
+#
+# --ctx-checkpoints 4: cap GPU-side context-checkpoint accumulation. The
+#   default of 32 is too high for this card and grows unbounded
+#   (ggml-org/llama.cpp#23181), and --cache-ram 0 in the unit's ExecStart
+#   does NOT disable checkpoint creation -- unbounded growth can OOM the
+#   P40's VRAM.
+#
+# --n-predict 32768: cap on generated tokens.
+#
+# No --spec-* flags: this GGUF has no MTP layer, so there is nothing for
+# speculative decoding to draft with (the Q42 regression case).
+flags = ["--jinja", "--ctx-checkpoints", "4", "--n-predict", "32768"]
+
+# Sampling: every sampler llama.cpp applies, all keys required.
+#
+# temp, top_k and top_p come from the GGUF's general.sampling.* metadata
+# (temp 1.0, top_k 64, top_p 0.95) -- the values llama-server would apply
+# from the file itself. min_p and the three penalties are not part of that
+# metadata; every profile must spell out all seven keys, so they are written
+# out here, at the values this model ran with before profiles.
+[slots.egpu.sampling]
+temp = 1.0
+top_k = 64
+top_p = 0.95
+min_p = 0.0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repeat_penalty = 1.0

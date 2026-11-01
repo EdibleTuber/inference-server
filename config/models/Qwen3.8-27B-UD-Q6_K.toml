@@ -1,0 +1,109 @@
+# config/models/Qwen3.8-27B-UD-Q6_K.toml
+# Profile for Qwen3.8-27B-UD-Q6_K (Q6_K, ~20.5 GiB of weights) -- the model
+# the `main` slot (Tesla V100) boots with.
+#
+# This file is the roster entry for the model. `manager/profiles.py`
+# validates it; on every swap the manager renders its [slots.main] section
+# into the slot's generated model env file (/var/lib/llama-manager/main.env)
+# as the whole MODEL_ARGS line, and the slot's unit loads that file before
+# its static env file. Every model flag the slot runs comes from this
+# profile: a flag it does not mention is absent, never inherited from the
+# previous model.
+#
+# Values are the live ones, read from the slot's sidecar, its env file and
+# the unit's ExecStart on 2026-10-30. Where the old config was silent, the
+# value is llama.cpp b11136's own default.
+#
+# There is no [slots.main.verified] table yet: scripts/onboard.py adds it
+# after a successful trial load. Until then /swap refuses the model unless
+# "trial" is true.
+
+home = "main"
+
+[slots.main]
+# Context window size in tokens.
+#
+# Measured, not projected. Qwen3.8-27B is hybrid linear attention: of its
+# 64 layers only every 4th (full_attention_interval=4) holds a KV cache, so
+# 16 layers x 4 KV heads x (256+256) x 2 bytes = 64 KiB/token. Confirmed by
+# loading it and reading llama-server's own accounting:
+#
+#   llama_kv_cache:        size = 2048.00 MiB ( 32768 cells, 16 layers, 4/1 seqs)
+#   llama_memory_recurrent: size =  598.50 MiB (     4 cells, 64 layers, 4 seqs)
+#
+# The recurrent state is a fixed cost that scales with sequence count, not
+# with context. Budget against the V100's 31.73 GiB:
+#
+#   weights 20.5 + KV 8.0 (131072 @ 64 KiB) + recurrent + compute ~= 29.4 GiB
+#
+# leaving ~2.3 GiB headroom. The model's native context is 262144, which
+# needs 16 GiB of f16 KV and does NOT fit; reaching it requires q8_0 KV
+# quantization (--cache-type-k/-v q8_0), which halves the KV term back to
+# 8 GiB and depends on flash attention. Not enabled here yet.
+#
+# Re-derive this from the llama_kv_cache line after any model change rather
+# than scaling the number -- `-lv 5` is required to surface that line on
+# b11136.
+ctx_size = 131072
+
+# Number of model layers to offload to GPU. -1 = all; the V100 has 32494
+# MiB and the weights are ~20.5 GiB, so all layers fit.
+n_gpu_layers = -1
+
+# Extra llama-server flags, one token per list item, in order.
+#
+# --jinja: enable Jinja2 chat-template parsing. Required for tool calling;
+#   without it the model's tool-calling template never applies.
+#
+# --ctx-checkpoints 4: cap GPU-side context-checkpoint accumulation. The
+#   default of 32 is too high for this card and grows unbounded
+#   (ggml-org/llama.cpp#23181), and --cache-ram 0 in the unit's ExecStart
+#   does NOT disable checkpoint creation -- unbounded growth can OOM the
+#   P40's VRAM.
+#
+# --n-predict 32768: cap on generated tokens; carried over from the live
+#   sidecar.
+#
+# --spec-type draft-mtp, --spec-draft-n-max 1: not sampling -- speculative
+#   decoding with the model's own MTP head (blk.64.nextn.* in this GGUF;
+#   nextn_predict_layers=1). It is model-specific: a GGUF without an MTP
+#   layer has nothing to draft with, so it must change with the model.
+#   Measured 2026-10-04 on the V100, 3 planner prompts x 1500 tokens,
+#   thinking on:
+#
+#     baseline   26.4 tok/s gen   547 tok/s prefill
+#     n-max 1    36.9 (+40%)      486 (-11%)   65% of drafts accepted
+#     n-max 2    37.0 (+40%)      486          49%   (worse worst case)
+#     n-max 3    34.3 (+30%)      487          39%
+#
+#   n-max 1 costs ~1.2 GiB of VRAM at this ctx_size (28.6 -> 29.8 GiB).
+#   Speculative decoding verifies every drafted token against the main
+#   model, so by design it changes speed, not output. Measured at
+#   0.3k-2.7k of context only.
+flags = ["--jinja", "--ctx-checkpoints", "4", "--n-predict", "32768",
+         "--spec-type", "draft-mtp", "--spec-draft-n-max", "1"]
+
+# Sampling: every sampler llama.cpp applies, all keys required.
+#
+# The values are Qwen3.8-27B's published THINKING-mode recommendation, which
+# is the mode in use (the server log reports "chat template supports
+# preserving reasoning, it is enabled by default"). How the old config got
+# it wrong: the deployed unit carried a hardcoded "--temp 0.2", set for
+# gemma-4-26b when that model lived in this slot. gemma left; the 0.2
+# stayed and was silently applied to Qwen3.8-27B, which ships a recommended
+# temp of 1.0 -- five times higher. Low temperature on a reasoning model is
+# not "more precise"; it narrows the thinking phase and tends toward
+# repetition and shallow analysis. Qwen's own guidance for multi-turn
+# agentic work says as much.
+#
+# Qwen's instruct/non-thinking mode wants different values -- temp 0.7,
+# top-p 0.80, presence-penalty 1.5 -- so if this slot is ever run in that
+# mode, change these too.
+[slots.main.sampling]
+temp = 1.0
+top_k = 20
+top_p = 0.95
+min_p = 0.0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repeat_penalty = 1.0

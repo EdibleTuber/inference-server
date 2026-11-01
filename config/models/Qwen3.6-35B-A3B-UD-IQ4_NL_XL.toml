@@ -1,0 +1,91 @@
+# config/models/Qwen3.6-35B-A3B-UD-IQ4_NL_XL.toml
+# Profile for Qwen3.6-35B-A3B (unsloth UD-IQ4_NL_XL, 18.16 GiB) -- the model
+# the `egpu` slot (Tesla P40 eGPU) boots with.
+#
+# This file is the roster entry for the model. `manager/profiles.py`
+# validates it; on every swap the manager renders its [slots.egpu] section
+# into the slot's generated model env file (/var/lib/llama-manager/egpu.env)
+# as the whole MODEL_ARGS line, and the slot's unit loads that file before
+# its static env file. Every model flag the slot runs comes from this
+# profile: a flag it does not mention is absent, never inherited from the
+# previous model.
+#
+# Values are the live ones, read from the slot's sidecar, its env file and
+# the unit's ExecStart on 2026-10-30. Where the old config was silent, the
+# value is llama.cpp b11136's own default.
+#
+# Chosen for this slot by benchmark over gemma-4-26b-a4b, Qwen3.5-35B-A3B,
+# Qwen3-Coder-30B-A3B and Devstral-Small-2 on this card: 10/10 on opencode
+# editor tasks, the fastest prefill and generation past 8k of context, and
+# the only candidate besides gemma to fit the full 131072 context on the
+# P40. Consumers request it by this profile's name (PARE's default model,
+# opencode's editor agent).
+#
+# There is no [slots.egpu.verified] table yet: scripts/onboard.py adds it
+# after a successful trial load. Until then /swap refuses the model unless
+# "trial" is true.
+
+home = "egpu"
+
+[slots.egpu]
+# Context window size in tokens.
+#
+# Measured, not projected. Qwen3.6-35B-A3B keeps a KV cache on only 10 of its
+# 40 layers (3 Gated DeltaNet : 1 gated attention), 2 KV heads x 256 dims, so
+# ~20 KiB/token. llama-server's own accounting at this value:
+#
+#   llama_kv_cache: size = 2560.00 MiB (131072 cells, 10 layers, 1/1 seqs)
+#   common_params_fit_impl: will leave 1767 >= 1024 MiB of free device memory
+#
+# i.e. 18071 MiB weights + 2560 MiB KV + compute, everything on the GPU with
+# ~1.7 GiB to spare. Re-derive from those two log lines after any model
+# change rather than scaling the number.
+ctx_size = 131072
+
+# Number of model layers to offload to GPU. -1 = all.
+#
+# "All layers" is not "all weights": llama.cpp's load-time auto-fit keeps a
+# 1024 MiB free margin and, if the model would breach it, silently moves MoE
+# expert tensors to system RAM while still reporting every layer offloaded.
+# Observed twice on 2026-10-03/04: Qwen3-Coder-30B at 64k context lost 5
+# layers' experts to RAM, and this slot started while another process held
+# the P40 and loaded almost entirely into RAM (708 MiB on the card, 4.8 tok/s
+# instead of ~47). Check after any start: `nvidia-smi` should show ~21 GiB on
+# the P40, and the fit decision is in the log as `common_params_fit_impl`
+# lines (needs -lv 5 on this build).
+n_gpu_layers = -1
+
+# Extra llama-server flags, one token per list item, in order.
+#
+# --jinja: enable Jinja2 chat-template parsing. Required for tool calling;
+#   without it the model's tool-calling template never applies.
+#
+# --ctx-checkpoints 4: cap GPU-side context-checkpoint accumulation. The
+#   default of 32 is too high for this card and grows unbounded
+#   (ggml-org/llama.cpp#23181), and --cache-ram 0 in the unit's ExecStart
+#   does NOT disable checkpoint creation -- unbounded growth can OOM the
+#   P40's VRAM.
+#
+# --n-predict 32768: cap on generated tokens; carried over from the live
+#   sidecar.
+flags = ["--jinja", "--ctx-checkpoints", "4", "--n-predict", "32768"]
+
+# Sampling: every sampler llama.cpp applies, all keys required.
+#
+# The values are Qwen3.6-35B-A3B's published "thinking mode, precise coding"
+# recommendation from its model card: temp 0.6, top-p 0.95, top-k 20,
+# presence-penalty 0. Its general thinking preset differs (temp 1.0,
+# presence-penalty 1.5) -- this slot serves agentic code editing, hence these.
+#
+# min_p is not on the card: the card says 0.0, but 0.05 is llama.cpp b11136's
+# own default and the old config was silent on it, so the model has always run
+# at 0.05. Kept to preserve today's behaviour -- changing it is tuning, which
+# belongs in the benchmarking review, not in this refactor.
+[slots.egpu.sampling]
+temp = 0.6
+top_k = 20
+top_p = 0.95
+min_p = 0.05
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repeat_penalty = 1.0

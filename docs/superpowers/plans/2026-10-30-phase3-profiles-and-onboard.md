@@ -283,7 +283,7 @@ llama_cpp_commit = "057494f93"
 
 **Files:** Modify `scripts/deploy-manager.sh`, `scripts/doctor.sh`, `scripts/setup.sh` and `config/manager.env`.
 - In `config/manager.env`: drop `SLOT_*_MODELS` together with the "Home slot per model" comment above them (it cites `routing.home_slot`, deleted in Task 3), and add `PROFILES_DIR=/etc/llama/models.d` and `MODEL_ENV_DIR=/var/lib/llama-manager`. Also fix its comment at line 15, which still says the manager updates `MODEL_PATH` in the slot env file during swaps (found in the Task 2 review).
-- Tests, committed by Claude: additions to `tests/test_deploy_script.py` and `tests/test_doctor.py`.
+- Tests, committed by Claude: `tests/test_deploy_script.py` and additions to `tests/test_repo_consistency.py`; see the pinned notes.
 
 **Interfaces:**
 - **`deploy-manager.sh`** takes new env overrides: `DEPLOY_PROFILES_DEST`, default `/etc/llama/models.d`; and `DEPLOY_MODELS_DIR`, default `MODELS_DIR` from the manager env, else `/opt/llama/models`.
@@ -299,6 +299,17 @@ llama_cpp_commit = "057494f93"
   5. `manager.env` has no `SLOT_*_MODELS`.
   6. `python -m manager.profiles check /etc/llama/models.d` passes.
 - **`setup.sh`** creates `/var/lib/llama-manager` (`_llama-mgr`, 755) and installs `config/models/*.toml` to `/etc/llama/models.d/`.
+
+**Pinned by the committed tests (2026-11-01, checked against a reference implementation; thirteen hand mutants all killed).** Two points correct the Interfaces block above, which this plan got wrong; deviating from it there is correct:
+- **Validation runs in both modes, before any exit decision (correction).** Run `manager.profiles check` right after the drift report and before the "Everything deployed matches" / `--check` / root-check exits, not after the suite. An invalid profile then exits 5 from `--check` too, even with no drift, and before anything installs. As planned it sat behind the root check, where nothing but a real `sudo` deploy could reach it, and `--check` (and doctor's check 7) would have called a broken profile clean.
+- **Untracked profiles are refused (correction).** The dirty-tree check uses `--untracked-files=no`, so a `.toml` dropped into `config/models/` but never committed would ship unreviewed. A non-`--check` run with any `git ls-files --others --exclude-standard -- 'config/models/*.toml'` output exits 3 and names the files.
+- New override `DEPLOY_PYTHON`, default `$DEST/venv/bin/python`. The validator runs as `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO" "$PY" -m manager.profiles check ...`, and its own error lines are shown, not swallowed.
+- `MODELS_DIR` is `DEPLOY_MODELS_DIR`, else `MODELS_DIR` from the manager env, else `/opt/llama/models`. `SLOTS` comes from the manager env, default `main`.
+- A checkout with no `config/models/*.toml` exits 5: the validator reports the missing directory.
+- Profile drift lines use the file's basename in the existing `printf '  %-22s ...'` format; a missing `$DEPLOY_PROFILES_DEST` means every profile is `absent`.
+- `config/manager.env`: `PROFILES_DIR` equals `ManagerConfig.from_env()`'s default and `MODEL_ENV_DIR` equals `build_slots`'s; no `SLOT_*_MODELS`, and neither `home_slot` nor `MODEL_PATH` appears anywhere in the file, comments included.
+- **Not reachable from the suite** (root and host state): the install and extras-removal lines, all of `doctor.sh`'s new checks, and `setup.sh`. They are verified on the host in Task 7. Doctor check 6 runs `manager.profiles check /etc/llama/models.d --slots <the list_slots names, comma-joined> --models-dir <MODELS_DIR from the manager env, default /opt/llama/models>`. Check 2 passes when the installed unit's `EnvironmentFile=/var/lib/llama-manager/<slot>.env` line comes before the line naming the slot's env file.
+- Test files in this task's test commit: `tests/test_deploy_script.py` (every clone now commits one valid profile and points all four `DEPLOY_*` paths at tmp; the two existing tests keep their assertions), additions to `tests/test_repo_consistency.py`. `tests/test_doctor.py` is unchanged.
 
 - [ ] Steps: run the tests (they fail) → implement → full suite passes → commit `feat(ops): deploy and doctor know about profiles (Q31)`.
 

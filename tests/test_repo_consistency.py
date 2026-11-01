@@ -36,3 +36,23 @@ def test_every_top_level_requirement_is_pinned_in_the_lock():
             if l.strip() and not l.startswith("#")}
     for r in reqs:
         assert name(r) in lock and "==" in lock[name(r)], r
+
+
+def test_the_template_names_the_profile_and_model_env_dirs_the_code_defaults_to(monkeypatch):
+    """manager.env spells out PROFILES_DIR and MODEL_ENV_DIR, and they are the
+    code's own defaults, so the template and an unset key agree."""
+    from manager.config import ManagerConfig
+    env = _template_env()
+    for key in ("PROFILES_DIR", "MODEL_ENV_DIR", "SLOTS"):
+        monkeypatch.delenv(key, raising=False)
+    assert env["PROFILES_DIR"] == ManagerConfig.from_env().profiles_dir
+    default_main = build_slots(getenv=lambda k: None)[0]
+    assert default_main.model_env_file == f"{env['MODEL_ENV_DIR']}/main.env"
+
+
+def test_the_template_has_no_pre_profile_settings():
+    text = (REPO / "config/manager.env").read_text()
+    assert not [k for k in _template_env() if re.fullmatch(r"SLOT_\w+_MODELS", k)]
+    # The home map's comment and the in-place MODEL_PATH rewrite are both gone.
+    assert "home_slot" not in text
+    assert "MODEL_PATH" not in text

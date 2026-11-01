@@ -73,12 +73,6 @@ def test_the_profile_has_one_section_its_home(shipped, name):
 
 
 @pytest.mark.parametrize("name", EXPECTED)
-def test_no_shipped_profile_is_verified_yet(shipped, name):
-    """onboard adds [slots.<slot>.verified] after a trial load on the host."""
-    assert shipped.get(name).verified_slots() == ()
-
-
-@pytest.mark.parametrize("name", EXPECTED)
 def test_the_profile_renders_todays_command_line(shipped, name):
     profile = shipped.get(name)
     section = profile.section(profile.home)

@@ -168,12 +168,17 @@ def test_manager_errors_log_their_code(client, caplog, code):
     assert r.headers["x-request-id"] == line["id"]
 
 
-def test_an_invalid_json_body_logs_invalid_body(client, caplog):
-    r = client.post("/v1/messages", content=b"{not json",
+@pytest.mark.parametrize("path", [
+    "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
+])
+def test_an_invalid_json_body_logs_invalid_body(client, caplog, path):
+    """Mutation run (M21): every endpoint's 400 carries the line's id."""
+    r = client.post(path, content=b"{not json",
                     headers={"content-type": "application/json"})
     assert r.status_code == 400
     (line,) = lines(caplog)
-    assert (line["outcome"], line["model"]) == ("invalid_body", None)
+    assert (line["endpoint"], line["outcome"], line["model"]) == (path, "invalid_body", None)
+    assert r.headers["x-request-id"] == line["id"]
 
 
 def test_a_backend_5xx_logs_backend_error_with_its_status(client, backend, caplog):

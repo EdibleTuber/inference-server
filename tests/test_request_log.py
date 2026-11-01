@@ -129,6 +129,14 @@ def test_openai_stream_tokens_come_from_the_last_chunks_timings():
     assert _tokens(st.tokens) == (12, 0, 8)
 
 
+def test_a_usage_line_after_the_timings_line_does_not_override_it():
+    """Mutation run (M10): timings is the source; a later usage line (as a
+    gateway or stream_options.include_usage may add) is only a fallback."""
+    st = StreamTokens("openai")
+    st.feed(OPENAI_STREAM.replace(b"data: [DONE]", b'data: {"choices":[],"usage":'
+            b'{"prompt_tokens":99,"completion_tokens":98}}\n\ndata: [DONE]'))
+    assert _tokens(st.tokens) == (12, 0, 8)
+
 def test_stream_tokens_survive_a_line_split_across_chunks():
     """Review Focus 1: the backend's write boundary can fall anywhere,
     including inside the one line that carries the counts."""

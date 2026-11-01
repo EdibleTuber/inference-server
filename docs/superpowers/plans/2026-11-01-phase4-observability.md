@@ -151,6 +151,17 @@ Each item names the task whose tests pin it:
 - `test_swap_lines[refused|already_loaded|accepted_ok|accepted_failed]`.
 - `test_a_raising_log_write_does_not_fail_the_request`: `logging.Logger.info` on `manager.requests` is patched to raise, and the request still returns its 200 and its bytes.
 
+**Pinned by the committed tests** (added 2026-11-01, after validating them against a scratch reference and 16 hand mutants, all killed):
+- `RequestRecord(id=, endpoint=, client=, user_agent=, model=, stream=)` constructs a record. Every later field defaults to None, and `tokens` defaults to `Tokens()`.
+- `from_request` logs a `model` that isn't a str as null, and treats `stream` as true only when it is literally `true`.
+- Times come from `time.monotonic()`, called through the module (`import time`). The test patches `manager.request_log.time.monotonic`.
+- Anthropic usage with no `cache_read_input_tokens` counts `cached_tokens` as 0. Any count that isn't a non-negative int (a bool, a str, a float) is null.
+- `StreamTokens` must stay bounded in memory: 32 MiB fed with no newline peaks under 8 MiB (`tracemalloc`). After dropping an oversized line, it resumes at the next newline.
+- **An item with no `"record"` key** (every pre-phase-4 test builds one) is served exactly as before, and writes no line.
+- **An invalid JSON body** logs `outcome` `invalid_body` on all three inference endpoints, with `model` null.
+- **A backend 4xx** passed through is `backend_error`, the same as a 5xx.
+- **A `/swap` writes only a swap line**, never a request line. The "already loaded" 200 must carry `X-Request-Id`, so it can't stay a plain dict.
+
 - [ ] **Step 1:** Run `tests/test_request_log.py` and `tests/test_request_lines.py`. Expected: they all fail, because `manager.request_log` doesn't exist.
 - [ ] **Step 2:** Implement `manager/request_log.py` per the Interfaces block.
 - [ ] **Step 3:** Wire it into `app.py`.

@@ -447,3 +447,34 @@ def test_status_keeps_every_existing_key(test_config, monkeypatch):
             got["oldest_queue_wait_seconds"], got["last_error"]) == (
         "idle", 0, None, None, None)
     assert {"gpu", "uptime_seconds", "profile_errors"} <= set(body)
+
+
+@pytest.mark.asyncio
+async def test_two_in_flight_requests_sharing_a_client_request_id_are_both_counted(
+        server, backend):
+    """Review round 1: a client-supplied X-Request-Id is kept as given, so two
+    requests can carry the same id (a retry, a client with a fixed id). The
+    in-flight table must count each request, not each id: ending one must
+    not end the other."""
+    slot = load(server, "test-model-q4", healthy=True)
+    hold = asyncio.Event()
+    stream_respond = _stream_response(hold=hold)
+
+    def respond(request, n):
+        if n == 1:
+            return stream_respond(request, n)
+        return httpx.Response(200, json={"ok": True})
+    seen = _observing(backend, slot, respond)
+
+    first, second = recorded(stream=True, rid="same"), recorded(rid="same")
+    async with consumer(server) as task:
+        await submit(server, first, second)
+        await answered(task, first, second)
+
+    assert seen == [1, 2], "the second request is in flight alongside the first"
+    assert slot.in_flight_count == 1, "the stream is still open after the second ended"
+    gone = asyncio.Event()
+    gone.set()
+    await drive(first["response"], disconnect=gone, slow_start=0.05)
+    await asyncio.sleep(0)
+    assert slot.in_flight_count == 0

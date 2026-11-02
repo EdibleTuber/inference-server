@@ -93,16 +93,23 @@ async def client(app):
 
 @contextlib.asynccontextmanager
 async def running(server, slot="main"):
-    """The slot's consumer, named exactly as the lifespan names it."""
-    task = asyncio.create_task(
-        app_mod._queue_consumer(server, server._config, slot_name=slot),
-        name=f"queue_consumer_{slot}")
+    """Every slot's consumer, named exactly as the lifespan names them (phase
+    5: /status asks each slot's consumer to probe, so all must run). Yields
+    the named slot's task."""
+    tasks = {
+        name: asyncio.create_task(
+            app_mod._queue_consumer(server, server._config, slot_name=name),
+            name=f"queue_consumer_{name}")
+        for name in server.slots
+    }
     try:
-        yield task
+        yield tasks[slot]
     finally:
-        task.cancel()
-        with contextlib.suppress(BaseException):
-            await task
+        for task in tasks.values():
+            task.cancel()
+        for task in tasks.values():
+            with contextlib.suppress(BaseException):
+                await task
 
 
 async def until(predicate, timeout=2.0, what="condition"):
@@ -270,10 +277,9 @@ async def test_a_queued_swap_whose_model_is_loaded_when_it_runs_does_not_swap(
 async def test_last_swap_reports_each_finished_swap_by_request_id(app, client, world):
     server = app.state.server
     main = server.slots["main"]
-    status = (await client.get("/status")).json()["slots"]["main"]
-    assert "last_swap" in status and status["last_swap"] is None
-
     async with running(server):
+        status = (await client.get("/status")).json()["slots"]["main"]
+        assert "last_swap" in status and status["last_swap"] is None
         await swap(client, "test-model-q8", "ok-1")
         await until(lambda: main.last_swap is not None, what="the first swap")
         first = (await client.get("/status")).json()["slots"]["main"]["last_swap"]

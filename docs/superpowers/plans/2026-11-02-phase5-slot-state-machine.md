@@ -54,18 +54,17 @@ Each item names the task whose tests pin it:
 
 ## Decisions made while planning (beyond the spec)
 
-- **States and transitions** (the final table, after Task 5; earlier tasks use a subset, named in each task):
+- **States and transitions** (the final table, after Task 5; earlier tasks use a subset, named in each task). The table is over **stored** states:
 
   | From | To |
   |---|---|
-  | `idle` | `serving`, `swapping`, `unhealthy` |
-  | `serving` | `idle`, `unhealthy` |
+  | `idle` | `swapping`, `unhealthy` |
   | `swapping` | `idle`, `failed` (Task 4; until then `unhealthy`) |
   | `unhealthy` | `probing`, `swapping` |
   | `probing` | `idle`, `unhealthy` |
   | `failed` | `idle` (a healthy probe), `swapping` (a `/swap`) |
 
-  A slot starts `unhealthy` and the consumer's first act is a probe. Setting the current state again is a no-op. Any other move raises `IllegalTransition` and is a bug. Every real transition logs one INFO line on `manager.slots`: `slot=<name> <from> -> <to>`.
+  **`serving` is not stored** (changed while writing Task 2's tests, 2026-11-02): the slot reads `serving` when its stored state is `idle` and a request is in flight. A stored `serving` would need the stream's closer, which runs on the response's task, to write the state, or the slot would stay `serving` after a consumer that had already exited; it would also log two INFO lines per request. A stored state other than `idle` shows as itself, so an `unhealthy` slot with a request still in flight reads `unhealthy`. A slot starts `unhealthy`; the lifespan's `refresh` asks for the first probe. Setting the current state again is a no-op. Any other move raises `IllegalTransition` and is a bug. Every real transition logs one INFO line on `manager.slots`: `slot=<name> <from> -> <to>`.
 - **`healthy` = state is `idle` or `serving`; `swapping` = state is `swapping`.** Both stay in `/status` for agent_core and `onboard`. During a swap `healthy` is now false (it used to keep its pre-swap value).
 - **Probing a `failed` slot (your decision, 2026-11-02):** the supervisor keeps probing it but never restarts it. A healthy probe moves it to `idle`, so a backend fixed by hand is noticed. A `/swap` is also accepted while `failed`.
 - **Supervisor restarts ship off (your decision, 2026-11-02):** `SUPERVISOR_RESTART=0` by default. The supervisor still probes, changes states, counts, and logs `would restart` at WARNING, but never runs `systemctl`. Turning it on is one line in `/etc/llama/manager.env`.
@@ -118,28 +117,39 @@ Transition: the swap moves from a background task into the consumer: `idle → s
 
 ### Task 2: One state, one writer (Q19)
 
-Transitions: `unhealthy → probing → idle | unhealthy`, `idle | serving → unhealthy`, `idle ↔ serving`, `idle | unhealthy → swapping → idle | unhealthy`. Every write of a slot's state or `loaded_model` happens on that slot's consumer task.
+Transitions (stored): `unhealthy → probing → idle | unhealthy`, `idle → unhealthy`, `idle | unhealthy → swapping → idle | unhealthy`. A probe of an `idle` slot leaves it `idle` while it runs. Every write of a slot's state or `loaded_model` happens on that slot's consumer task.
 
-**Files:** `manager/slots.py`, `manager/app.py`, `README.md` (the `/status` `state` row); test `tests/test_state_machine.py` (new, Claude) plus reworked tests.
+**Files:** `manager/slots.py`, `manager/app.py`, `README.md` (the `/status` `state`, `healthy` and `swapping` rows); test `tests/test_state_machine.py` (new, Claude) plus reworked tests.
 
 **Interfaces (produced):**
-- `class IllegalTransition(ValueError)` and `TRANSITIONS: dict[str, frozenset[str]]` in `manager/slots.py`.
-- `SlotState.state -> str` (read-only property over a stored field); `SlotState._set_state(new: str) -> None` (no-op for the current state, `IllegalTransition` for a move not in `TRANSITIONS`, one INFO line per real move).
-- `SlotState.healthy -> bool` (property: state is `idle` or `serving`). It keeps a setter, for tests only: `True` stores `idle`, `False` stores `unhealthy`, bypassing the table. No code in `manager/` assigns `healthy` (a test reads the source to pin it).
-- `async def SlotState.refresh(self, timeout: float) -> bool`: ask the consumer to probe; return True once a probe it asked for has finished, False on timeout. Returns False at once, without asking, when the state is `serving` or `swapping`. Callers waiting at the same time share one probe.
-- `ServerState.reprobe_all_slots()` and `reprobe_all_slots_concurrently()` keep their names and contracts but call `refresh` (bound: `REFRESH_TIMEOUT = 5.0` in `manager/app.py`).
-- `_reprobe_for` is deleted: after a 5xx or a proxy error the consumer moves the slot to `unhealthy` and probes it itself right after the item.
-- The startup probe moves into the consumer: the lifespan starts the consumers, then awaits `refresh` on each slot before logging `ready` / `not reachable`.
+- `class IllegalTransition(ValueError)` and `TRANSITIONS: dict[str, frozenset[str]]` in `manager/slots.py`, keyed by stored state; for this task exactly the moves above. `serving` appears nowhere in it.
+- `SlotState.state -> str`: a read-only property over a stored field, which reads `serving` for a stored `idle` with a request in flight. `SlotState._set_state(new: str) -> None` is a no-op for the current stored state, raises `IllegalTransition` for a move not in `TRANSITIONS` (state unchanged, nothing logged), and logs one INFO line `slot=<name> <from> -> <to>` on `manager.slots` per real move.
+- `SlotState.probe` moves an `unhealthy` slot to `probing` before calling the backend, then to `idle` or `unhealthy`; an `idle` slot stays `idle` during the call and moves to `unhealthy` only if it fails. `mark_unhealthy()` moves to `unhealthy`; `mark_swapped(model)` moves `swapping → idle` and raises `IllegalTransition` from anywhere else. `ensure_model_on_slot` moves to `swapping` before the swap runs (after the already-loaded shortcut and the profile checks).
+- `SlotState.healthy -> bool`: a property, true when the state is `idle` or `serving`. It keeps a setter for tests only: `True` stores `idle`, `False` stores `unhealthy`, bypassing the table and logging nothing. No code in `manager/` assigns `healthy`, and `healthy` is no longer a dataclass field (a test reads the source to pin both). `to_status_dict()["swapping"]` is `state == "swapping"`, not the lock.
+- `async def SlotState.refresh(self, timeout: float) -> bool`: ask the consumer to probe and wake it (`queue_event`); return True once a probe it asked for has finished, False on timeout. Returns False at once, without asking, when the state is `serving` or `swapping`. Callers waiting at the same time share one probe, and one caller timing out does not cancel the probe for the others.
+- `ServerState.reprobe_all_slots()` (sequential) and `reprobe_all_slots_concurrently()` (`gather`, `return_exceptions=True`) keep their names, call `refresh` with `REFRESH_TIMEOUT = 5.0` (in `manager/app.py`) and never raise. `_validate_and_route`'s reprobe of an unhealthy slot calls `refresh` too. `_reprobe_slot_if_unlocked` may go.
+- `_reprobe_for` is deleted: after a 5xx or a proxy error the consumer moves the slot to `unhealthy` and probes it itself right after the item, without waiting for another item.
+- The startup probe moves into the consumer: the lifespan starts the consumers, then awaits `refresh` on each slot before logging `slot=<name> ready with model <model>` / `slot=<name> not reachable at startup` (unchanged text).
 
-**Invariants:** every call of `SlotState.probe`, `_set_state`, `mark_swapped` and `mark_unhealthy` runs on the task named `queue_consumer_<slot>` (pinned at runtime by recording `asyncio.current_task().get_name()` across startup, `/status`, routing, a 5xx and a swap); `/status` never waits on a `serving` or `swapping` slot.
+**Invariants:** every call of `SlotState.probe`, `_set_state`, `mark_swapped` and `mark_unhealthy` runs on the task named `queue_consumer_<slot>` (pinned at runtime by recording `asyncio.current_task().get_name()` across startup, `/status`, routing including the stale-view reprobe, a 5xx and a swap); `/status` never waits on a `serving` or `swapping` slot. Behaviour change: during a swap `healthy` is false.
+
+**Before Task 3** a handed-off stream still lets the consumer take the next item, so a swap can start while a stream relays (stored `idle → swapping` is legal). Task 3 closes that.
+
+**Existing tests reworked in Claude's commit:** `tests/test_endpoints.py`'s `client` fixture now runs the lifespan (consumers are the only probers), `test_status_endpoint_does_not_block_event_loop` runs the lifespan, `test_the_reprobe_skips_a_slot_mid_swap` uses the `swapping` state instead of the lock, and `test_reprobe_waits_for_swap_lock` is deleted with `_reprobe_for` (replaced by `test_after_a_fault_the_consumer_probes_the_slot_before_its_next_item`); in `tests/test_consumer.py`, `test_unhealthy_slot_is_reprobed_and_routed` and `test_unhealthy_slot_still_503s_when_the_probe_fails` run a consumer, and `test_unhealthy_slot_mid_swap_is_not_probed` uses the `swapping` state; `tests/test_slots.py::test_mark_swapped_sets_all_three_fields` enters `swapping` first; `tests/test_slot_status.py::test_state_priority` builds its states through the machine; `tests/test_profile_roster.py::test_a_slot_with_no_home_models_reports_an_empty_list` runs the lifespan; `tests/test_swap_queue.py`'s `running` starts every slot's consumer, and `test_last_swap_reports_each_finished_swap_by_request_id` reads `/status` only while they run.
+
+- [ ] **Step 1: Claude's tests are committed.** Run: `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_state_machine.py -q -p no:cacheprovider`. Expected: FAIL (collection error: no `IllegalTransition`).
+- [ ] **Step 2: Implement** the stored state, the table, `_set_state`, the derived `healthy`, `refresh`, the consumer serving probe requests and post-fault probes, the reprobe callers, and the lifespan order.
+- [ ] **Step 3: Update `README.md`** (the `/status` `state`, `healthy` and `swapping` rows: `probing` is a new `state` value; `healthy` is false while swapping).
+- [ ] **Step 4: Run the full suite** twice. Expected: all pass, and no test takes about 5 s (that is a `refresh` waiting on a consumer that isn't running).
+- [ ] **Step 5: Commit** `manager/app.py manager/slots.py README.md`.
 
 ### Task 3: A slot is busy until its response completes (Q10)
 
-Transition: `serving → idle` happens only when the response is complete: a stream's closer has run, or a non-streamed response has been built.
+Transition: the slot reads `serving` (stored `idle`, a request in flight) until the response is complete: a stream's closer has run, or a non-streamed response has been built.
 
 **Interfaces:** the consumer awaits the relay's closer before taking the next item. If the relay's generator has not started and its background task has not run within `STREAM_START_TIMEOUT = 30.0` s of the handoff, the consumer runs the closer itself and the line's outcome is `client_disconnected`.
 
-**Invariants:** `in_flight` is at most 1; a client that leaves mid-stream frees the slot as soon as the closer runs; the item's event is set at the handoff, not at the close (the client must get its response to start reading). Claude rewrites `test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts`, which pins today's two-in-flight behaviour on purpose.
+**Invariants:** `in_flight` is at most 1; a client that leaves mid-stream frees the slot as soon as the closer runs; the item's event is set at the handoff, not at the close (the client must get its response to start reading). Claude rewrites `test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts`, which pins today's two-in-flight behaviour on purpose. The README's `/swap` section (Task 1) already says requests in flight run before a queued swap; for a relayed stream that becomes true here, so Task 3's review checks it.
 
 ### Task 4: A failed swap falls back once; then `failed` (Q20)
 

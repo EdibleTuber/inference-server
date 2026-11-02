@@ -17,7 +17,10 @@ def app(test_config):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    # The lifespan runs (phase 5, Q19): each slot's consumer is the only
+    # thing that probes it, so /status and routing need the consumers.
+    with TestClient(app) as c:
+        yield c
 
 
 def test_health_endpoint(client):
@@ -99,7 +102,10 @@ async def test_status_endpoint_does_not_block_event_loop(app):
             ticks += 1
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    # ASGITransport runs no lifespan; /status asks each slot's consumer to
+    # probe (phase 5, Q19), so the consumers must run.
+    async with app.router.lifespan_context(app), \
+            httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         with patch("manager.gpu.subprocess.run", side_effect=slow_nvidia_smi):
             start = time.monotonic()
             await asyncio.gather(client.get("/status"), ticker())
@@ -593,27 +599,6 @@ async def test_ensure_model_skips_swap_on_case_variant(test_config):
     server.slots["main"].swapper.swap_to.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# reprobe swap_lock gate (Task 5)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_reprobe_waits_for_swap_lock(test_config):
-    """A post-5xx reprobe must not run while a swap holds the slot lock."""
-    from manager.app import ServerState, _reprobe_for
-    server = ServerState(test_config)
-    slot = server.slots["main"]
-    slot.reconcile_on_error = AsyncMock()
-
-    await slot.swap_lock.acquire()          # simulate an in-flight swap
-    task = asyncio.create_task(_reprobe_for(slot))
-    await asyncio.sleep(0.01)
-    slot.reconcile_on_error.assert_not_called()   # blocked on the lock
-    slot.swap_lock.release()
-    await task
-    slot.reconcile_on_error.assert_awaited_once()  # ran after release
-
-
 # --- a stale slot view must not be reported as "not loaded" ----------------
 
 def test_a_stale_slot_is_reprobed_before_returning_409(client, monkeypatch):
@@ -691,8 +676,9 @@ def test_a_genuinely_unloaded_model_still_409s_after_the_reprobe(client, monkeyp
 
 def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
     """A swap in flight is authoritative and already producing fresh state.
-    Waiting on its lock would stall this request behind a model load, and
-    probing past it could clobber a fresh mark_swapped."""
+    Waiting on it would stall this request behind a model load, and
+    probing past it could clobber a fresh mark_swapped. Phase 5 (Q19): mid
+    swap is the slot's `swapping` state."""
     from manager.slots import SlotState
 
     server = client.app.state.server
@@ -708,17 +694,10 @@ def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
 
     monkeypatch.setattr(SlotState, "probe", fake_probe)
 
-    async def hold_and_request():
-        await server.slots["egpu"].swap_lock.acquire()
-        try:
-            return await asyncio.to_thread(
-                client.post, "/v1/chat/completions",
-                json={"model": "test-model-q8",
-                      "messages": [{"role": "user", "content": "hi"}]})
-        finally:
-            server.slots["egpu"].swap_lock.release()
-
-    r = asyncio.run(hold_and_request())
+    server.slots["egpu"]._set_state("swapping")
+    r = client.post("/v1/chat/completions",
+                    json={"model": "test-model-q8",
+                          "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 409
     assert "egpu" not in probed, probed
     assert "main" in probed, probed

@@ -302,7 +302,9 @@ def test_status_reports_home_models_and_profile_errors(roster):
 
 def test_a_slot_with_no_home_models_reports_an_empty_list(three_slot_config):
     from manager.app import create_app
-    body = TestClient(create_app(three_slot_config)).get("/status").json()
+    # The lifespan runs: /status asks each slot's consumer to probe (phase 5).
+    with TestClient(create_app(three_slot_config)) as client:
+        body = client.get("/status").json()
     assert body["slots"]["aux"]["models"] == []
     assert body["profile_errors"] == {}
 

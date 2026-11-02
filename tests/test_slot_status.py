@@ -139,26 +139,23 @@ def test_record_error_sets_code_message_and_utc_time():
     assert slot.last_error["code"] == "backend_error"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("swapping, healthy, in_flight, expected", [
-    pytest.param(True, False, True, "swapping", id="swapping_beats_unhealthy"),
+    pytest.param(True, False, True, "swapping", id="swapping_beats_serving"),
     pytest.param(False, False, True, "unhealthy", id="unhealthy_beats_serving"),
     pytest.param(False, True, True, "serving", id="serving"),
     pytest.param(False, True, False, "idle", id="idle"),
 ])
-async def test_state_priority(swapping, healthy, in_flight, expected):
+def test_state_priority(swapping, healthy, in_flight, expected):
+    """Phase 5 (Q19): the state is stored and moved by the consumer; serving
+    is idle with a request in flight, so a stored state beats it."""
     slot = make_slot()
     slot.healthy = healthy
     if in_flight:
         slot.begin_request("r1")
     if swapping:
-        await slot.swap_lock.acquire()
-    try:
-        assert slot.state == expected
-        assert slot.to_status_dict()["state"] == expected
-    finally:
-        if swapping:
-            slot.swap_lock.release()
+        slot._set_state("swapping")
+    assert slot.state == expected
+    assert slot.to_status_dict()["state"] == expected
 
 
 @pytest.mark.asyncio

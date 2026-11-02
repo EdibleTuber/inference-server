@@ -285,6 +285,7 @@ def test_mark_swapped_sets_all_three_fields():
     assert slot.last_swap_utc is None
     assert slot.healthy is False
 
+    slot._set_state("swapping")       # phase 5 (Q19): a swap ends from swapping
     slot.mark_swapped("gemma-4-E4B-it-Q4_K_M")
 
     assert slot.loaded_model == "gemma-4-E4B-it-Q4_K_M"

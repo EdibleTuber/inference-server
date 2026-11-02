@@ -165,7 +165,8 @@ async def test_state_priority(swapping, healthy, in_flight, expected):
 async def test_status_dict_reports_ages_rounded_and_null_when_empty(clock):
     slot = make_slot()
     d = slot.to_status_dict()
-    assert set(d) == EXISTING_SLOT_KEYS | NEW_SLOT_KEYS
+    # A superset: later phases add keys (phase 5: last_swap, supervisor).
+    assert EXISTING_SLOT_KEYS | NEW_SLOT_KEYS <= set(d)
     assert (d["in_flight"], d["in_flight_age_seconds"], d["oldest_queue_wait_seconds"],
             d["last_error"]) == (0, None, None, None)
 

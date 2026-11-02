@@ -75,6 +75,12 @@ _STREAM_DIALECTS = {
     "v1/messages": "anthropic",
 }
 
+# How long a caller (startup, /status, routing) waits for the slot's
+# consumer to get to the probe it asked for (phase 5, Q19). The probe
+# itself carries its own 3 s client timeout, so this bounds the wait for
+# the consumer's turn, not the backend call.
+REFRESH_TIMEOUT = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Server state
@@ -164,115 +170,82 @@ class ServerState:
     # Model swap
     # ------------------------------------------------------------------
 
-    async def _reprobe_slot_if_unlocked(self, name: str, slot, probe_client) -> None:
-        """Probe one slot unless a swap already holds its lock.
-
-        Shared by reprobe_all_slots and reprobe_all_slots_concurrently so both
-        keep exactly the same skip-if-mid-swap rule; only the fan-out (loop vs
-        gather) differs between them.
-        """
-        if slot.swap_lock.locked():
-            logger.debug("slot=%s mid-swap, skipping reprobe", name)
-            return
-        async with slot.swap_lock:
-            await slot.probe(probe_client)
-
     async def reprobe_all_slots(self) -> None:
-        """Refresh every slot's view of its backend, one at a time. Never raises.
+        """Ask every slot's consumer to probe, one at a time. Never raises.
 
-        Probing otherwise happens only at startup and after a backend 5xx, so a
+        Probing otherwise happens at startup and after a slot fault, so a
         backend that became ready LATER is invisible for the life of the
         process. Observed on the live server: llama-manager and
-        llama-server-batch both started at 23:36:45 -- the same second -- so the
-        startup probe ran before the iGPU had finished loading a 4B model. The
-        batch backend was serving a model this manager reported as
-        loaded_model: null, and every request for it got a 409 telling the
-        caller to load a model that was already loaded.
+        llama-server-batch both started at 23:36:45 -- the same second -- so
+        the startup probe ran before the iGPU had finished loading a 4B
+        model. The batch backend was serving a model this manager reported
+        as loaded_model: null, and every request for it got a 409 telling
+        the caller to load a model that was already loaded.
 
-        Takes each slot's swap_lock, matching _reprobe_for: between the two
-        writers of loaded_model, a swap is authoritative and a probe must never
-        clobber a fresh mark_swapped.
+        Phase 5 (Q19): the probe runs on each slot's own consumer, asked
+        for through refresh. A slot that is serving or swapping is not
+        probed -- refresh returns at once for it, so this path never waits
+        behind a model load and can never clobber a fresh mark_swapped.
 
-        A slot whose lock is already held is SKIPPED rather than waited on. A
-        swap in flight is both authoritative and already producing fresh state,
-        and blocking here would stall the caller behind a whole model load.
-
-        Sequential: worst case is N slots times the per-slot probe timeout
-        (see slot.probe) if every slot is unreachable. That is deliberate
+        Sequential: worst case is N slots times REFRESH_TIMEOUT if every
+        slot's consumer is slow to get to its probe. That is deliberate
         and unchanged here -- this is the chat 409 path's reprobe, called
         for one request already in flight that is about to fail anyway, so
-        a few extra seconds of serialized, easy-to-reason-about probing
+        a few extra seconds of serialized, easy-to-reason-about refresh
         costs little. GET /status calls the concurrent variant below
         instead; see its docstring for why.
         """
-        async with httpx.AsyncClient() as probe_client:
-            for name, slot in self.slots.items():
-                await self._reprobe_slot_if_unlocked(name, slot, probe_client)
+        for name, slot in self.slots.items():
+            try:
+                await slot.refresh(REFRESH_TIMEOUT)
+            except Exception:
+                logger.exception(
+                    "slot=%s refresh raised (should not happen; refresh is "
+                    "expected to never raise)", name,
+                )
 
     async def reprobe_all_slots_concurrently(self) -> None:
-        """Refresh every slot's view of its backend, all at once. Never raises.
+        """Ask every slot's consumer to probe, all at once. Never raises.
 
         Used only by GET /status. reprobe_all_slots (above) is sequential by
         design for the chat 409 path, where that's fine. /status is a
         monitoring endpoint: its worst case matters most exactly when slots
         are down, since that's when someone is anxiously checking it or an
         automated health check is polling it on a tight timeout. Sequential
-        probing there would cost up to N * (the per-slot probe timeout) if
-        every slot is unreachable -- multiplying the outage's visible cost
-        instead of just reporting it. Probing concurrently bounds /status's
-        worst case to one probe timeout regardless of slot count.
+        refresh there would cost up to N * REFRESH_TIMEOUT if every slot's
+        consumer is slow to get to its probe -- multiplying the outage's
+        visible cost instead of just reporting it. Refreshing concurrently
+        bounds /status's worst case to one refresh timeout regardless of
+        slot count.
 
-        Same skip-if-mid-swap rule as reprobe_all_slots, via
-        _reprobe_slot_if_unlocked; only the fan-out is different. Slots are
-        probed with one shared AsyncClient but each against its own
-        swap_lock, so there is no cross-slot contention from running them
-        concurrently.
+        Phase 5 (Q19): each refresh runs on that slot's own consumer, so
+        there is no cross-slot contention to manage, and a slot that is
+        serving or swapping answers at once and is not probed.
 
         return_exceptions=True is load-bearing, not decorative. Without it,
         asyncio.gather re-raises the first child exception immediately,
         without awaiting or cancelling its siblings, and that exception
         would propagate straight out of this method -- past nothing that
-        would catch it -- and 500 /status. That is the real, every-run
-        production symptom of dropping this flag: confirmed by testing
-        the un-forced, naturally-occurring interleaving (main.probe
-        raising, batch.probe untouched, real backend delays of 0/50/300ms):
-        9/9 runs gave /status a 500, with batch's own state left
-        untouched (asyncio.gather's ensure_future queues both slots' first
-        step before either completes, so in practice a sibling already
-        reaches client.get() and suspends inside connection setup before
-        this method's `async with httpx.AsyncClient()` block would exit
-        and close the shared client -- so the natural race here does not
-        corrupt a sibling's health, only crashes the endpoint).
-
-        Guarding against a sibling being corrupted anyway is still the
-        right design, not overkill: it is one `async with` block away from
-        happening (e.g. if a slower probe start, more slots, or a
-        different scheduler ever changes that interleaving), and
-        `tests/test_endpoints.py::test_status_survives_a_raising_slot_probe`
-        deliberately forces that interleaving to pin it as a property,
-        rather than relying on it never mattering. slot.probe() itself
-        never raises (see its docstring), so return_exceptions=True is
-        defense in depth against a probe somehow still raising either
-        way -- gather waits for every child regardless, so the client is
-        never closed while a sibling might still be using it, and any
-        exception a child does produce is logged and otherwise ignored
-        rather than propagated to the /status caller.
+        would catch it -- and 500 /status. slot.refresh is expected to
+        never raise (the probe itself is contained on the consumer), so
+        this is defense in depth; gather waits for every child regardless,
+        and any exception a child does produce is logged and otherwise
+        ignored rather than propagated to the /status caller.
         """
-        async with httpx.AsyncClient() as probe_client:
-            results = await asyncio.gather(
-                *(
-                    self._reprobe_slot_if_unlocked(name, slot, probe_client)
-                    for name, slot in self.slots.items()
-                ),
-                return_exceptions=True,
-            )
-            for name, result in zip(self.slots, results):
-                if isinstance(result, BaseException):
-                    logger.warning(
-                        "slot=%s reprobe raised during concurrent /status "
-                        "reprobe (should not happen; slot.probe is expected "
-                        "to never raise): %s", name, result,
-                    )
+        results = await asyncio.gather(
+            *(
+                slot.refresh(REFRESH_TIMEOUT)
+                for name, slot in self.slots.items()
+            ),
+            return_exceptions=True,
+        )
+        for name, result in zip(self.slots, results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "slot=%s refresh raised during concurrent /status "
+                    "reprobe (should not happen; refresh is expected "
+                    "to never raise): %s", name, result,
+                )
 
     async def ensure_model_on_slot(self, slot_name: str, model_name: str,
                                    *, force: bool = False) -> bool:
@@ -325,6 +298,13 @@ class ServerState:
                 "Model %s has no [slots.%s] section; it may run on: %s",
                 profile.name, slot_name, ", ".join(profile.sections))
             return False
+
+        # From here the swap is real: the slot shows swapping -- and with
+        # it, not healthy -- for its whole duration, so /status and a
+        # concurrent request see the truth (phase 5, Q19). The move is
+        # legal from wherever a swap can start: the slot was idle holding
+        # a different model, or unhealthy.
+        slot._set_state("swapping")
 
         logger.info("slot=%s swapping to %s", slot_name, profile.name)
         msg: str | None = None
@@ -410,16 +390,29 @@ def _setup_logging(config: ManagerConfig) -> None:
 # Background queue consumer helpers
 # ---------------------------------------------------------------------------
 
-async def _reprobe_for(slot) -> None:
-    """Fire-and-forget re-probe used after a backend 5xx.
+async def _serve_probe_requests(slot) -> None:
+    """Run this slot's pending probes, if any (phase 5, Q19).
 
-    Acquires the slot's swap_lock first, so the reprobe serializes AFTER any
-    in-flight/queued swap and can never clobber a fresh mark_swapped. Between
-    the two writers of loaded_model, the swap is authoritative.
+    The consumer is the only probe writer: startup, /status and routing ask
+    for a probe through refresh, which arms the handshake and wakes the
+    consumer on the queue event. A probe is contained here -- the contract
+    says it never raises, but a bug past that guarantee must not end the
+    consumer or strand the refresh waiters, so finish_probe always runs.
+    The queue event is deliberately NOT cleared here: a refresh that joins
+    mid-drain wakes the consumer on this handshake, not on the event, and
+    an extra empty pass costs nothing.
     """
-    async with slot.swap_lock:
-        async with httpx.AsyncClient() as probe_client:
-            await slot.reconcile_on_error(probe_client)
+    while slot.probe_pending:
+        try:
+            async with httpx.AsyncClient() as probe_client:
+                await slot.probe(probe_client)
+        except Exception:
+            logger.exception(
+                "slot=%s probe raised (should not happen; slot.probe is "
+                "expected to never raise)", slot.name,
+            )
+        finally:
+            slot.finish_probe()
 
 
 def _stream_close(ctx, client):
@@ -516,6 +509,11 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
     out while it sat in the queue gets the 409 a fresh request would
     (O1: chat requests never swap a slot).
 
+    Before each pass over the queue, and after every item, it runs the
+    slot's pending probes (phase 5, Q19): startup, /status and routing ask
+    for a probe through refresh, and this consumer is the only thing that
+    runs one.
+
     Every dequeued item is answered exactly once (response or error) and
     its event set exactly once: an Exception on any per-item step is
     answered as a 503 queue_error for that item and the loop continues,
@@ -533,6 +531,11 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
         await slot.queue_event.wait()
         slot.queue_event.clear()
 
+        # A probe may have been asked for since the last pass (startup,
+        # /status or routing, through refresh): run it before the queue so
+        # the next item's readiness is checked against fresh state.
+        await _serve_probe_requests(slot)
+
         while not slot.queue.empty():
             item = await slot.queue.dequeue()
             if item.get("kind") == "swap":
@@ -542,177 +545,202 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 # (last_swap, the swap line, the event). Items with no
                 # "kind" are requests, as are those with "kind": "request".
                 await _run_swap_item(server, slot_name, item)
-                continue
-            event: asyncio.Event = item["event"]
-            record = item.get("record")
-            if record is not None:
-                # The endpoint stamped enqueued_at; the consumer stamps the
-                # dequeue (queue_wait_ms) and, below, backend_started_at.
-                record.slot = slot_name
-                record.dequeued_at = time.monotonic()
+            else:
+                await _process_request_item(server, config, slot_name, item)
+            # A fault answered above may have asked for a probe: run it now,
+            # without waiting for another item (phase 5, Q19).
+            await _serve_probe_requests(slot)
 
-            try:
-                body: dict = item["body"]
-                model_name: str = body.get("model", "")
-                backend_path = item.get("backend_path", "v1/chat/completions")
-                backend_url = f"{slot.url}/{backend_path}"
-                # Token dialect to sniff the backend body with, keyed off
-                # the path the endpoint stamped (count_tokens never
-                # queues). An unknown path sniffs nothing.
-                dialect = _STREAM_DIALECTS.get(backend_path)
 
-                readiness = await server.ready_for(slot_name, model_name)
-                if readiness == "wrong_model":
-                    item["error"] = _not_loaded_message(model_name, server.slots)
-                    item["error_code"] = "model_not_loaded"
-                    event.set()
-                    continue
-                if readiness == "unavailable":
-                    item["error"] = f"{slot_name} slot not ready"
-                    item["error_code"] = "slot_unavailable"
-                    event.set()
-                    continue
+async def _process_request_item(server: "ServerState", config: ManagerConfig,
+                                slot_name: str, item: dict) -> None:
+    """Process one queued request item for the named slot.
 
-                is_streaming = body.get("stream", False)
-                # Q27: the request is in flight from just before the backend
-                # call until the response is complete; a request refused
-                # before the call (wrong_model, slot_unavailable) never gets
-                # here. Every request gets a FRESH key, record or not: a
-                # client-supplied X-Request-Id is kept as given (record.id),
-                # so two requests can share it -- a retry, a client with a
-                # fixed id -- and keying by the record's id would let the
-                # second overwrite the first and let ending either end both.
-                # The closer and the finally below end this same key.
-                request_id = request_id_from(None)
-                slot.begin_request(request_id)
-                handed_off = False
-                try:
-                    if record is not None:
-                        # backend_ms runs from the backend call to the line.
-                        record.backend_started_at = time.monotonic()
-                    if is_streaming:
-                        # The consumer opens the backend stream itself so it
-                        # can see the status before the first byte: a 4xx/5xx
-                        # is passed through as a plain error response, only a
-                        # <400 is relayed (A2). Streaming errors stay out of
-                        # scope for reconcile, except 5xx like non-streaming.
-                        client = httpx.AsyncClient()
-                        try:
-                            ctx = client.stream(
-                                "POST", backend_url, json=body,
-                                timeout=httpx.Timeout(
-                                    config.proxy_read_timeout, connect=10.0,
-                                ),
-                            )
-                            resp = await ctx.__aenter__()
-                        except Exception:
-                            await client.aclose()
-                            raise
-                        close = _stream_close(ctx, client)
-                        if resp.status_code >= 400:
-                            try:
-                                content = await resp.aread()
-                            finally:
-                                await close()
-                            if resp.status_code >= 500:
-                                slot.mark_unhealthy()
-                                asyncio.create_task(_reprobe_for(slot))
-                                slot.record_error(
-                                    "backend_error",
-                                    f"backend returned {resp.status_code} "
-                                    f"on {backend_path}",
-                                )
-                            if record is not None and dialect is not None:
-                                record.tokens = tokens_from_body(content, dialect)
-                            item["response"] = Response(
-                                content=content,
-                                status_code=resp.status_code,
-                                media_type=resp.headers.get(
-                                    "content-type", "application/json",
-                                ),
-                            )
-                        else:
-                            stream_tokens = (
-                                StreamTokens(dialect)
-                                if record is not None and dialect is not None
-                                else None
-                            )
-                            # The relay owns this request's end: its closer
-                            # runs when the stream closes, never before. The
-                            # default argument pins request_id to THIS item
-                            # -- the loop rebinds the name for the next item.
-                            item["response"] = _relay_stream(
-                                resp, close, record=record,
-                                stream_tokens=stream_tokens,
-                                on_close=lambda rid=request_id:
-                                    slot.end_request(rid),
-                            )
-                            handed_off = True
-                    else:
-                        async with httpx.AsyncClient() as client:
-                            resp = await client.post(
-                                backend_url, json=body,
-                                timeout=httpx.Timeout(
-                                    config.proxy_read_timeout, connect=10.0,
-                                ),
-                            )
-                        if resp.status_code >= 500:
-                            slot.mark_unhealthy()
-                            asyncio.create_task(_reprobe_for(slot))
-                            slot.record_error(
-                                "backend_error",
-                                f"backend returned {resp.status_code} "
-                                f"on {backend_path}",
-                            )
-                        if record is not None and dialect is not None:
-                            record.tokens = tokens_from_body(resp.content, dialect)
-                        item["response"] = Response(
-                            content=resp.content,
-                            status_code=resp.status_code,
-                            media_type=resp.headers.get("content-type", "application/json"),
-                        )
-                except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
-                    # A slow but healthy backend: 504 upstream_timeout, the
-                    # slot stays healthy and no reprobe is scheduled (F4).
-                    # ConnectTimeout is deliberately NOT caught here: a
-                    # backend that won't accept connections is unhealthy.
-                    logger.warning("slot=%s upstream timeout: %s", slot_name, exc)
-                    item["error"] = (
-                        f"{slot_name} did not respond within "
-                        f"{config.proxy_read_timeout}s"
-                    )
-                    item["error_code"] = "upstream_timeout"
-                    slot.record_error("upstream_timeout", item["error"])
-                except Exception as exc:
-                    logger.exception("slot=%s proxy error: %s", slot_name, exc)
-                    item["error"] = f"Proxy error: {exc}"
-                    slot.mark_unhealthy()
-                    asyncio.create_task(_reprobe_for(slot))
-                    slot.record_error("proxy_error", item["error"])
-                finally:
-                    # Q27: every exit path ends the request, cancellation
-                    # included -- CancelledError skips the except clauses
-                    # above but not a finally, so a cancelled consumer
-                    # cannot leak an entry that would show the slot serving
-                    # forever. The one exception is a stream handed to a
-                    # relay (handed_off): its closer ends it, never before
-                    # the stream closes.
-                    if not handed_off:
-                        slot.end_request(request_id)
+    The consumer's per-request body, extracted so the consumer itself stays
+    readable: readiness first (ready_for -- read-only, never swaps or
+    restarts), then the proxy to the slot's backend URL. Early exits
+    return; the item is always answered (response or error) and its event
+    set exactly once. A per-item exception is answered
+    as a 503 queue_error and swallowed (F2 part 2); cancellation
+    (asyncio.CancelledError) is a BaseException and still propagates and
+    kills the consumer.
 
-            except Exception as exc:
-                # A per-item failure must never end the consumer (F2 part 2):
-                # answer this one item as a 503 queue_error and move on.
-                # asyncio.CancelledError is a BaseException, so a cancelled
-                # consumer still propagates and dies.
-                logger.exception("slot=%s internal error: %s", slot_name, exc)
-                item["error"] = f"Internal error on slot {slot_name}: {exc}"
-                item["error_code"] = "queue_error"
-                slot.record_error("queue_error", item["error"])
-                event.set()
-                continue
+    The backend PATH is per-item: each endpoint stamps its own
+    item["backend_path"] when enqueuing, since OpenAI chat and Anthropic
+    messages are proxied by the same consumer to different backend
+    endpoints. The default keeps any un-stamped item on the OpenAI path.
+    """
+    slot = server.slots[slot_name]
+    event: asyncio.Event = item["event"]
+    record = item.get("record")
+    if record is not None:
+        # The endpoint stamped enqueued_at; the consumer stamps the
+        # dequeue (queue_wait_ms) and, below, backend_started_at.
+        record.slot = slot_name
+        record.dequeued_at = time.monotonic()
 
+    try:
+        body: dict = item["body"]
+        model_name: str = body.get("model", "")
+        backend_path = item.get("backend_path", "v1/chat/completions")
+        backend_url = f"{slot.url}/{backend_path}"
+        # Token dialect to sniff the backend body with, keyed off
+        # the path the endpoint stamped (count_tokens never
+        # queues). An unknown path sniffs nothing.
+        dialect = _STREAM_DIALECTS.get(backend_path)
+
+        readiness = await server.ready_for(slot_name, model_name)
+        if readiness == "wrong_model":
+            item["error"] = _not_loaded_message(model_name, server.slots)
+            item["error_code"] = "model_not_loaded"
             event.set()
+            return
+        if readiness == "unavailable":
+            item["error"] = f"{slot_name} slot not ready"
+            item["error_code"] = "slot_unavailable"
+            event.set()
+            return
+
+        is_streaming = body.get("stream", False)
+        # Q27: the request is in flight from just before the backend
+        # call until the response is complete; a request refused
+        # before the call (wrong_model, slot_unavailable) never gets
+        # here. Every request gets a FRESH key, record or not: a
+        # client-supplied X-Request-Id is kept as given (record.id),
+        # so two requests can share it -- a retry, a client with a
+        # fixed id -- and keying by the record's id would let the
+        # second overwrite the first and let ending either end both.
+        # The closer and the finally below end this same key.
+        request_id = request_id_from(None)
+        slot.begin_request(request_id)
+        handed_off = False
+        try:
+            if record is not None:
+                # backend_ms runs from the backend call to the line.
+                record.backend_started_at = time.monotonic()
+            if is_streaming:
+                # The consumer opens the backend stream itself so it
+                # can see the status before the first byte: a 4xx/5xx
+                # is passed through as a plain error response, only a
+                # <400 is relayed (A2). Streaming errors stay out of
+                # scope for reconcile, except 5xx like non-streaming.
+                client = httpx.AsyncClient()
+                try:
+                    ctx = client.stream(
+                        "POST", backend_url, json=body,
+                        timeout=httpx.Timeout(
+                            config.proxy_read_timeout, connect=10.0,
+                        ),
+                    )
+                    resp = await ctx.__aenter__()
+                except Exception:
+                    await client.aclose()
+                    raise
+                close = _stream_close(ctx, client)
+                if resp.status_code >= 400:
+                    try:
+                        content = await resp.aread()
+                    finally:
+                        await close()
+                    if resp.status_code >= 500:
+                        slot.mark_unhealthy()
+                        slot.record_error(
+                            "backend_error",
+                            f"backend returned {resp.status_code} "
+                            f"on {backend_path}",
+                        )
+                        slot.request_probe()
+                    if record is not None and dialect is not None:
+                        record.tokens = tokens_from_body(content, dialect)
+                    item["response"] = Response(
+                        content=content,
+                        status_code=resp.status_code,
+                        media_type=resp.headers.get(
+                            "content-type", "application/json",
+                        ),
+                    )
+                else:
+                    stream_tokens = (
+                        StreamTokens(dialect)
+                        if record is not None and dialect is not None
+                        else None
+                    )
+                    # The relay owns this request's end: its closer
+                    # runs when the stream closes, never before. The
+                    # default argument pins request_id to THIS item
+                    # -- the loop rebinds the name for the next item.
+                    item["response"] = _relay_stream(
+                        resp, close, record=record,
+                        stream_tokens=stream_tokens,
+                        on_close=lambda rid=request_id:
+                            slot.end_request(rid),
+                    )
+                    handed_off = True
+            else:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        backend_url, json=body,
+                        timeout=httpx.Timeout(
+                            config.proxy_read_timeout, connect=10.0,
+                        ),
+                    )
+                if resp.status_code >= 500:
+                    slot.mark_unhealthy()
+                    slot.record_error(
+                        "backend_error",
+                        f"backend returned {resp.status_code} "
+                        f"on {backend_path}",
+                    )
+                    slot.request_probe()
+                if record is not None and dialect is not None:
+                    record.tokens = tokens_from_body(resp.content, dialect)
+                item["response"] = Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type", "application/json"),
+                )
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+            # A slow but healthy backend: 504 upstream_timeout, the
+            # slot stays healthy and no reprobe is scheduled (F4).
+            # ConnectTimeout is deliberately NOT caught here: a
+            # backend that won't accept connections is unhealthy.
+            logger.warning("slot=%s upstream timeout: %s", slot_name, exc)
+            item["error"] = (
+                f"{slot_name} did not respond within "
+                f"{config.proxy_read_timeout}s"
+            )
+            item["error_code"] = "upstream_timeout"
+            slot.record_error("upstream_timeout", item["error"])
+        except Exception as exc:
+            logger.exception("slot=%s proxy error: %s", slot_name, exc)
+            item["error"] = f"Proxy error: {exc}"
+            slot.mark_unhealthy()
+            slot.record_error("proxy_error", item["error"])
+            slot.request_probe()
+        finally:
+            # Q27: every exit path ends the request, cancellation
+            # included -- CancelledError skips the except clauses
+            # above but not a finally, so a cancelled consumer
+            # cannot leak an entry that would show the slot serving
+            # forever. The one exception is a stream handed to a
+            # relay (handed_off): its closer ends it, never before
+            # the stream closes.
+            if not handed_off:
+                slot.end_request(request_id)
+
+    except Exception as exc:
+        # A per-item failure must never end the consumer (F2 part 2):
+        # answer this one item as a 503 queue_error and move on.
+        # asyncio.CancelledError is a BaseException, so a cancelled
+        # consumer still propagates and dies.
+        logger.exception("slot=%s internal error: %s", slot_name, exc)
+        item["error"] = f"Internal error on slot {slot_name}: {exc}"
+        item["error_code"] = "queue_error"
+        slot.record_error("queue_error", item["error"])
+        event.set()
+        return
+
+    event.set()
 
 
 async def _run_swap_item(server: "ServerState", slot_name: str, item: dict) -> None:
@@ -905,11 +933,11 @@ async def _validate_and_route(
     if not slot.healthy and same_model(model_name, slot.loaded_model):
         # Model IS loaded on this slot but the slot is unhealthy. Our view
         # may be stale -- the backend may have recovered, or even loaded a
-        # different model, since the last probe (F6) -- so reprobe once
-        # before answering. A slot mid-swap (lock held) is skipped by
-        # _reprobe_slot_if_unlocked, so this path never waits behind a swap.
-        async with httpx.AsyncClient() as probe_client:
-            await server._reprobe_slot_if_unlocked(slot_name, slot, probe_client)
+        # different model, since the last probe (F6) -- so ask the slot's
+        # consumer for one fresh probe before answering (phase 5, Q19). A
+        # busy slot (serving or swapping) is refused at once, so this path
+        # never waits behind a swap or an in-flight request.
+        await slot.refresh(REFRESH_TIMEOUT)
         if slot.healthy and same_model(model_name, slot.loaded_model):
             # The probe confirms it: route normally.
             return None, slot_name
@@ -1088,19 +1116,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Probe each slot to see if it's already running.
-        async with httpx.AsyncClient() as probe_client:
-            for name, slot in server.slots.items():
-                await slot.probe(probe_client)
-                if slot.healthy:
-                    logger.info(
-                        "slot=%s ready with model %s",
-                        name, slot.loaded_model,
-                    )
-                else:
-                    logger.info("slot=%s not reachable at startup", name)
-
-        # Start one background queue consumer per slot.
+        # Start one background queue consumer per slot FIRST: the startup
+        # probes below run on each slot's own consumer (phase 5, Q19) --
+        # the single writer of that slot's state.
         consumer_tasks = [
             asyncio.create_task(
                 _queue_consumer(server, config, slot_name=name),
@@ -1108,6 +1126,18 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             )
             for name in server.slots
         ]
+
+        # Ask each slot to probe itself through its consumer to see if the
+        # backend is already running.
+        for name, slot in server.slots.items():
+            await slot.refresh(REFRESH_TIMEOUT)
+            if slot.healthy:
+                logger.info(
+                    "slot=%s ready with model %s",
+                    name, slot.loaded_model,
+                )
+            else:
+                logger.info("slot=%s not reachable at startup", name)
 
         # Collection retrieval (Q28): the startup block (initialization,
         # background indexing, the orphaned-collection prune task) and the

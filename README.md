@@ -73,7 +73,7 @@ sudo bash scripts/setup.sh
 This script creates:
 - System users `_llama` and `_llama-mgr` (no shell, no home directory)
 - `/opt/llama/bin/`, `/opt/llama/models/`, `/opt/llama/manager/`
-- `/etc/llama/` (config files), `/var/log/llama/` (log files)
+- `/etc/llama/` (config files)
 - A narrow sudoers entry so `_llama-mgr` can restart `llama-server.service` and `llama-server-egpu.service`
 - The `llama-server`, `llama-manager` and `llama-embeddings` unit files (installed, not enabled — step 6 starts them)
 
@@ -226,7 +226,12 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "last_swap_utc": "2026-09-23T14:02:11+00:00",
       "queue_depth": 0,
       "queue_limit": 20,
-      "models": ["qwen2.5-7b-instruct-q4_k_m"]
+      "models": ["qwen2.5-7b-instruct-q4_k_m"],
+      "state": "idle",
+      "in_flight": 0,
+      "in_flight_age_seconds": null,
+      "oldest_queue_wait_seconds": null,
+      "last_error": null
     },
     "egpu": {
       "host": "127.0.0.1",
@@ -236,7 +241,12 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
       "last_swap_utc": "2026-10-04T09:12:40+00:00",
       "queue_depth": 1,
       "queue_limit": 20,
-      "models": ["Qwen3.6-35B-A3B-UD-IQ4_NL_XL"]
+      "models": ["Qwen3.6-35B-A3B-UD-IQ4_NL_XL"],
+      "state": "serving",
+      "in_flight": 1,
+      "in_flight_age_seconds": 12.4,
+      "oldest_queue_wait_seconds": 3.1,
+      "last_error": null
     }
   },
   "gpu": {
@@ -263,6 +273,23 @@ This is illustrative — the authoritative shape is whatever `GET /status` actua
 ```
 
 `name`, `vram_total_mb`, and `vram_used_mb` at the top of `gpu` always mirror `gpus[0]`, for any consumer that only expects a single GPU.
+
+Per slot (`slots.<name>`):
+
+| Field | Meaning |
+|---|---|
+| `state` | What the slot is doing right now, most pressing first: `swapping` (a swap holds the slot's lock), then `unhealthy` (the slot is not healthy — see `healthy`), then `serving` (a request is in flight), else `idle`. |
+| `in_flight` | Requests the slot is currently serving or relaying. The consumer starts the next queued request while a relayed stream is still running, so this can reach 2 until phase 5. |
+| `in_flight_age_seconds` | Age in seconds (rounded to 1 decimal) of the oldest in-flight request; `null` when none. |
+| `oldest_queue_wait_seconds` | How long in seconds (rounded to 1 decimal) the request at the head of the queue has been waiting; `null` when the queue is empty. |
+| `last_error` | The last slot fault, as `{"code", "message", "at_utc"}` with `code` one of `backend_error` (the backend answered 5xx), `upstream_timeout`, `proxy_error`, `queue_error`, `swap_failed` or `probe_failed`. Set only by slot faults — never by client errors — and never cleared: a later success leaves it in place, so it is the last thing that went wrong, not necessarily something happening now. `null` until a fault. |
+| `host`, `port` | The slot's backend address. |
+| `loaded_model` | What the backend reports loaded; `null` when nothing is. |
+| `healthy` | Whether the slot is healthy. The most recent probe sets it (it must reach the backend and find a loaded model), and a backend 5xx, a proxy error or a failed swap clear it; a successful probe or swap restores it. |
+| `swapping` | Whether a swap currently holds the slot's lock. |
+| `last_swap_utc` | ISO-8601 UTC time of the slot's last successful swap; `null` if it has never succeeded. |
+| `queue_depth`, `queue_limit` | Requests waiting / the queue's capacity. |
+| `models` | The onboarded models whose profile names this slot as their `home`. |
 
 ### Using with OpenAI Python client
 
@@ -404,7 +431,6 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
 | `RESTART_TIMEOUT` | `150` | Upper bound, in seconds, on a `systemctl restart` of a slot's unit during a swap. Both slot units have `TimeoutStopUSec=1min 30s`, so a restart can legitimately take ~90s before the new process starts; 150s covers that. Exceeding it fails the swap. |
 | `PROXY_READ_TIMEOUT` | `1800` | The longest, in seconds, the manager waits for the next bytes from the backend. For a non-streaming request that is effectively the whole generation; for a stream it is the longest silence, such as prefill before the first token. A read or write timeout answers 504 `upstream_timeout` and leaves the slot healthy. |
-| `LOG_FILE` | `/var/log/llama/manager.log` | Log file path for the model manager. |
 | `EMBEDDINGS_HOST` / `EMBEDDINGS_PORT` | `127.0.0.1` / `8082` | Where llama-embeddings listens. Always localhost. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
@@ -424,7 +450,7 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
 | `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>, "trial": <bool>}`; `target` defaults to the profile's home slot, and the pair must be verified unless `"trial"` is true (a trial reloads even a loaded model). Returns 200 if already loaded and no trial was requested, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. Errors: `invalid_trial`, 404 `model_not_found` (no profile), `invalid_target`, `slot_not_allowed`, `not_verified`. |
 | `GET` | `/v1/models` | Lists the onboarded profiles — models with at least one verified (model, slot) pair — as an OpenAI-compatible model list, each entry with `home_slot`, `verified_slots` and `loaded_on`. |
-| `GET` | `/status` | Per-slot health, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
+| `GET` | `/status` | Per-slot state, health, in-flight and queue-wait ages, last fault, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |
@@ -574,21 +600,22 @@ systemctl status llama-server llama-server-egpu llama-embeddings llama-manager
 
 ### View logs
 
-```bash
-# Live log from systemd journal
-sudo journalctl -u llama-manager -f
+Every service logs to the journal only; there are no per-service log files.
+Read a unit's logs with `journalctl -u <unit>`, adding `-f` to follow:
 
-# Each unit appends stdout/stderr to /var/log/llama/<name>.{log,err}.
-# llama-server and the manager both log to stderr, so the .err files are
-# the ones with content:
-tail -f /var/log/llama/llama-server.err
-tail -f /var/log/llama/llama-server-egpu.err
-tail -f /var/log/llama/manager.err
+```bash
+journalctl -u llama-server -f
+journalctl -u llama-server-egpu -f
+journalctl -u llama-embeddings -f
+journalctl -u llama-manager -f
 ```
 
-The manager also tries to write `LOG_FILE` (`/var/log/llama/manager.log`); if `_llama-mgr` cannot create it, it logs a `Could not open log file` warning to `manager.err` and carries on.
+The manager writes one structured JSON line per inference request and per
+`/swap` on the `manager.requests` logger. Extract just those lines with:
 
-Logs rotate weekly via `config/llama-logrotate` (installed to `/etc/logrotate.d/llama`), using `copytruncate` because systemd holds each file open for the life of the process.
+```bash
+journalctl -u llama-manager -o cat | sed -n 's/^INFO manager.requests: //p' | jq
+```
 
 ### Enable on boot
 
@@ -712,8 +739,6 @@ If any step shows a service on the wrong card, the fix is in the relevant `/etc/
 /var/lib/llama-manager/             # generated per-slot model env files (<slot>.env),
                                     # rewritten by the manager on every swap; _llama-mgr, 755
 
-/var/log/llama/                     # <unit>.log / <unit>.err per service, rotated weekly
-
 /etc/systemd/system/
   ├── llama-manager.service
   ├── llama-server.service          # main
@@ -737,7 +762,7 @@ inference-server/
 │   ├── embeddings.py, vectordb.py, collections.py, reindex_jobs.py   # retrieval
 │   └── README.md                   # manager component documentation
 ├── systemd/                        # unit files (copied to /etc/systemd/system/)
-├── config/                         # config templates (copied to /etc/llama/) + logrotate
+├── config/                         # config templates (copied to /etc/llama/)
 │   └── models/                     # per-model TOML profiles (installed to /etc/llama/models.d/)
 ├── scripts/
 │   ├── setup.sh                    # first install: users, dirs, permissions, sudoers, main-slot units

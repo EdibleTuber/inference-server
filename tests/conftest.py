@@ -124,7 +124,6 @@ def test_config(tmp_models_dir, tmp_env_file, tmp_egpu_env_file, profiles_dir, m
         llama_server_unit="llama-server.service",
         queue_limit=20,
         swap_timeout=5,
-        log_file="/dev/null",
         embeddings_host="127.0.0.1",
         embeddings_port=18082,
         collections_config="/dev/null",

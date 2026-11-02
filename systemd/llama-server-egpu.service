@@ -86,9 +86,5 @@ ExecStart=/opt/llama/bin/llama-server \
 Restart=on-failure
 RestartSec=5
 
-# Persistent file logs (also in journal via journalctl -u llama-server-egpu)
-StandardOutput=append:/var/log/llama/llama-server-egpu.log
-StandardError=append:/var/log/llama/llama-server-egpu.err
-
 [Install]
 WantedBy=multi-user.target

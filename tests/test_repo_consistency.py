@@ -81,3 +81,29 @@ def test_the_readme_documents_the_profile_api():
                  "slot_not_allowed", "not_verified", "home_slot", "verified_slots",
                  "loaded_on", "profile_errors"):
         assert term in text, term
+
+
+UNITS = sorted((REPO / "systemd").glob("*.service"))
+
+
+@pytest.mark.parametrize("unit", UNITS, ids=lambda u: u.name)
+def test_no_unit_logs_to_a_file(unit):
+    """Q27: every service logs to the journal, systemd's default. An
+    append: target bypasses it and needs logrotate."""
+    lines = [l for l in unit.read_text(encoding="utf-8").splitlines()
+             if l.startswith(("StandardOutput=", "StandardError="))]
+    assert lines == []
+
+
+OLD_LOG_REFS = ["README.md", "manager/README.md", "config/manager.env", "scripts/setup.sh"]
+
+
+@pytest.mark.parametrize("rel", OLD_LOG_REFS)
+def test_nothing_names_the_old_log_files(rel):
+    text = (REPO / rel).read_text(encoding="utf-8")
+    for needle in ("/var/log/llama", "LOG_FILE", "logrotate"):
+        assert needle not in text, f"{rel} still mentions {needle}"
+
+
+def test_the_logrotate_config_is_gone():
+    assert not (REPO / "config" / "llama-logrotate").exists()

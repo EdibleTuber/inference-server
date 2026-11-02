@@ -114,11 +114,19 @@ else
   fail 3 "$bad"
 fi
 
-# 4. _llama-mgr can write the log directory.
-if runuser -u _llama-mgr -- test -w /var/log/llama; then
-  pass 4 "_llama-mgr can write /var/log/llama"
+# 4. No installed unit logs to a file (Q27: everything goes to the journal).
+bad=""
+for unit in /etc/systemd/system/llama-*.service; do
+  [ -e "$unit" ] || continue
+  if grep -qE '^(StandardOutput|StandardError)=' "$unit"; then
+    bad="$(basename "$unit")"
+    break
+  fi
+done
+if [ -z "$bad" ]; then
+  pass 4 "no installed unit logs to a file"
 else
-  fail 4 "_llama-mgr cannot write /var/log/llama"
+  fail 4 "$bad logs to a file (StandardOutput=/StandardError=)"
 fi
 
 # 5. Every repo systemd unit that is installed on the host is unmodified.

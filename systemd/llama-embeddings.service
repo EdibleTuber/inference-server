@@ -56,8 +56,5 @@ ExecStart=/opt/llama/bin/llama-server \
 Restart=on-failure
 RestartSec=5
 
-StandardOutput=append:/var/log/llama/embeddings.log
-StandardError=append:/var/log/llama/embeddings.err
-
 [Install]
 WantedBy=multi-user.target

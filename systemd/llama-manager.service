@@ -44,8 +44,5 @@ ExecStart=/opt/llama/manager/venv/bin/python -m uvicorn \
 Restart=on-failure
 RestartSec=5
 
-# Stderr goes to file (uvicorn access logs)
-StandardError=append:/var/log/llama/manager.err
-
 [Install]
 WantedBy=multi-user.target

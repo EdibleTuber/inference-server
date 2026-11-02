@@ -40,7 +40,6 @@ class ManagerConfig:
         llama_server_unit: systemd unit name for the main llama-server.
         queue_limit: Max number of requests to hold in the FIFO queue.
         swap_timeout: Seconds to wait for llama-server health after a model swap.
-        log_file: Path to the manager's log file.
         embeddings_host: Address where the embeddings server is running.
         embeddings_port: Port where the embeddings server listens.
         collections_config: Path to the collections configuration JSON file.
@@ -62,7 +61,6 @@ class ManagerConfig:
     llama_server_unit: str
     queue_limit: int
     swap_timeout: int
-    log_file: str
     embeddings_host: str
     embeddings_port: int
     collections_config: str
@@ -95,7 +93,6 @@ class ManagerConfig:
             llama_server_unit=os.getenv("LLAMA_SERVER_UNIT", "llama-server.service"),
             queue_limit=_int_env("QUEUE_LIMIT", 20),
             swap_timeout=_int_env("SWAP_TIMEOUT", 120),
-            log_file=os.getenv("LOG_FILE", "/var/log/llama/manager.log"),
             embeddings_host=os.getenv("EMBEDDINGS_HOST", "127.0.0.1"),
             embeddings_port=_int_env("EMBEDDINGS_PORT", 8082),
             collections_config=os.getenv("COLLECTIONS_CONFIG", "/etc/llama/collections.json"),

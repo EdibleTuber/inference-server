@@ -45,6 +45,11 @@ class SlotState:
     swap_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     model_env_file: Optional[str] = None   # generated model env file; the swap's write target
     last_error: Optional[dict] = None      # {"code","message","at_utc"}; set only by slot faults
+    # The swap item the consumer finished most recently:
+    # {"id","model","trial","outcome","message","at_utc"}, outcome one of
+    # ok, already_loaded, failed, drained. None until the first finished
+    # swap; set only by the slot's queue consumer.
+    last_swap: Optional[dict] = None
     # request_id -> time.monotonic() begin. A request is in flight from just
     # before the consumer calls the backend until the response is complete; a
     # relayed stream stays in flight until its closer runs.
@@ -250,6 +255,7 @@ class SlotState:
             "oldest_queue_wait_seconds": _round_1(
                 self.queue.oldest_wait_seconds(now)),
             "last_error": self.last_error,
+            "last_swap": self.last_swap,
         }
 
 

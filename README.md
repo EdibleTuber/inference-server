@@ -175,14 +175,15 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 
 ### Switch to a different model
 
-Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its profile's `home` slot (every profile names exactly one). The call returns **202** as soon as the swap has started — the swap itself runs in the background and takes 30 seconds to several minutes for a large cold load. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up).
+Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its profile's `home` slot (every profile names exactly one). A swap is a FIFO item in that slot's queue: the call returns **202** as soon as the swap is queued, and the slot's consumer runs it after whatever is already ahead of it — requests in flight and queued on that slot run first, and requests queued behind the swap wait for it to finish (a large cold load takes 30 seconds to several minutes). It returns **200** only when nothing is ahead: the slot is idle (healthy, no request in flight, not mid-swap), its queue is empty, the model is already loaded, and no trial was requested. A queue at its limit refuses the swap **503** `queue_full`. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up, `last_swap` what the latest finished swap ended with).
 
 ```bash
 curl http://YOUR_LAN_IP:11434/swap \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL"}'
 # → 202, {"slot": "egpu", "model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL", "status": "swapping"}
-#   (or 200 with "status": "ok" if it is already loaded there and no trial was requested)
+#   (or 200 with "status": "ok" if nothing is ahead — the slot idle, its
+#    queue empty, the model already loaded there, and no trial requested)
 ```
 
 A model may only be swapped to a slot its profile names, and only once that pair has been verified; `"trial": true` relaxes the verification for one swap. That is how `scripts/onboard.py` verifies a new pair — and a trial reloads the model even when it is already loaded, so it really exercises the load. Errors: 400 for a missing `model`, a non-boolean `trial` (`invalid_trial`) or an unknown `target`; 404 `model_not_found` if no profile exists for the model (the message names the `config/models/<model>.toml` to add); 400 `slot_not_allowed` if the profile has no section for the target slot; 400 `not_verified` if the pair is not verified and no trial was requested. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error; it leaves the slot `healthy: false` in `GET /status`.
@@ -288,6 +289,7 @@ Per slot (`slots.<name>`):
 | `healthy` | Whether the slot is healthy. The most recent probe sets it (it must reach the backend and find a loaded model), and a backend 5xx, a proxy error or a failed swap clear it; a successful probe or swap restores it. |
 | `swapping` | Whether a swap currently holds the slot's lock. |
 | `last_swap_utc` | ISO-8601 UTC time of the slot's last successful swap; `null` if it has never succeeded. |
+| `last_swap` | The swap the slot's consumer most recently finished, as `{"id", "model", "trial", "outcome", "message", "at_utc"}`; `outcome` is `ok`, `already_loaded` (the model was loaded by the time the item ran, so nothing swapped), `failed`, or `drained` (a swap ahead of it in the queue failed and drained it). `message` is the failure text, `null` otherwise. `null` until the slot's first finished swap. |
 | `queue_depth`, `queue_limit` | Requests waiting / the queue's capacity. |
 | `models` | The onboarded models whose profile names this slot as their `home`. |
 

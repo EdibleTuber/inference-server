@@ -25,10 +25,11 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -292,57 +293,98 @@ class ServerState:
         """
         slot = self.slots[slot_name]
         async with slot.swap_lock:
-            if not force and slot.healthy and same_model(model_name, slot.loaded_model):
-                return True
+            return await self._ensure_model_on_slot_locked(
+                slot_name, model_name, force=force)
 
-            profile = self.profiles.get(model_name)
-            if profile is None:
-                logger.error(
-                    "No profile for model %s in %s; add a <name>.toml there",
-                    model_name, self._config.profiles_dir)
-                return False
+    async def _ensure_model_on_slot_locked(self, slot_name: str, model_name: str,
+                                           *, force: bool = False) -> bool:
+        """The body of ensure_model_on_slot, with the slot's swap_lock
+        already held by the caller.
 
-            section = profile.section(slot_name)
-            if section is None:
-                logger.error(
-                    "Model %s has no [slots.%s] section; it may run on: %s",
-                    profile.name, slot_name, ", ".join(profile.sections))
-                return False
+        The public wrapper takes the lock; the slot's queue consumer holds
+        it itself, so its already-loaded decision and the swap run are one
+        atomic step a probe cannot land between and change the answer. A
+        failed swap leaves `slot.last_error` holding the swap_failed
+        message (set in the same synchronous step, before the drain) so
+        the caller can report it.
+        """
+        slot = self.slots[slot_name]
+        if not force and slot.healthy and same_model(model_name, slot.loaded_model):
+            return True
 
-            logger.info("slot=%s swapping to %s", slot_name, profile.name)
-            msg: str | None = None
-            try:
-                env_text = render_model_env(profile, section, self._config.models_dir)
-                success = await slot.swapper.swap_to(profile.name, env_text)
-            except Exception as exc:
-                # A raising swap is a failed swap, not a crash: the same
-                # failure tail as the timeout case (unhealthy, drained
-                # queue, False) so no caller ever sees an exception here.
-                logger.exception("slot=%s swap to %s raised", slot_name, profile.name)
-                success = False
-                msg = f"Model swap failed on slot {slot_name}: {profile.name}: {exc}"
-            if success:
-                slot.mark_swapped(profile.name)
-                return True
-
-            if msg is None:
-                msg = f"Model swap timed out on slot {slot_name}: {model_name}"
-            slot.mark_unhealthy()
-            slot.record_error("swap_failed", msg)
-            self._drain_slot_queue_with_error(slot_name, msg)
+        profile = self.profiles.get(model_name)
+        if profile is None:
+            logger.error(
+                "No profile for model %s in %s; add a <name>.toml there",
+                model_name, self._config.profiles_dir)
             return False
 
-    def _drain_slot_queue_with_error(self, slot_name: str, message: str) -> None:
-        """Drain the given slot's queue, signaling each item with an error."""
+        section = profile.section(slot_name)
+        if section is None:
+            logger.error(
+                "Model %s has no [slots.%s] section; it may run on: %s",
+                profile.name, slot_name, ", ".join(profile.sections))
+            return False
+
+        logger.info("slot=%s swapping to %s", slot_name, profile.name)
+        msg: str | None = None
+        try:
+            env_text = render_model_env(profile, section, self._config.models_dir)
+            success = await slot.swapper.swap_to(profile.name, env_text)
+        except Exception as exc:
+            # A raising swap is a failed swap, not a crash: the same
+            # failure tail as the timeout case (unhealthy, drained
+            # queue, False) so no caller ever sees an exception here.
+            logger.exception("slot=%s swap to %s raised", slot_name, profile.name)
+            success = False
+            msg = f"Model swap failed on slot {slot_name}: {profile.name}: {exc}"
+        if success:
+            slot.mark_swapped(profile.name)
+            return True
+
+        if msg is None:
+            msg = f"Model swap timed out on slot {slot_name}: {model_name}"
+        slot.mark_unhealthy()
+        slot.record_error("swap_failed", msg)
+        await self._drain_slot_queue_with_error(slot_name, msg)
+        return False
+
+    async def _drain_slot_queue_with_error(self, slot_name: str,
+                                           message: str) -> None:
+        """Drain the given slot's queue after a failed swap.
+
+        Request items are signaled with the error at once: their endpoint
+        is waiting on the item's event and renders the error response.
+        Swap items are not answered here: a drained swap gets its line,
+        its last_swap entry and its event from the consumer, after the
+        swap whose failure drained it, so last_swap ends on the latest
+        swap -- they are marked and put back in the queue, in order,
+        where the consumer's next iterations take them. The queue is
+        empty after the drain and a put below capacity never yields, so
+        the put-back loop runs to completion without interleaving.
+        """
         slot = self.slots[slot_name]
         items = slot.queue.drain()
+        swaps: list[dict] = []
         for item in items:
-            item["error"] = message
-            item["event"].set()
-        if items:
+            if item.get("kind") == "swap":
+                item["drained_by"] = message
+                swaps.append(item)
+            else:
+                item["error"] = message
+                item["event"].set()
+        for item in swaps:
+            await slot.queue.enqueue(item)
+        if len(items) - len(swaps):
             logger.warning(
                 "slot=%s drained %d queued requests with error: %s",
-                slot_name, len(items), message,
+                slot_name, len(items) - len(swaps), message,
+            )
+        if swaps:
+            logger.warning(
+                "slot=%s leaving %d queued swap item(s) to the consumer "
+                "(drained by a failed swap): %s",
+                slot_name, len(swaps), message,
             )
 
 
@@ -493,6 +535,14 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
 
         while not slot.queue.empty():
             item = await slot.queue.dequeue()
+            if item.get("kind") == "swap":
+                # A queued swap (phase 5, Q12): the consumer runs it itself,
+                # after whatever was ahead of it in the queue. It never
+                # raises except CancelledError and always finishes the item
+                # (last_swap, the swap line, the event). Items with no
+                # "kind" are requests, as are those with "kind": "request".
+                await _run_swap_item(server, slot_name, item)
+                continue
             event: asyncio.Event = item["event"]
             record = item.get("record")
             if record is not None:
@@ -665,6 +715,92 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
             event.set()
 
 
+async def _run_swap_item(server: "ServerState", slot_name: str, item: dict) -> None:
+    """Run one queued swap item (phase 5, Q12): the swap itself, then the
+    slot's last_swap entry, the swap's line, and the item's event.
+
+    The swap holds the slot's swap_lock for its duration, so /status shows
+    the slot swapping while it runs. The already-loaded decision is made
+    under that same held lock, one atomic step with the swap run, so a
+    probe cannot land between the two and change the answer.
+
+    Never raises except CancelledError: an unexpected exception still ends
+    the item (a failed entry, a failed line, the event set), so the
+    consumer's every-dequeued-item-is-answered-once guarantee holds.
+    """
+    slot = server.slots[slot_name]
+    model_name: str = item["model"]
+    trial: bool = item["trial"]
+    rid: str = item["id"]
+    try:
+        if item.get("drained_by") is not None:
+            # A failed swap ahead of this one in the queue drained it
+            # (_drain_slot_queue_with_error). It never runs; it is answered
+            # after that swap's own line, so last_swap ends on the latest
+            # swap.
+            outcome, message = "drained", item["drained_by"]
+        else:
+            async with slot.swap_lock:
+                if not trial and slot.healthy and same_model(
+                        model_name, slot.loaded_model):
+                    # The model was loaded while this item waited (something
+                    # ahead of it in the queue swapped it in): nothing to
+                    # run. Same condition as _ensure_model_on_slot_locked's
+                    # shortcut, checked under the same held lock, so the
+                    # two cannot disagree.
+                    outcome, message = "already_loaded", None
+                else:
+                    ok = await server._ensure_model_on_slot_locked(
+                        slot_name, model_name, force=trial)
+                    if ok:
+                        outcome, message = "ok", None
+                    else:
+                        # The failure tail set last_error to the swap_failed
+                        # message in the same synchronous step. The
+                        # no-profile and no-section refusals (unreachable
+                        # for a queued item -- the endpoint validated both
+                        # before enqueuing) carry no recorded error, so a
+                        # plain message stands in for them.
+                        outcome = "failed"
+                        message = (
+                            slot.last_error["message"]
+                            if slot.last_error is not None
+                            and slot.last_error.get("code") == "swap_failed"
+                            else (f"Model swap failed on slot {slot_name}: "
+                                  f"{model_name}"))
+        slot.last_swap = {
+            "id": rid,
+            "model": model_name,
+            "trial": trial,
+            "outcome": outcome,
+            "message": message,
+            "at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        log_swap(rid, item["client"], item["user_agent"], slot_name,
+                 model_name, trial, 202, outcome,
+                 round((time.monotonic() - item["accepted_at"]) * 1000))
+        item["event"].set()
+    except Exception:
+        # The consumer must survive whatever a swap item throws; the item
+        # still gets exactly one answer. last_swap and the line are set in
+        # the same synchronous step, as in the normal path.
+        logger.exception("slot=%s swap item %s failed internally",
+                         slot_name, rid)
+        slot.last_swap = {
+            "id": rid,
+            "model": model_name,
+            "trial": trial,
+            "outcome": "failed",
+            "message": "internal error while running the swap "
+                       "(see manager logs)",
+            "at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        log_swap(rid, item["client"], item["user_agent"], slot_name,
+                 model_name, trial, 202, "failed",
+                 round((time.monotonic() - item["accepted_at"]) * 1000))
+        item["event"].set()
+
+
 # ---------------------------------------------------------------------------
 # Shared routing/enqueue core for the inference endpoints
 # ---------------------------------------------------------------------------
@@ -813,6 +949,7 @@ async def _route_and_wait(
 
     event = asyncio.Event()
     item: dict = {
+        "kind": "request",
         "body": body, "event": event, "response": None, "error": None,
         "error_code": None, "backend_path": backend_path,
     }
@@ -1221,7 +1358,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     # ------------------------------------------------------------------
 
     @app.post("/swap")
-    async def swap_slot(request: Request, background_tasks: BackgroundTasks):
+    async def swap_slot(request: Request):
         """Admin endpoint: swap a slot to a different model.
 
         Body: {"model": str, "target": <slot name> (optional), "trial": bool
@@ -1233,14 +1370,20 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         that is already loaded, because a trial that skips the load would
         verify nothing. No auth; LAN-only is the trust boundary.
 
-        Returns 200 if the model is already loaded and no trial was
-        requested, 202 if a swap was started. Callers poll GET /status
-        (the slot's ``swapping`` and ``loaded_model`` fields) to know when
-        the swap lands.
+        The swap is a FIFO item in the target slot's queue (phase 5, Q12):
+        the slot's consumer runs it after whatever is ahead of it. 200 is
+        answered only when nothing is ahead -- the slot is idle (healthy,
+        unlocked, nothing in flight), its queue is empty, the model is
+        already loaded and no trial was requested. Everything else,
+        including an already-loaded model with something ahead, is 202:
+        the swap waits its turn in the queue. A full queue is refused 503
+        queue_full. Callers poll GET /status (the slot's ``swapping``,
+        ``state`` and ``last_swap`` fields) to know when the swap lands.
 
         Every response -- refusal, the already-loaded 200, and the 202 --
         carries X-Request-Id and writes one swap line (never a request
-        line) to the manager.requests logger (phase 4, Q27).
+        line) to the manager.requests logger (phase 4, Q27): refusals and
+        the 200 at once, a 202 when the slot's consumer ends the swap.
         """
         rid, client_host, user_agent = request_context(request)
         headers = {"x-request-id": rid}
@@ -1319,10 +1462,12 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             )
 
         slot = server.slots[target]
-        if not trial and slot.healthy and same_model(model_name, slot.loaded_model):
-            # Already loaded and no trial: answer now and log at once. A
-            # JSONResponse (not a plain dict) so the X-Request-Id header
-            # rides along.
+        if (not trial and slot.state == "idle" and slot.queue.empty()
+                and same_model(model_name, slot.loaded_model)):
+            # Already loaded, nothing ahead of it (the slot idle: healthy,
+            # unlocked, nothing in flight; the queue empty) and no trial:
+            # answer now and log at once. A JSONResponse (not a plain dict)
+            # so the X-Request-Id header rides along.
             log_swap(rid, client_host, user_agent, target, model_name, trial,
                      200, "already_loaded", None)
             return JSONResponse(
@@ -1330,20 +1475,25 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
                 status_code=200, headers=headers,
             )
 
-        started = time.monotonic()
-
-        async def _do_swap():
-            ok = await server.ensure_model_on_slot(target, model_name, force=trial)
-            if not ok:
-                logger.error("background swap failed: %s on slot %s",
-                             model_name, target)
-            # The swap line lands when the background task ends; the
-            # duration runs from the 202 to that end.
-            log_swap(rid, client_host, user_agent, target, model_name, trial,
-                     202, "ok" if ok else "failed",
-                     round((time.monotonic() - started) * 1000))
-
-        background_tasks.add_task(_do_swap)
+        # Otherwise the swap is a FIFO item in the target slot's queue: the
+        # slot's consumer runs it after whatever is ahead of it and writes
+        # its line when the swap ends; the 202's duration runs from here.
+        event = asyncio.Event()
+        item: dict = {
+            "kind": "swap",
+            "model": model_name,
+            "trial": trial,
+            "id": rid,
+            "client": client_host,
+            "user_agent": user_agent,
+            "accepted_at": time.monotonic(),
+            "event": event,
+        }
+        try:
+            await slot.queue.enqueue(item)
+        except RequestQueue.QueueFullError:
+            return refuse(503, "queue_full", "Server busy", model_name, target)
+        slot.queue_event.set()
         return JSONResponse(
             {"slot": target, "model": model_name, "status": "swapping"},
             status_code=202, headers=headers,

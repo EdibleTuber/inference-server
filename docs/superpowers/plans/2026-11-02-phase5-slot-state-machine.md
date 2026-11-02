@@ -149,7 +149,7 @@ Transition: the slot reads `serving` (stored `idle`, a request in flight) until 
 
 **Interfaces:** the consumer awaits the relay's closer before taking the next item. If the relay's generator has not started and its background task has not run within `STREAM_START_TIMEOUT = 30.0` s of the handoff, the consumer runs the closer itself and the line's outcome is `client_disconnected`.
 
-**Invariants:** `in_flight` is at most 1; a client that leaves mid-stream frees the slot as soon as the closer runs; the item's event is set at the handoff, not at the close (the client must get its response to start reading). Claude rewrites `test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts`, which pins today's two-in-flight behaviour on purpose. The README's `/swap` section (Task 1) already says requests in flight run before a queued swap; for a relayed stream that becomes true here, so Task 3's review checks it.
+**Invariants:** `in_flight` is at most 1; a client that leaves mid-stream frees the slot as soon as the closer runs; the item's event is set at the handoff, not at the close (the client must get its response to start reading). Claude rewrites `test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts`, which pins today's two-in-flight behaviour on purpose. The README's `/swap` section (Task 1) already says requests in flight run before a queued swap; for a relayed stream that becomes true here, so Task 3's review checks it. The README's `/status` `in_flight` row says it "can reach 2 until phase 5"; Task 3 rewrites that row to state the property (at most 1).
 
 ### Task 4: A failed swap falls back once; then `failed` (Q20)
 

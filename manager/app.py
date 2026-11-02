@@ -527,12 +527,13 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 # Q27: the request is in flight from just before the backend
                 # call until the response is complete; a request refused
                 # before the call (wrong_model, slot_unavailable) never gets
-                # here. The record's id when there is one, a generated id
-                # otherwise -- an item without a record is still counted and
-                # ended.
-                request_id = (
-                    record.id if record is not None else request_id_from(None)
-                )
+                # here. Every request gets a FRESH key, record or not: a
+                # client-supplied X-Request-Id is kept as given (record.id),
+                # so two requests can share it -- a retry, a client with a
+                # fixed id -- and keying by the record's id would let the
+                # second overwrite the first and let ending either end both.
+                # The closer and the finally below end this same key.
+                request_id = request_id_from(None)
                 slot.begin_request(request_id)
                 handed_off = False
                 try:

@@ -278,14 +278,14 @@ Per slot (`slots.<name>`):
 
 | Field | Meaning |
 |---|---|
-| `state` | What the slot is doing right now, most pressing first: `swapping` (a swap holds the slot's lock), then `unhealthy` (the last probe failed), then `serving` (a request is in flight), else `idle`. |
+| `state` | What the slot is doing right now, most pressing first: `swapping` (a swap holds the slot's lock), then `unhealthy` (the slot is not healthy — see `healthy`), then `serving` (a request is in flight), else `idle`. |
 | `in_flight` | Requests the slot is currently serving or relaying. The consumer starts the next queued request while a relayed stream is still running, so this can reach 2 until phase 5. |
 | `in_flight_age_seconds` | Age in seconds (rounded to 1 decimal) of the oldest in-flight request; `null` when none. |
 | `oldest_queue_wait_seconds` | How long in seconds (rounded to 1 decimal) the request at the head of the queue has been waiting; `null` when the queue is empty. |
 | `last_error` | The last slot fault, as `{"code", "message", "at_utc"}` with `code` one of `backend_error` (the backend answered 5xx), `upstream_timeout`, `proxy_error`, `queue_error`, `swap_failed` or `probe_failed`. Set only by slot faults — never by client errors — and never cleared: a later success leaves it in place, so it is the last thing that went wrong, not necessarily something happening now. `null` until a fault. |
 | `host`, `port` | The slot's backend address. |
 | `loaded_model` | What the backend reports loaded; `null` when nothing is. |
-| `healthy` | Whether the most recent probe reached the backend and found a loaded model. |
+| `healthy` | Whether the slot is healthy. The most recent probe sets it (it must reach the backend and find a loaded model), and a backend 5xx, a proxy error or a failed swap clear it; a successful probe or swap restores it. |
 | `swapping` | Whether a swap currently holds the slot's lock. |
 | `last_swap_utc` | ISO-8601 UTC time of the slot's last successful swap; `null` if it has never succeeded. |
 | `queue_depth`, `queue_limit` | Requests waiting / the queue's capacity. |

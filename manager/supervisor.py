@@ -42,7 +42,9 @@ class Supervision:
     restarts the operator has not opted into (supervisor_restart off). The
     two private fields pace the backoff: _last_due is the time.monotonic()
     of the last due restart, _delay the current backoff delay (None means
-    the base, config.supervisor_backoff).
+    the base, config.supervisor_backoff). A healthy probe puts _delay back
+    to the base but keeps _last_due, so a due restart always comes at
+    least the current delay after the previous one.
     """
 
     consecutive_failures: int = 0
@@ -60,12 +62,15 @@ def judge(sup: Supervision, result: str, *, stored_state: str,
     passed in) and touches only `sup` -- never the slot's state. Returns
     True when a restart is due.
 
-    A healthy probe resets the count and the backoff. A loading probe
-    (HTTP 503) while now - grace_started < config.swap_timeout changes
-    nothing: the backend is still loading, not failing, and it neither
-    counts nor resets. Every other result (a connection failure, any other
-    status, a malformed or model-less 200, or a probe that raised and
-    arrived here as PROBE_FAILED) counts one failure.
+    A healthy probe resets the count and puts the backoff delay back to
+    its base, but it does not forget when the last due restart was: every
+    due restart still comes at least the current delay after the previous
+    one, a healthy probe in between or not. A loading probe (HTTP 503)
+    while now - grace_started < config.swap_timeout changes nothing: the
+    backend is still loading, not failing, and it neither counts nor
+    resets. Every other result (a connection failure, any other status, a
+    malformed or model-less 200, or a probe that raised and arrived here
+    as PROBE_FAILED) counts one failure.
 
     A restart is due when the count is at least config.supervisor_failures,
     the slot's stored state is `unhealthy` -- a `failed` slot is counted but
@@ -76,12 +81,14 @@ def judge(sup: Supervision, result: str, *, stored_state: str,
     delay after the previous one. The delay starts at
     config.supervisor_backoff, doubles after each due restart, and is capped
     at config.supervisor_backoff_max; a healthy probe puts it back to its
-    base. A due restart resets the count -- in observe-only mode too, so
-    the backoff paces the `would restart` lines.
+    base, but the next due restart still comes at least that delay after
+    the last one. A due restart resets the count -- in observe-only mode
+    too, so the backoff paces the `would restart` lines.
     """
     if result == PROBE_HEALTHY:
         sup.consecutive_failures = 0
-        sup._last_due = None
+        # Put the delay back to its base, but keep _last_due: the next due
+        # restart still comes at least the (base) delay after the last one.
         sup._delay = None
         return False
     if result == PROBE_LOADING and now - grace_started < config.swap_timeout:
@@ -92,11 +99,14 @@ def judge(sup: Supervision, result: str, *, stored_state: str,
     if (sup.consecutive_failures < config.supervisor_failures
             or stored_state != "unhealthy"):
         return False
-    if sup._last_due is not None and now - sup._last_due < sup._delay:
-        # Inside the backoff delay since the last due restart. _delay is
-        # never None when _last_due is set: both are set on a due and both
-        # cleared by a healthy probe.
-        return False
+    if sup._last_due is not None:
+        # Inside the backoff delay since the last due restart. _delay can
+        # be None here (back at the base after a healthy probe), which
+        # keeps _last_due, so read the base in that case.
+        delay = (sup._delay if sup._delay is not None
+                 else config.supervisor_backoff)
+        if now - sup._last_due < delay:
+            return False
     # Due. Record the time, reset the count, and set the delay for the
     # next due restart: the base after a reset, otherwise doubled and
     # capped.

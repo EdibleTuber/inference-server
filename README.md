@@ -452,7 +452,7 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
 | `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>, "trial": <bool>}`; `target` defaults to the profile's home slot, and the pair must be verified unless `"trial"` is true (a trial reloads even a loaded model). Returns 200 if already loaded and no trial was requested, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. Errors: `invalid_trial`, 404 `model_not_found` (no profile), `invalid_target`, `slot_not_allowed`, `not_verified`. |
 | `GET` | `/v1/models` | Lists the onboarded profiles — models with at least one verified (model, slot) pair — as an OpenAI-compatible model list, each entry with `home_slot`, `verified_slots` and `loaded_on`. |
-| `GET` | `/status` | Per-slot state, health, in-flight and queue-wait ages, last fault, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
+| `GET` | `/status` | Per-slot state, health, in-flight and queue-wait ages, last fault, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Before answering, asks each idle or unhealthy slot's consumer to probe it; a slot that is serving or swapping is reported as it stands. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |

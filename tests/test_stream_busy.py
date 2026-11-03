@@ -235,3 +235,46 @@ async def test_the_slot_moves_on_when_closing_the_stream_raises(server, backend)
     assert first["finished"][0] == (200, "client_disconnected")   # the line
     assert seen == [1, 1]
     assert slot.in_flight_count == 0
+
+
+class SlowClose(TrackedStream):
+    """A backend stream whose close takes a while (the connection is torn
+    down over the network); it finishes when `gate` opens."""
+    gate: asyncio.Event | None = None
+
+    async def aclose(self):
+        await SlowClose.gate.wait()
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_the_next_item_waits_for_the_close_to_finish_not_just_to_begin(
+        server, backend):
+    """The client leaves before the first chunk, so the background task is
+    the closer. Until the backend stream's close has finished, the slot is
+    still busy with it: the next request must not reach the backend while
+    the old stream is half torn down."""
+    slot = load(server, "test-model-q4", healthy=True)
+    SlowClose.gate = asyncio.Event()
+    opened, seen = stream_then_json(backend, slot, hold=asyncio.Event(),
+                                    stream_cls=SlowClose)
+    first, second = recorded(stream=True, rid="r1"), recorded(rid="r2")
+
+    async with consumer(server) as task:
+        await submit(server, first, second)
+        await answered(task, first)
+        gone = asyncio.Event()
+        gone.set()
+        driving = asyncio.create_task(
+            drive(first["response"], disconnect=gone, slow_start=0.05))
+        await asyncio.sleep(0.2)
+        assert not opened[0].closed, "the close should still be waiting on its gate"
+        assert len(backend.calls) == 1, "the next request started mid-close"
+        assert not second["event"].is_set()
+
+        SlowClose.gate.set()
+        await driving
+        await answered(task, second)
+
+    assert opened[0].closed
+    assert seen == [1, 1]

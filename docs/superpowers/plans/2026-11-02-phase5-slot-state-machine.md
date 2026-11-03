@@ -190,6 +190,38 @@ Transitions: drives `idle → unhealthy`, `unhealthy → probing → idle | unhe
 
 **Interfaces:** one task per slot, `supervisor_<slot>`, that calls `slot.request_probe()` every `SUPERVISOR_PROBE_INTERVAL` while the state is `idle`, `unhealthy` or `failed`. The consumer counts consecutive failures, treats a 503 as loading within the grace, and after `SUPERVISOR_FAILURES` failures (and not before the backoff allows) restarts the unit with `ModelSwapper.restart_llama_server()`, or logs `would restart` when `SUPERVISOR_RESTART=0`. A `failed` slot is probed but never restarted. `/status` gains `supervisor` per slot.
 
+Added while writing Task 5's tests (2026-11-03):
+- **New module `manager/supervisor.py`** (it imports nothing from `manager.slots`; `slots.py` imports from it):
+  - `PROBE_HEALTHY, PROBE_LOADING, PROBE_FAILED = "healthy", "loading", "failed"`.
+  - `@dataclass class Supervision`: `consecutive_failures: int = 0`, `restarts: int = 0`, `restarts_suppressed: int = 0`, plus whatever backoff bookkeeping you need (the tests construct it with no arguments).
+  - `judge(sup, result, *, stored_state, grace_started, config, now) -> bool`. It is pure: it reads no clock and touches only `sup`. It returns True when a restart is due.
+    - A healthy result resets the count and the backoff.
+    - A loading result while `now - grace_started < config.swap_timeout` changes nothing: it neither counts nor resets.
+    - Any other result counts one failure.
+    - A restart is due when the count is at least `config.supervisor_failures`, `stored_state == "unhealthy"`, and the backoff allows it. The first restart is always allowed. After that, each due restart must come at least the current delay after the previous one; the delay starts at `supervisor_backoff`, doubles each time, and is capped at `supervisor_backoff_max`.
+    - When a restart is due, the count resets to 0. This holds in observe-only mode too, so the backoff paces the `would restart` lines.
+    - A `failed` slot is counted but never due.
+  - `async def supervise(slot, interval: float) -> None`: forever, sleep `interval`, then call `slot.request_probe()` if `slot.state` (the derived state, so `serving` is excluded) is `idle`, `unhealthy` or `failed`. It writes nothing.
+  - `supervisor_status(sup, config) -> dict`: exactly `{"restart_enabled", "restarts", "restarts_suppressed", "consecutive_failures"}`.
+- **`SlotState`:**
+  - `supervision: Supervision` (default factory).
+  - `grace_started: float`, which is `time.monotonic()` when the slot is made, so the manager's own start is a grace. `_set_state` resets it on every move out of `idle`. Moves among other states never reset it: each probe of an unhealthy slot goes `unhealthy → probing → unhealthy`, and if that reset the grace a 503 would never count.
+  - `probe()` now returns `PROBE_HEALTHY` (a usable model), `PROBE_LOADING` (HTTP 503) or `PROBE_FAILED` (anything else, including no usable model). What it records and how it moves the state are unchanged.
+- **The consumer** (`_serve_probe_requests`):
+  - After each probe, and after `finish_probe()` (so refresh waiters never wait behind a restart), it calls `judge` with `time.monotonic()`. A probe that raises counts as failed.
+  - When a restart is due and `config.supervisor_restart` is true, it calls `slot.swapper.restart_llama_server()` under `slot.swap_lock`, on the consumer's own task. A restart that returns increments `restarts` and sets `grace_started` to now. A restart that raises is logged at ERROR with its exception; it is not counted and the grace is not reset. The consumer carries on.
+  - When restarts are off, it increments `restarts_suppressed` and logs one WARNING containing `would restart`, the slot name and its unit.
+  - Every probe the consumer runs is judged, whoever asked for it (supervisor, `/status`, routing, a 5xx).
+- **Lifespan:** one `asyncio` task per slot named `supervisor_<slot>`, running `supervise(slot, config.supervisor_probe_interval)`, cancelled and awaited at shutdown.
+- **`/status`:** each slot gains `supervisor: supervisor_status(...)`.
+- **`ManagerConfig`:**
+  - `supervisor_probe_interval: float = 15.0` (`SUPERVISOR_PROBE_INTERVAL`), `supervisor_failures: int = 3` (`SUPERVISOR_FAILURES`), `supervisor_backoff: float = 30.0` (`SUPERVISOR_BACKOFF`), `supervisor_backoff_max: float = 600.0` (`SUPERVISOR_BACKOFF_MAX`), `supervisor_restart: bool = False` (`SUPERVISOR_RESTART`, exactly `0` or `1`).
+  - A bad value raises `ValueError` naming its key. The floats accept `2.5`.
+  - The template `config/manager.env` must not turn restarts on.
+- **Known consequence, accepted:** the grace is `SWAP_TIMEOUT`, which the template sets to 600, so a backend stuck answering 503 is restarted only after about 10 minutes.
+
+**Tests (Claude's commit):** `tests/test_supervisor.py`.
+
 ### Task 6: Skip a request whose client has gone (Q26)
 
 **Interfaces:** a request item carries `"request": starlette.requests.Request`. At dequeue the consumer awaits `request.is_disconnected()`; if true, the item is answered without a backend call (event set; the endpoint finishes the line with 499 `client_gone`), and the slot never leaves `idle`. Step 1 of this task is a measurement: a real uvicorn server, a client that sends a body and disconnects while queued, and a check that `is_disconnected()` turns true. If it doesn't, the task stops and Claude redesigns it.

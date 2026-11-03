@@ -347,12 +347,15 @@ class ServerState:
         # Record the fault BEFORE the fallback, so a failed fallback keeps
         # the original last_error (Task 4, Q20).
         slot.record_error("swap_failed", msg)
-        # One fallback swap to the slot's known-good model: a different
-        # model this slot has served healthily (a healthy probe or a
-        # successful swap set it). One direct swap_to under this
-        # already-held swap_lock -- not a second call into this method,
-        # and never the already-loaded shortcut: the known-good model is
-        # not what just failed, and a fallback must really load it.
+        # One fallback swap to the slot's known-good model -- the rule:
+        # a fallback is to a DIFFERENT model (a healthy probe or a
+        # successful swap set it). Reloading the model that just failed
+        # would double the outage for nothing, and a /swap retries if
+        # wanted -- so when the known-good model is the one that failed,
+        # there is no fallback and the slot goes `failed` below. One
+        # direct swap_to under this already-held swap_lock -- not a
+        # second call into this method, and never the already-loaded
+        # shortcut: a fallback must really load the other model.
         known_good = slot.known_good
         if known_good is not None and not same_model(known_good, model_name):
             fb_profile = self.profiles.get(known_good)
@@ -377,6 +380,11 @@ class ServerState:
                     return "fell_back", f"{msg}; fell back to {known_good}"
                 msg = f"{msg}; fallback to {known_good} also failed"
         slot._set_state("failed")
+        # Keep the reason on the slot: this tail's final message is what
+        # failed it, and the slot_failed 503s that follow must name it --
+        # not a later fault (a failed probe while failed records
+        # probe_failed as the new last_error; Task 4, review round 1).
+        slot.failed_reason = msg
         await self._fail_slot_queue(slot_name)
         return "failed", msg
 
@@ -1010,11 +1018,10 @@ class _RouteDecision:
 def _slot_failed_message(slot_name: str, slot: SlotState) -> str:
     """The 503 slot_failed message, shared by the routing path, the queue
     consumer and the failure tail (Task 4, Q20): the slot and the fault
-    that failed it (its last_error), so the answer says what happened, not
-    just that the slot is down."""
-    detail = slot.last_error.get("message") if slot.last_error else None
-    if not detail:
-        detail = "no fault recorded"
+    that failed it -- the reason kept on the slot when it entered
+    `failed` (review round 1) -- so the answer names that fault even
+    after a later one (a failed probe) has become the last_error."""
+    detail = slot.failed_reason or "no fault recorded"
     return f"slot {slot_name} failed: {detail}"
 
 

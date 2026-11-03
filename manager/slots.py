@@ -81,6 +81,14 @@ class SlotState:
     swap_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     model_env_file: Optional[str] = None   # generated model env file; the swap's write target
     last_error: Optional[dict] = None      # {"code","message","at_utc"}; set only by slot fault
+    # The fault that made the slot `failed` -- the failure tail's final
+    # message, kept on the slot when it enters `failed` (Task 4, Q20,
+    # review round 1): the slot_failed 503s name this, not a later fault
+    # (a failed probe while the slot is failed records probe_failed as
+    # the new last_error, and the answer must still name the swap that
+    # failed the slot). Re-set on every entry into `failed`; read only
+    # while the slot is `failed`.
+    failed_reason: Optional[str] = None
     # The swap item the consumer finished most recently:
     # {"id","model","trial","outcome","message","at_utc"}, outcome one of
     # ok, already_loaded, fell_back (the swap failed and the slot fell

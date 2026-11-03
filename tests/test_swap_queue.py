@@ -331,11 +331,12 @@ async def test_status_shows_swapping_while_the_consumer_runs_the_swap(app, clien
 
 
 @pytest.mark.asyncio
-async def test_a_swap_drained_by_a_failed_swap_ahead_still_gets_its_line(
-        app, client, world, caplog):
-    """Invariant 4. Task 4 changes what a failed swap does to the queue; until
-    then the failure tail drains it, and a drained swap must still be
-    answered, logged and reported."""
+async def test_a_swap_queued_behind_a_failed_swap_still_runs(app, client, world, caplog):
+    """Invariant 4, as Task 4 reshaped it: a failed swap no longer drains the
+    swaps queued behind it. The slot has no known-good model (the fixture's
+    test-only setter sets none), so the first swap ends the slot `failed`;
+    the second still runs -- a /swap is how a failed slot is recovered -- and
+    each gets its own line, in order."""
     server = app.state.server
     main = server.slots["main"]
     world.swap_ok = False
@@ -343,14 +344,14 @@ async def test_a_swap_drained_by_a_failed_swap_ahead_still_gets_its_line(
     assert (await swap(client, "test-model-q4", "second", trial=True)).status_code == 202
     async with running(server):
         await until(lambda: main.last_swap is not None and main.last_swap["id"] == "second",
-                    what="the drained swap")
-    assert [e.split(":task=")[0] for e in world.order] == ["swap:test-model-q8"]
-    assert main.last_swap["outcome"] == "drained"
-    by_id = {line["id"]: line for line in swap_lines(caplog)}
-    assert set(by_id) == {"first", "second"}
-    assert (by_id["first"]["status"], by_id["first"]["outcome"]) == (202, "failed")
-    assert (by_id["second"]["status"], by_id["second"]["outcome"], by_id["second"]["trial"]) == (
-        202, "drained", True)
+                    what="the second swap")
+    assert [e.split(":task=")[0] for e in world.order] == [
+        "swap:test-model-q8", "swap:test-model-q4"]
+    assert main.last_swap["outcome"] == "failed"
+    lines = swap_lines(caplog)
+    assert [(line["id"], line["status"], line["outcome"]) for line in lines] == [
+        ("first", 202, "failed"), ("second", 202, "failed")]
+    assert main.state == "failed"
 
 
 @pytest.mark.asyncio

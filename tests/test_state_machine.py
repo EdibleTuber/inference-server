@@ -46,9 +46,12 @@ def make_slot(name: str = "main") -> SlotState:
 
 def put(slot: SlotState, state: str) -> SlotState:
     """Put a slot in `state`: the test-only healthy setter, then legal moves."""
-    if state in ("unhealthy", "probing", "swapping"):
+    if state in ("unhealthy", "probing", "swapping", "failed"):
         slot.healthy = False
-        if state != "unhealthy":
+        if state == "failed":
+            slot._set_state("swapping")
+            slot._set_state("failed")
+        elif state != "unhealthy":
             slot._set_state(state)
     elif state == "idle":
         slot.healthy = True
@@ -215,17 +218,23 @@ async def submit(server, *items, slot="main"):
 # The table
 # ---------------------------------------------------------------------------
 
-STORED = {"unhealthy", "probing", "idle", "swapping"}
+STORED = {"unhealthy", "probing", "idle", "swapping", "failed"}
 
-LEGAL = [("unhealthy", "probing"), ("unhealthy", "swapping"),
-         ("probing", "idle"), ("probing", "unhealthy"),
-         ("idle", "swapping"), ("idle", "unhealthy"),
-         ("swapping", "idle"), ("swapping", "unhealthy")]
+# The final table (Task 4 added `failed` and dropped swapping -> unhealthy: a
+# failed swap now falls back or fails; Task 5 adds no moves).
+FINAL = {
+    "unhealthy": {"probing", "swapping"},
+    "probing": {"idle", "unhealthy"},
+    "idle": {"swapping", "unhealthy"},
+    "swapping": {"idle", "failed"},
+    "failed": {"idle", "swapping"},
+}
+LEGAL = [(frm, to) for frm, tos in sorted(FINAL.items()) for to in sorted(tos)]
 
-# Illegal in the final table too (Tasks 4 and 5 add only `failed` moves).
 ILLEGAL = [("unhealthy", "idle"), ("idle", "probing"), ("probing", "swapping"),
            ("swapping", "probing"), ("idle", "serving"), ("unhealthy", "serving"),
-           ("idle", "bogus")]
+           ("idle", "bogus"), ("swapping", "unhealthy"), ("failed", "unhealthy"),
+           ("failed", "probing"), ("idle", "failed"), ("unhealthy", "failed")]
 
 
 def test_a_slot_starts_unhealthy():
@@ -246,8 +255,12 @@ def test_the_table_is_over_stored_states_and_serving_is_not_one():
     assert issubclass(IllegalTransition, ValueError)
 
 
+def test_the_table_is_exactly_the_final_table():
+    assert {frm: set(tos) for frm, tos in slots_mod.TRANSITIONS.items()} == FINAL
+
+
 @pytest.mark.parametrize("frm, to", LEGAL, ids=[f"{a}->{b}" for a, b in LEGAL])
-def test_every_task_2_move_is_allowed(frm, to):
+def test_every_move_in_the_final_table_is_allowed(frm, to):
     slot = put(make_slot(), frm)
     slot._set_state(to)
     assert slot.state == to
@@ -297,6 +310,7 @@ def test_each_real_move_logs_one_info_line(caplog):
     ("idle", True, "serving", True, False),
     ("swapping", False, "swapping", False, True),
     ("swapping", True, "swapping", False, True),
+    ("failed", False, "failed", False, False),
 ])
 def test_healthy_and_swapping_derive_from_the_state(state, in_flight, shown, healthy, swapping):
     slot = put(make_slot(), state)
@@ -373,18 +387,30 @@ def test_mark_swapped_ends_a_swap_and_is_a_bug_outside_one():
         put(make_slot(), "unhealthy").mark_swapped("foo-Q4")
 
 
-@pytest.mark.parametrize("state", ["idle", "probing", "swapping", "unhealthy"])
-def test_mark_unhealthy_moves_any_state_to_unhealthy(state):
+@pytest.mark.parametrize("state", ["idle", "probing", "unhealthy"])
+def test_mark_unhealthy_moves_idle_and_probing_slots_to_unhealthy(state):
     slot = put(make_slot(), state)
     slot.mark_unhealthy()
     assert slot.state == "unhealthy"
+
+
+@pytest.mark.parametrize("state", ["swapping", "failed"])
+def test_mark_unhealthy_is_a_bug_mid_swap_or_failed(state):
+    """Task 4: a failed swap falls back or fails; nothing marks a swapping
+    or failed slot unhealthy."""
+    slot = put(make_slot(), state)
+    with pytest.raises(IllegalTransition):
+        slot.mark_unhealthy()
+    assert slot.state == state
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ok", [True, False], ids=["ok", "failed"])
 async def test_a_swap_is_the_swapping_state_and_not_healthy_while_it_runs(test_config, ok, caplog):
     """Behaviour change (phase 5): `healthy` used to keep its pre-swap value
-    during a swap; now it is false, since the state is `swapping`."""
+    during a swap; now it is false, since the state is `swapping`. The slot
+    has no known-good model (the test-only setter sets none), so a failed
+    swap has nothing to fall back to and ends `failed` (Task 4)."""
     caplog.set_level(logging.INFO, logger="manager.slots")
     server = app_mod.ServerState(test_config)
     main = put(server.slots["main"], "idle")
@@ -399,7 +425,7 @@ async def test_a_swap_is_the_swapping_state_and_not_healthy_while_it_runs(test_c
     assert await server.ensure_model_on_slot("main", "test-model-q8") is ok
     (d,) = during
     assert (d["state"], d["healthy"], d["swapping"]) == ("swapping", False, True)
-    end = "idle" if ok else "unhealthy"
+    end = "idle" if ok else "failed"
     assert main.state == end
     assert slot_lines(caplog) == ["slot=main idle -> swapping", f"slot=main swapping -> {end}"]
 

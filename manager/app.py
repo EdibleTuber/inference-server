@@ -81,6 +81,13 @@ _STREAM_DIALECTS = {
 # the consumer's turn, not the backend call.
 REFRESH_TIMEOUT = 5.0
 
+# How long a handed-off relayed stream may go unstarted before the
+# consumer closes it itself (phase 5, Q10): its client never came to
+# read it. A stream the client is reading is never cut off by this: once
+# the relay's generator or background task has run, the consumer waits
+# for the close without a timeout.
+STREAM_START_TIMEOUT = 30.0
+
 
 # ---------------------------------------------------------------------------
 # Server state
@@ -419,8 +426,9 @@ def _stream_close(ctx, client):
     """Build the single idempotent closer for an opened backend stream.
 
     Exits the stream context (closes the backend stream), then closes the
-    client that owns it. Idempotent because the relay calls it from BOTH the
-    generator's finally and its background task.
+    client that owns it. Idempotent: the relay's finish -- run by exactly
+    one of the generator's finally, the background task, or the consumer --
+    calls it, but a second call can never hurt.
     """
     state = {"closed": False}
 
@@ -436,30 +444,99 @@ def _stream_close(ctx, client):
     return close
 
 
+class _Relay(StreamingResponse):
+    """The handed-off relayed stream, with the consumer's handle on it
+    (phase 5, Q10).
+
+    It is the StreamingResponse the endpoint gives the client, plus what
+    the consumer needs to hold the slot for it: `started` is set when the
+    relay's generator begins or its background task runs; from then on
+    the stream is live (or already ran) and the wait on it carries no
+    timeout. `closed` is set once the stream's closer has run, from
+    whichever path ran it. `finish` runs that closer and ends the request
+    it carries; the consumer calls it only when nobody started the stream
+    within STREAM_START_TIMEOUT.
+    """
+
+    def __init__(self, gen, resp, started, closed, finish, finish_stream):
+        super().__init__(
+            gen,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "text/event-stream"),
+            background=BackgroundTask(finish_stream),
+        )
+        self.started = started
+        self.closed = closed
+        self.finish = finish
+
+
 def _relay_stream(resp, close, record=None, stream_tokens=None,
-                  on_close=None) -> StreamingResponse:
+                  on_close=None) -> _Relay:
     """Relay an already-opened backend stream (status < 400) to the client.
 
-    `close` runs from the generator's finally and again from the background
-    task; it is idempotent, so every path closes the backend stream: normal
-    end, client gone mid-stream (generator aborted -> finally), and client
-    gone before the first chunk (the generator never starts, so the
-    background task is the only closer).
+    The closer runs from the generator's finally, from the background
+    task, and -- for a stream nobody starts within STREAM_START_TIMEOUT --
+    from the consumer itself. All three paths call the same `finish`, and
+    its synchronous claim makes them one: the first to run it closes the
+    stream and ends the request it carries; a close that raises still ends
+    the request before the exception propagates (on that path Starlette
+    never reaches the background task, so the request must not depend on
+    it).
+
+    The request ends when the closer runs: on_close (the slot's
+    end_request) and the line are written from the closer, on every exit
+    path -- ok when the relay reached the end of the stream,
+    client_disconnected otherwise -- so the slot stays busy until the
+    stream closes and never before (phase 5, Q10).
 
     When the item carries a request record (phase 4, Q27), each relayed
     chunk is also fed, unchanged, to stream_tokens -- the sniffing never
-    touches or buffers the bytes -- and the background task, the stream's
-    closer, writes the line: ok when the relay reached the end of the
-    stream, client_disconnected otherwise. finish is idempotent, so the
-    closer and the endpoint can never double-write a relayed stream's line.
-
-    `on_close`, when given, runs from the same background task as the
-    closer: a relayed stream stays in flight on its slot until that moment,
-    never before the stream closes.
+    touches or buffers the bytes -- and the closer writes the line with
+    the sniffed counts. finish is idempotent, so the paths can never
+    double-write a relayed stream's line.
     """
-    state = {"completed": False}
+    state = {"completed": False, "closed": False}
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    def end_request_line() -> None:
+        # The request ends here, on every exit path, even if close()
+        # raised; all three calls are idempotent, so a path that runs
+        # after another is a no-op.
+        if on_close is not None:
+            on_close()
+        if record is not None:
+            if stream_tokens is not None:
+                # The sniffed counts live on the StreamTokens until the
+                # stream ends; hand them to the record so the line has them.
+                record.tokens = stream_tokens.tokens
+            record.finish(
+                resp.status_code,
+                "ok" if state["completed"] else "client_disconnected",
+            )
+        closed.set()
+
+    async def finish() -> None:
+        # The one closer for this stream. The claim is synchronous, so
+        # exactly one path -- the generator's finally, the background
+        # task, or the consumer at the start timeout -- runs it; a close
+        # that raises still ends the request (finally below), and the
+        # exception propagates afterwards.
+        if state["closed"]:
+            return
+        state["closed"] = True
+        try:
+            await close()
+        finally:
+            end_request_line()
 
     async def gen():
+        if state["closed"]:
+            # The consumer closed this stream as unstarted before the
+            # response was driven, or the endpoint drove it late: end it
+            # empty instead of reading a stream that is gone.
+            return
+        started.set()
         try:
             async for chunk in resp.aiter_bytes():
                 if stream_tokens is not None:
@@ -467,33 +544,57 @@ def _relay_stream(resp, close, record=None, stream_tokens=None,
                 yield chunk
             state["completed"] = True
         finally:
-            await close()
+            await finish()
 
     async def finish_stream() -> None:
-        try:
-            await close()
-        finally:
-            # The request the relay carries ends here, on every exit path,
-            # even if close() raises; the line is written the same way and
-            # the exception propagates afterwards.
-            if on_close is not None:
-                on_close()
-            if record is not None:
-                if stream_tokens is not None:
-                    # The sniffed counts live on the StreamTokens until the
-                    # stream ends; hand them to the record so the line has them.
-                    record.tokens = stream_tokens.tokens
-                record.finish(
-                    resp.status_code,
-                    "ok" if state["completed"] else "client_disconnected",
-                )
+        # Starlette runs this after the stream, on every path that
+        # reaches it. The generator's finally already ran finish on every
+        # one of those, so this is the safety net that keeps the old
+        # guarantee: the closer runs even when the generator never
+        # started (the client left before the first chunk).
+        started.set()
+        await finish()
 
-    return StreamingResponse(
-        gen(),
-        status_code=resp.status_code,
-        media_type=resp.headers.get("content-type", "text/event-stream"),
-        background=BackgroundTask(finish_stream),
-    )
+    return _Relay(gen(), resp, started, closed, finish, finish_stream)
+
+
+async def _wait_for_relay(relay: "_Relay", slot_name: str) -> None:
+    """Hold the consumer until a handed-off stream's closer has run (Q10).
+
+    The item was already answered at the handoff (its event is set before
+    this wait), so the client can start reading; what waits is the slot's
+    next item -- a queued swap included -- and any probe the consumer
+    would otherwise serve now.
+
+    The start timeout touches only a stream nobody starts: if neither the
+    relay's generator nor its background task has run within
+    STREAM_START_TIMEOUT of the handoff, the consumer runs the closer
+    itself and the line ends client_disconnected. A stream the client is
+    reading is never cut off: once started, this wait has no timeout.
+
+    Cancelling the consumer here does not close a started stream (the
+    client may still be reading); the cancellation propagates as is. A
+    close that raises at the start timeout has already ended the request
+    inside finish; it is logged, not swallowed into the consumer.
+    """
+    try:
+        await asyncio.wait_for(relay.started.wait(),
+                               timeout=STREAM_START_TIMEOUT)
+    except asyncio.TimeoutError:
+        if relay.started.is_set():
+            # The generator or background task started in the same instant
+            # the timeout fired: treat the stream as live.
+            await relay.closed.wait()
+        else:
+            try:
+                await relay.finish()
+            except Exception:
+                logger.exception(
+                    "slot=%s closing an unstarted stream raised; the "
+                    "request ended anyway", slot_name,
+                )
+    else:
+        await relay.closed.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -560,10 +661,13 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
     readable: readiness first (ready_for -- read-only, never swaps or
     restarts), then the proxy to the slot's backend URL. Early exits
     return; the item is always answered (response or error) and its event
-    set exactly once. A per-item exception is answered
-    as a 503 queue_error and swallowed (F2 part 2); cancellation
-    (asyncio.CancelledError) is a BaseException and still propagates and
-    kills the consumer.
+    set exactly once. A relayed stream is answered at the handoff and
+    then held: the function waits for the stream's closer before
+    returning (phase 5, Q10), so the consumer takes no next item, serves
+    no probe, and runs no queued swap while the stream relays. A per-item
+    exception is answered as a 503 queue_error and swallowed (F2 part
+    2); cancellation (asyncio.CancelledError) is a BaseException and
+    still propagates and kills the consumer.
 
     The backend PATH is per-item: each endpoint stamps its own
     item["backend_path"] when enqueuing, since OpenAI chat and Anthropic
@@ -614,6 +718,7 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
         request_id = request_id_from(None)
         slot.begin_request(request_id)
         handed_off = False
+        relay = None
         try:
             if record is not None:
                 # backend_ms runs from the backend call to the line.
@@ -669,12 +774,13 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
                     # runs when the stream closes, never before. The
                     # default argument pins request_id to THIS item
                     # -- the loop rebinds the name for the next item.
-                    item["response"] = _relay_stream(
+                    relay = _relay_stream(
                         resp, close, record=record,
                         stream_tokens=stream_tokens,
                         on_close=lambda rid=request_id:
                             slot.end_request(rid),
                     )
+                    item["response"] = relay
                     handed_off = True
             else:
                 async with httpx.AsyncClient() as client:
@@ -741,6 +847,13 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
         return
 
     event.set()
+
+    if handed_off:
+        # Q10: the slot is busy until the relayed stream closes. The
+        # event was set at the handoff, so the client can start reading
+        # now; what waits is this consumer -- its next item, its probes,
+        # a queued swap -- which must not move on while the stream runs.
+        await _wait_for_relay(relay, slot_name)
 
 
 async def _run_swap_item(server: "ServerState", slot_name: str, item: dict) -> None:

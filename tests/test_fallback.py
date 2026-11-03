@@ -240,6 +240,49 @@ async def test_while_failed_a_request_is_answered_at_once_with_503_slot_failed(
 
 
 @pytest.mark.asyncio
+async def test_the_503_names_the_fault_that_failed_the_slot_after_a_failed_probe(
+        app, client, swaps, monkeypatch):
+    """Routing refreshes a failed slot before answering, and a failed probe
+    records probe_failed as the slot's last_error. The 503 must still name
+    the swap failure that failed the slot, not the latest probe."""
+    main = main_of(app)
+    swaps.results[Q8] = False
+    assert (await swap(client, Q8, "s1")).status_code == 202
+
+    async def failing_probe(self, client):
+        self._probe_failed("probe failed: refused")
+    async with running(app.state.server):
+        await finished(main, "s1")
+        assert main.state == "failed"
+        monkeypatch.setattr(SlotState, "probe", failing_probe)
+        r = await client.post("/v1/chat/completions",
+                              json={"model": Q4, "max_tokens": 8, "messages": MSGS})
+    assert main.last_error["code"] == "probe_failed", "the probe ran and failed"
+    assert r.status_code == 503 and r.json()["error"]["type"] == "slot_failed"
+    message = r.json()["error"]["message"]
+    assert "timed out" in message and Q8 in message
+    assert "probe" not in message
+
+
+@pytest.mark.asyncio
+async def test_a_failed_swap_whose_known_good_is_the_same_model_fails_without_retrying(
+        app, client, swaps):
+    """Decided in Task 4's review: the fallback is to a different model. When
+    the known-good model is the one that just failed to load, loading it
+    again would double the outage for nothing; the slot goes `failed` and a
+    /swap retries if wanted."""
+    main = main_of(app)
+    main.known_good = Q4
+    swaps.results[Q4] = False
+    assert (await swap(client, Q4, "s1", trial=True)).status_code == 202
+    async with running(app.state.server):
+        await finished(main, "s1")
+    assert swaps.order == [Q4]
+    assert main.state == "failed"
+    assert main.last_swap["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_slot_failed_maps_to_503():
     decision = app_mod._decision_from_item_error(
         {"error": "slot main failed: x", "error_code": "slot_failed"}, "main")

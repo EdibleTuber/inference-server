@@ -83,7 +83,8 @@ class FakeManager:
 
     def _finish(self, s, rid, model, outcome):
         s["last_swap"] = {"id": rid, "model": model, "trial": True, "outcome": outcome,
-                          "message": None if outcome == "ok" else f"swap {outcome}",
+                          "message": (None if outcome == "ok"
+                                      else f"swap {outcome}: the reason the manager gave"),
                           "at_utc": "2026-10-31T00:00:00+00:00"}
 
     def _advance(self):
@@ -287,7 +288,9 @@ def test_onboard_reports_a_failed_trial_that_fell_back(env, capsys):
     assert (env["repo"] / f"{NEW}.toml").read_text() == PROFILE
     assert fake.chats == []
     assert fake.polls_after_settle <= 2
-    assert "fell_back" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "fell_back" in out
+    assert "the reason the manager gave" in out, "print the outcome and its message"
     assert fake.swaps[1] == {"model": "Old-Model-Q4", "target": "main", "trial": True}
 
 

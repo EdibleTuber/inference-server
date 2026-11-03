@@ -151,6 +151,15 @@ Transition: the slot reads `serving` (stored `idle`, a request in flight) until 
 
 **Invariants:** `in_flight` is at most 1; a client that leaves mid-stream frees the slot as soon as the closer runs; the item's event is set at the handoff, not at the close (the client must get its response to start reading). Claude rewrites `test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts`, which pins today's two-in-flight behaviour on purpose. The README's `/swap` section (Task 1) already says requests in flight run before a queued swap; for a relayed stream that becomes true here, so Task 3's review checks it. The README's `/status` `in_flight` row says it "can reach 2 until phase 5"; Task 3 rewrites that row to state the property (at most 1).
 
+Added while writing Task 3's tests (2026-11-03):
+- The request ends (`end_request`, the line, and the consumer moving on) when the closer runs, from whichever of the three paths runs it: the generator's `finally`, the background task, or the consumer at `STREAM_START_TIMEOUT`. That holds even if closing the backend stream raises. When the close raises in the generator's `finally`, Starlette never reaches the background task (`starlette/responses.py:257-284`), so today's `finish_stream` would never run on that path.
+- "Started" means the generator has begun or the background task has run. Once a client is reading, the stream runs as long as the backend sends; `STREAM_START_TIMEOUT` never cuts it off.
+- Cancelling the consumer while it waits leaves the stream to its client. Shutdown must not close a response that is being read.
+- A closer that runs late (the consumer closed an unstarted stream, then the response's background task ran) ends only its own request. In-flight keys stay per request, never the client's `X-Request-Id`.
+- The item's event is still set at the handoff, before the wait.
+
+**Tests (Claude's commit):** `tests/test_stream_busy.py` (7 tests). In `tests/test_slot_status.py`, `test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts` becomes `test_one_request_in_flight_while_a_stream_relays_then_the_next_starts`, and `test_two_in_flight_requests_sharing_a_client_request_id_are_both_counted` becomes `test_a_late_closer_does_not_end_a_later_request_sharing_its_client_id` (with one request in flight, a late closer is the remaining way one request could end another). Tests monkeypatch `manager.app.STREAM_START_TIMEOUT`, so the consumer must read it at call time.
+
 ### Task 4: A failed swap falls back once; then `failed` (Q20)
 
 Transitions: `swapping → idle` (fell back), `swapping → failed`, `failed → swapping`, `failed → idle`.

@@ -292,10 +292,11 @@ async def test_in_flight_counts_a_held_stream_then_drops_on_close(server, backen
 
 
 @pytest.mark.asyncio
-async def test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_starts(
+async def test_one_request_in_flight_while_a_stream_relays_then_the_next_starts(
         server, backend):
-    """Pins today's pre-Q10 behavior: the consumer takes the next item while a
-    relayed stream is still running. Phase 5 changes this test on purpose."""
+    """Phase 5 (Q10) changed this on purpose: it used to pin two in flight,
+    the consumer taking the next item while a relayed stream still ran. Now
+    the next request waits for the stream to close."""
     slot = load(server, "test-model-q4", healthy=True)
     hold = asyncio.Event()
     stream_respond = _stream_response(hold=hold)
@@ -309,14 +310,16 @@ async def test_two_requests_in_flight_when_a_stream_is_relayed_and_the_next_star
     first, second = recorded(stream=True, rid="r1"), recorded(rid="r2")
     async with consumer(server) as task:
         await submit(server, first, second)
-        await answered(task, first, second)
+        await answered(task, first)
+        await asyncio.sleep(0.05)
+        assert seen == [1] and not second["event"].is_set()
+        assert slot.in_flight_count == 1            # the stream is still open
+        gone = asyncio.Event()
+        gone.set()
+        await drive(first["response"], disconnect=gone, slow_start=0.05)
+        await answered(task, second)
 
-    assert seen == [1, 2]
-    assert slot.in_flight_count == 1            # the stream is still open
-    gone = asyncio.Event()
-    gone.set()
-    await drive(first["response"], disconnect=gone, slow_start=0.05)
-    await asyncio.sleep(0)
+    assert seen == [1, 1]
     assert slot.in_flight_count == 0
 
 
@@ -448,31 +451,42 @@ def test_status_keeps_every_existing_key(test_config, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_two_in_flight_requests_sharing_a_client_request_id_are_both_counted(
-        server, backend):
-    """Review round 1: a client-supplied X-Request-Id is kept as given, so two
-    requests can carry the same id (a retry, a client with a fixed id). The
-    in-flight table must count each request, not each id: ending one must
-    not end the other."""
+async def test_a_late_closer_does_not_end_a_later_request_sharing_its_client_id(
+        server, backend, monkeypatch):
+    """Review round 1 of phase 4, reshaped by phase 5 (Q10): a client-supplied
+    X-Request-Id is kept as given, so two requests can carry the same id (a
+    retry, a client with a fixed id). With one request in flight at a time,
+    the way one can still end the other is a closer that runs late: the
+    consumer closed a stream nobody started, moved on to the next request,
+    and then the response's own background task runs the closer again. That
+    must end only its own request -- the in-flight table counts requests,
+    not ids."""
+    monkeypatch.setattr(app_mod, "STREAM_START_TIMEOUT", 0.1)
     slot = load(server, "test-model-q4", healthy=True)
-    hold = asyncio.Event()
-    stream_respond = _stream_response(hold=hold)
+    entered, release = asyncio.Event(), asyncio.Event()
+    stream_respond = _stream_response(hold=asyncio.Event())
 
-    def respond(request, n):
+    async def respond(request, n):
         if n == 1:
             return stream_respond(request, n)
+        entered.set()
+        await release.wait()
         return httpx.Response(200, json={"ok": True})
     seen = _observing(backend, slot, respond)
 
     first, second = recorded(stream=True, rid="same"), recorded(rid="same")
     async with consumer(server) as task:
         await submit(server, first, second)
-        await answered(task, first, second)
+        await answered(task, first)
+        await asyncio.wait_for(entered.wait(), 2)   # the consumer closed the first
+        assert slot.in_flight_count == 1
+        gone = asyncio.Event()
+        gone.set()
+        await drive(first["response"], disconnect=gone, slow_start=0.05)
+        await asyncio.sleep(0)
+        assert slot.in_flight_count == 1, "the late closer ended the second request"
+        release.set()
+        await answered(task, second)
 
-    assert seen == [1, 2], "the second request is in flight alongside the first"
-    assert slot.in_flight_count == 1, "the stream is still open after the second ended"
-    gone = asyncio.Event()
-    gone.set()
-    await drive(first["response"], disconnect=gone, slow_start=0.05)
-    await asyncio.sleep(0)
+    assert seen == [1, 1]
     assert slot.in_flight_count == 0

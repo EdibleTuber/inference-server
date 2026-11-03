@@ -49,6 +49,9 @@ from manager.profiles import ProfileSet, load_profiles, render_model_env
 from manager.queue import RequestQueue
 from manager.reindex_jobs import ReindexRegistry
 from manager.slots import SlotState
+from manager.supervisor import (
+    PROBE_FAILED, judge, supervise, supervisor_status,
+)
 from manager.swap import ModelSwapper
 from manager.routing import resolve_slot
 
@@ -449,8 +452,9 @@ def _setup_logging(config: ManagerConfig) -> None:
 # Background queue consumer helpers
 # ---------------------------------------------------------------------------
 
-async def _serve_probe_requests(slot) -> None:
-    """Run this slot's pending probes, if any (phase 5, Q19).
+async def _serve_probe_requests(slot, config: ManagerConfig) -> None:
+    """Run this slot's pending probes, if any (phase 5, Q19), judging each
+    for the supervisor (Task 5, Q21).
 
     The consumer is the only probe writer: startup, /status and routing ask
     for a probe through refresh, which arms the handshake and wakes the
@@ -460,11 +464,18 @@ async def _serve_probe_requests(slot) -> None:
     The queue event is deliberately NOT cleared here: a refresh that joins
     mid-drain wakes the consumer on this handshake, not on the event, and
     an extra empty pass costs nothing.
+
+    After each probe, and after finish_probe() -- so the refresh waiters
+    are released before a restart, which can take RESTART_TIMEOUT, begins --
+    the result goes to judge. A probe that raised counts as failed (the
+    result stays PROBE_FAILED). A due restart runs under the slot's
+    swap_lock on this task (see _apply_supervision).
     """
     while slot.probe_pending:
+        result = PROBE_FAILED
         try:
             async with httpx.AsyncClient() as probe_client:
-                await slot.probe(probe_client)
+                result = await slot.probe(probe_client)
         except Exception:
             logger.exception(
                 "slot=%s probe raised (should not happen; slot.probe is "
@@ -472,6 +483,57 @@ async def _serve_probe_requests(slot) -> None:
             )
         finally:
             slot.finish_probe()
+        await _apply_supervision(slot, config, result)
+
+
+async def _apply_supervision(slot, config: ManagerConfig, result: str) -> None:
+    """The supervisor's half of a finished probe (Task 5, Q21): judge the
+    result on this slot's Supervision, and act when a restart is due.
+
+    Runs on the slot's queue consumer -- the only writer of the slot's
+    state and supervision -- after finish_probe(), so a restart never
+    holds up the refresh waiters. A probe that raised (a bug past its
+    never-raises contract) arrives here as PROBE_FAILED and counts.
+
+    A due restart with config.supervisor_restart calls
+    slot.swapper.restart_llama_server() under slot.swap_lock on this task;
+    one that returns increments restarts and starts a fresh loading grace,
+    one that raises is logged with its exception -- not counted, the grace
+    untouched -- and the consumer carries on. With restarts off (the
+    default) a due restart increments restarts_suppressed and logs one
+    WARNING; the judge already reset the count, so the backoff paces those
+    lines.
+    """
+    due = judge(
+        slot.supervision, result,
+        stored_state=slot.stored_state,
+        grace_started=slot.grace_started,
+        config=config,
+        now=time.monotonic(),
+    )
+    if not due:
+        return
+    if not config.supervisor_restart:
+        slot.supervision.restarts_suppressed += 1
+        logger.warning(
+            "slot=%s would restart %s after %d consecutive failed probes "
+            "(supervisor restarts are disabled; set SUPERVISOR_RESTART=1 "
+            "to enable)",
+            slot.name, slot.systemd_unit, config.supervisor_failures,
+        )
+        return
+    try:
+        async with slot.swap_lock:
+            await slot.swapper.restart_llama_server()
+    except Exception:
+        logger.exception(
+            "slot=%s supervisor restart of %s failed; not counted, the "
+            "loading grace is unchanged",
+            slot.name, slot.systemd_unit,
+        )
+        return
+    slot.supervision.restarts += 1
+    slot.grace_started = time.monotonic()
 
 
 def _stream_close(ctx, client):
@@ -687,7 +749,7 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
         # A probe may have been asked for since the last pass (startup,
         # /status or routing, through refresh): run it before the queue so
         # the next item's readiness is checked against fresh state.
-        await _serve_probe_requests(slot)
+        await _serve_probe_requests(slot, config)
 
         while not slot.queue.empty():
             item = await slot.queue.dequeue()
@@ -702,7 +764,7 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
                 await _process_request_item(server, config, slot_name, item)
             # A fault answered above may have asked for a probe: run it now,
             # without waiting for another item (phase 5, Q19).
-            await _serve_probe_requests(slot)
+            await _serve_probe_requests(slot, config)
 
 
 async def _process_request_item(server: "ServerState", config: ManagerConfig,
@@ -1319,6 +1381,18 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             for name in server.slots
         ]
 
+        # One supervisor per slot (Task 5, Q21): a ticker that asks the
+        # slot's own consumer to probe while the slot is idle, unhealthy or
+        # failed. It writes nothing -- the probe, its judgment and any
+        # restart run on the consumer.
+        supervisor_tasks = [
+            asyncio.create_task(
+                supervise(server.slots[name], config.supervisor_probe_interval),
+                name=f"supervisor_{name}",
+            )
+            for name in server.slots
+        ]
+
         # Ask each slot to probe itself through its consumer to see if the
         # backend is already running.
         for name, slot in server.slots.items():
@@ -1339,6 +1413,16 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         yield
 
         await retrieval.stop_retrieval(server, prune_task)
+
+        # Stop the askers before the writers: a supervisor cancelled after
+        # its consumer could only arm probes nothing runs anymore.
+        for task in supervisor_tasks:
+            task.cancel()
+        for task in supervisor_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         for task in consumer_tasks:
             task.cancel()
@@ -1383,7 +1467,11 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         gpu = await get_gpu_info_async()
         return {
             "slots": {
-                name: {**slot.to_status_dict(), "models": home_models.get(name, [])}
+                name: {
+                    **slot.to_status_dict(),
+                    "supervisor": supervisor_status(slot.supervision, config),
+                    "models": home_models.get(name, []),
+                }
                 for name, slot in server.slots.items()
             },
             "gpu": gpu,

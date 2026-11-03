@@ -26,6 +26,32 @@ def _int_env(key: str, default: int) -> int:
         ) from None
 
 
+def _float_env(key: str, default: float) -> float:
+    """Read a float from an env var with a clear error on bad values."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"Configuration error: {key}={raw!r} is not a valid float"
+        ) from None
+
+
+def _bool01_env(key: str, default: bool) -> bool:
+    """Read a boolean from an env var that must be exactly 0 or 1, with a
+    clear error naming the key on any other value."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    if raw not in ("0", "1"):
+        raise ValueError(
+            f"Configuration error: {key}={raw!r} must be 0 or 1"
+        )
+    return raw == "1"
+
+
 @dataclass
 class ManagerConfig:
     """Typed configuration for the model manager service.
@@ -51,6 +77,17 @@ class ManagerConfig:
         profiles_dir: Directory of per-model TOML profiles (the roster). Each
             swap renders its profile's section for the slot into the slot's
             generated model env file.
+        supervisor_probe_interval: Seconds between the per-slot supervisor's
+            probes, while the slot is idle, unhealthy or failed (Task 5, Q21).
+        supervisor_failures: Consecutive failed probes that make a restart due
+            for an unhealthy slot.
+        supervisor_backoff: Base delay, in seconds, between two supervisor
+            restarts (the start of the capped exponential backoff).
+        supervisor_backoff_max: Cap, in seconds, on the supervisor's restart
+            backoff.
+        supervisor_restart: Whether a due restart actually restarts the slot's
+            unit (env value exactly 0 or 1). Off by default: a due restart is
+            logged as "would restart" and counted in /status.
     """
     host: str
     port: int
@@ -69,6 +106,12 @@ class ManagerConfig:
     restart_timeout: int = 150
     proxy_read_timeout: int = 1800
     profiles_dir: str = "/etc/llama/models.d"
+    # The per-slot supervisor (Task 5, Q21).
+    supervisor_probe_interval: float = 15.0
+    supervisor_failures: int = 3
+    supervisor_backoff: float = 30.0
+    supervisor_backoff_max: float = 600.0
+    supervisor_restart: bool = False
 
     @property
     def llama_server_url(self) -> str:
@@ -101,4 +144,9 @@ class ManagerConfig:
             restart_timeout=_int_env("RESTART_TIMEOUT", 150),
             proxy_read_timeout=_int_env("PROXY_READ_TIMEOUT", 1800),
             profiles_dir=os.getenv("PROFILES_DIR", "/etc/llama/models.d"),
+            supervisor_probe_interval=_float_env("SUPERVISOR_PROBE_INTERVAL", 15.0),
+            supervisor_failures=_int_env("SUPERVISOR_FAILURES", 3),
+            supervisor_backoff=_float_env("SUPERVISOR_BACKOFF", 30.0),
+            supervisor_backoff_max=_float_env("SUPERVISOR_BACKOFF_MAX", 600.0),
+            supervisor_restart=_bool01_env("SUPERVISOR_RESTART", False),
         )

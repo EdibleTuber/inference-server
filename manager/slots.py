@@ -18,6 +18,9 @@ from typing import Optional
 
 from manager.names import display_name
 from manager.queue import RequestQueue
+from manager.supervisor import (
+    PROBE_FAILED, PROBE_HEALTHY, PROBE_LOADING, Supervision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,19 @@ class SlotState:
     # back to its known-good model), failed. None until the first
     # finished swap; set only by the slot's queue consumer.
     last_swap: Optional[dict] = None
+    # The supervisor's bookkeeping for this slot (Task 5, Q21): the
+    # consecutive-failure count, the restart counters and the backoff.
+    # Written only by the slot's own queue consumer (judge, after every
+    # probe it runs, and the restart it triggers); the supervisor task
+    # itself writes nothing -- it only asks for probes.
+    supervision: Supervision = field(default_factory=Supervision)
+    # When the current loading grace started, in time.monotonic(): the
+    # slot's creation (the manager's own start is a grace) and every move
+    # out of `idle` (see _set_state); a supervisor restart that returns
+    # starts a fresh one (manager/app.py). While now - grace_started <
+    # SWAP_TIMEOUT a 503 is a backend still loading its model, not a
+    # failed probe (Task 5, Q21, Review Focus 3).
+    grace_started: float = field(default_factory=time.monotonic)
     # request_id -> time.monotonic() begin. A request is in flight from just
     # before the consumer calls the backend until the response is complete; a
     # relayed stream stays in flight until its closer runs.
@@ -174,13 +190,24 @@ class SlotState:
         again is a no-op (no log). A move not in TRANSITIONS raises
         IllegalTransition with the state unchanged and nothing logged --
         it is a bug, not an expected path. Every real move logs one INFO
-        line, `slot=<name> <from> -> <to>`, on this module's logger."""
+        line, `slot=<name> <from> -> <to>`, on this module's logger. A move
+        out of `idle` (idle -> unhealthy or idle -> swapping) also starts a
+        fresh loading grace (grace_started); moves among the other states
+        never do (Task 5, Q21)."""
         if new == self.stored_state:
             return
         if new not in TRANSITIONS.get(self.stored_state, frozenset()):
             raise IllegalTransition(
                 f"slot={self.name} cannot move {self.stored_state} -> {new}")
         logger.info("slot=%s %s -> %s", self.name, self.stored_state, new)
+        if self.stored_state == "idle":
+            # Leaving `idle` starts a fresh loading grace (Task 5, Q21):
+            # from now, a 503 is a backend still loading, not a failed
+            # probe, until SWAP_TIMEOUT. Moves among the other states
+            # never restart it: each probe of an unhealthy slot goes
+            # unhealthy -> probing -> unhealthy, and if that re-armed the
+            # grace a 503 would never count.
+            self.grace_started = time.monotonic()
         self.stored_state = new
 
     def mark_unhealthy(self) -> None:
@@ -264,7 +291,7 @@ class SlotState:
     # Probing the backend
     # ------------------------------------------------------------------
 
-    async def probe(self, client) -> None:
+    async def probe(self, client) -> str:
         """Query /v1/models on the slot's backend and update the state.
 
         Never raises. On any failure (connection, timeout, non-200, non-JSON
@@ -300,6 +327,15 @@ class SlotState:
         failed; an idle slot stays idle while the call runs and moves to
         unhealthy only if it fails, so a routine refresh of a healthy slot
         logs nothing.
+
+        Returns one of the supervisor's probe results (Task 5, Q21):
+        PROBE_HEALTHY when a usable model is reported, PROBE_LOADING for an
+        HTTP 503 (the backend is still loading its model), and
+        PROBE_FAILED for anything else -- a connection failure, any other
+        status, a body the guards above reject, or a 200 with no usable
+        model id. The consumer hands the result to judge
+        (manager/supervisor.py); what the probe records and how it moves
+        the state are unchanged by the return value.
         """
         if self.stored_state == "unhealthy":
             self._set_state("probing")
@@ -308,19 +344,22 @@ class SlotState:
         except Exception as exc:
             logger.warning("slot %s probe failed: %s", self.name, exc)
             self._probe_failed(f"probe failed: {exc}")
-            return
+            return PROBE_FAILED
 
         if resp.status_code != 200:
             logger.warning("slot %s probe returned %s", self.name, resp.status_code)
             self._probe_failed(f"probe returned {resp.status_code}")
-            return
+            # A 503 is the backend still loading its model (Task 5, Q21):
+            # the judge exempts it while the loading grace runs, and only
+            # then does it count as a failure.
+            return PROBE_LOADING if resp.status_code == 503 else PROBE_FAILED
 
         try:
             data = resp.json()
         except Exception as exc:
             logger.warning("slot %s probe returned non-JSON: %s", self.name, exc)
             self._probe_failed(f"probe returned non-JSON: {exc}")
-            return
+            return PROBE_FAILED
 
         # A 200 with a JSON body that isn't shaped like /v1/models must not
         # raise -- guard each shape assumption instead of indexing/`.get`-ing
@@ -335,7 +374,7 @@ class SlotState:
                 f"/v1/models returned malformed payload "
                 f"(not an object): {type(data).__name__}",
             )
-            return
+            return PROBE_FAILED
 
         entries = data.get("data")
         if not isinstance(entries, list):
@@ -347,13 +386,13 @@ class SlotState:
                 f"/v1/models 'data' field is malformed "
                 f"(not a list): {type(entries).__name__}",
             )
-            return
+            return PROBE_FAILED
 
         if not entries:
             logger.warning("slot %s /v1/models returned no entries", self.name)
             self.loaded_model = None
             self._probe_failed("/v1/models returned no entries")
-            return
+            return PROBE_FAILED
 
         first = entries[0]
         if not isinstance(first, dict):
@@ -365,7 +404,7 @@ class SlotState:
                 f"/v1/models first entry is malformed "
                 f"(not an object): {type(first).__name__}",
             )
-            return
+            return PROBE_FAILED
 
         raw_id = first.get("id")
         if raw_id and not isinstance(raw_id, str):
@@ -381,7 +420,7 @@ class SlotState:
                 f"/v1/models first entry 'id' is malformed "
                 f"(not a string): {type(raw_id).__name__}",
             )
-            return
+            return PROBE_FAILED
 
         # Normalize to the clean display form (basename, no .gguf, original case).
         # display_name also collapses a full path to its stem, falsy input
@@ -397,12 +436,14 @@ class SlotState:
                 # usable model puts it back. An idle slot stays idle here,
                 # so a routine refresh of a healthy slot logs nothing.
                 self._set_state("idle")
+            return PROBE_HEALTHY
         else:
             # The backend answered but has no model we can name (missing or
             # empty id): the same treatment as the empty-data branch above.
             logger.warning(
                 "slot %s /v1/models returned no usable model id", self.name)
             self._probe_failed("/v1/models returned no usable model id")
+            return PROBE_FAILED
 
     def _probe_failed(self, message: str) -> None:
         """Record a failed probe and move the state (Task 4, Q20): a failed

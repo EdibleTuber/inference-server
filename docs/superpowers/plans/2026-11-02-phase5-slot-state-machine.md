@@ -222,6 +222,11 @@ Added while writing Task 5's tests (2026-11-03):
 
 **Tests (Claude's commit):** `tests/test_supervisor.py`.
 
+**Review round 1 (2026-11-03, on `be6d718`):**
+- **A healthy probe resets the delay, not the time since the last restart.** `judge`'s healthy branch clears `_last_due`, so the restart after a healthy probe is allowed at once. A backend that comes up and dies straight away would be restarted again within seconds. The rule stands as written: every due restart comes at least the current delay after the previous one, and a healthy probe only puts that delay back to `supervisor_backoff`. Test: `test_a_healthy_probe_does_not_lift_the_delay_since_the_last_restart`. The README's backoff wording ("resets to the base on a healthy probe") is still true and should stay.
+- Accepted deviation: `ready_for`'s own probe predates this task and is not judged. It runs under the held `swap_lock`, so a restart there would deadlock, and the supervisor's tick still covers a dead backend.
+- Mutator survivor P10 (sleep before the first ask) is now pinned by `test_the_supervisor_waits_one_interval_before_its_first_ask`. `test_the_supervisor_asks_for_a_probe_each_interval` also gains an upper bound. Qwen's code already passes both.
+
 ### Task 6: Skip a request whose client has gone (Q26)
 
 **Interfaces:** a request item carries `"request": starlette.requests.Request`. At dequeue the consumer awaits `request.is_disconnected()`; if true, the item is answered without a backend call (event set; the endpoint finishes the line with 499 `client_gone`), and the slot never leaves `idle`. Step 1 of this task is a measurement: a real uvicorn server, a client that sends a body and disconnects while queued, and a check that `is_disconnected()` turns true. If it doesn't, the task stops and Claude redesigns it.

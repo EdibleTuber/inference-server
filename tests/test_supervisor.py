@@ -108,6 +108,21 @@ def test_backoff_doubles_up_to_the_cap_and_a_healthy_probe_resets_it(test_config
     assert run(sup, ["failed"], config, now=420) == [True]
 
 
+def test_a_healthy_probe_does_not_lift_the_delay_since_the_last_restart(test_config):
+    """A healthy probe puts the delay back to its base, but the next
+    restart still comes at least that delay after the previous one: a
+    backend that comes up and dies at once is not restarted again within
+    seconds."""
+    config = cfg(test_config, supervisor_backoff=30.0, supervisor_backoff_max=600.0)
+    sup = Supervision()
+    assert run(sup, ["failed"] * 3, config, now=0) == [False, False, True]
+    assert run(sup, ["healthy"] + ["failed"] * 3, config, now=5) == [False] * 4
+    assert run(sup, ["failed"], config, now=30) == [True]
+    # The delay was back at its base, so the next is due 30 later, not 60.
+    assert run(sup, ["failed"] * 3, config, now=59) == [False] * 3
+    assert run(sup, ["failed"], config, now=60) == [True]
+
+
 @pytest.mark.parametrize("state", ["failed", "idle", "probing", "swapping"])
 def test_only_an_unhealthy_slot_is_ever_due_a_restart(test_config, state):
     """A `failed` slot is probed but never restarted (its recovery is a
@@ -182,8 +197,17 @@ async def ticks(slot, monkeypatch, seconds=0.2, interval=0.01):
 @pytest.mark.parametrize("state", ["idle", "unhealthy", "failed"])
 async def test_the_supervisor_asks_for_a_probe_each_interval(monkeypatch, state):
     slot = put(make_slot(), state)
-    assert await ticks(slot, monkeypatch) >= 5
+    n = await ticks(slot, monkeypatch, seconds=0.2, interval=0.01)
+    assert 5 <= n <= 25, "about one ask per interval, no more"
     assert slot.state == state, "the supervisor writes nothing itself"
+
+
+@pytest.mark.asyncio
+async def test_the_supervisor_waits_one_interval_before_its_first_ask(monkeypatch):
+    """The lifespan has just probed every slot; an ask at once would be a
+    second probe for nothing."""
+    slot = put(make_slot(), "idle")
+    assert await ticks(slot, monkeypatch, seconds=0.05, interval=0.5) == 0
 
 
 @pytest.mark.asyncio

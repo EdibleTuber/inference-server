@@ -30,12 +30,18 @@ class IllegalTransition(ValueError):
 
 # The only legal moves, over the stored states (phase 5, Q19). `serving` is
 # not a stored state -- it is `idle` with a request in flight -- and
-# appears nowhere in the table. `failed` and its moves arrive in Task 4.
+# appears nowhere in the table. `failed` (Task 4, Q20): a swap that failed
+# and had no known-good model to fall back to, or whose fallback failed too;
+# a /swap (failed -> swapping) or a healthy probe (failed -> idle) recovers
+# it. Nothing moves a swapping or a failed slot to unhealthy: a failed swap
+# falls back or fails, and a failed slot recovers by loading a model, not by
+# going stale behind a fault.
 TRANSITIONS: dict[str, frozenset[str]] = {
     "unhealthy": frozenset({"probing", "swapping"}),
     "probing": frozenset({"idle", "unhealthy"}),
     "idle": frozenset({"swapping", "unhealthy"}),
-    "swapping": frozenset({"idle", "unhealthy"}),
+    "swapping": frozenset({"idle", "failed"}),
+    "failed": frozenset({"idle", "swapping"}),
 }
 
 
@@ -46,9 +52,9 @@ class SlotState:
     A slot is a backing llama-server process that the manager fronts.
     'loaded_model' reflects what that process currently has loaded;
     'stored_state' is the one state the machine holds for the slot
-    (unhealthy, probing, idle, swapping). 'state' derives 'serving' from
-    an idle slot with a request in flight, and 'healthy' derives from
-    the state.
+    (unhealthy, probing, idle, swapping, failed). 'state' derives
+    'serving' from an idle slot with a request in flight, and 'healthy'
+    derives from the state.
 
     The queue, queue_event, and swap_lock are per-slot so work on one
     slot does not interfere with the other.
@@ -60,6 +66,11 @@ class SlotState:
     systemd_unit: str                       # unit name to restart
     queue: RequestQueue
     loaded_model: Optional[str] = None
+    # The model this slot last served healthily (Task 4, Q20): set by
+    # every healthy probe and by mark_swapped, never cleared -- a failed
+    # probe or a no-model probe leaves it alone. None until the first
+    # such evidence; the fallback target of a failed swap.
+    known_good: Optional[str] = None
     # The one stored state (phase 5, Q19), moved only through TRANSITIONS
     # and only by the slot's own queue consumer. `serving` is never stored
     # (it reads idle with a request in flight). Tests reach the states
@@ -72,8 +83,9 @@ class SlotState:
     last_error: Optional[dict] = None      # {"code","message","at_utc"}; set only by slot fault
     # The swap item the consumer finished most recently:
     # {"id","model","trial","outcome","message","at_utc"}, outcome one of
-    # ok, already_loaded, failed, drained. None until the first finished
-    # swap; set only by the slot's queue consumer.
+    # ok, already_loaded, fell_back (the swap failed and the slot fell
+    # back to its known-good model), failed. None until the first
+    # finished swap; set only by the slot's queue consumer.
     last_swap: Optional[dict] = None
     # request_id -> time.monotonic() begin. A request is in flight from just
     # before the consumer calls the backend until the response is complete; a
@@ -129,8 +141,8 @@ class SlotState:
         `serving`. `serving` is never stored: a relayed stream's closer
         runs on the response's task, not the consumer's, so a slot that
         stored `serving` could strand there after a consumer restart. A
-        stored state other than idle (unhealthy, probing, swapping) reads
-        as itself, even with requests still in flight."""
+        stored state other than idle (unhealthy, probing, swapping,
+        failed) reads as itself, even with requests still in flight."""
         if self.stored_state == "idle" and self.in_flight:
             return "serving"
         return self.stored_state
@@ -164,17 +176,22 @@ class SlotState:
         self.stored_state = new
 
     def mark_unhealthy(self) -> None:
-        """Move the stored state to unhealthy (legal from every stored
-        state; a no-op if it is already there)."""
+        """Move the stored state to unhealthy (legal from idle, probing and
+        unhealthy; a no-op if it is already there). From swapping or failed
+        it raises IllegalTransition: a failed swap falls back or fails, and
+        neither state may be marked stale behind a fault (Task 4, Q20)."""
         self._set_state("unhealthy")
 
     def mark_swapped(self, model: str) -> None:
         """Record a successful swap: move `swapping` -> `idle` (raising
         IllegalTransition from anywhere else -- a swap that ended without
-        running from `swapping` is a bug), then record the new model and
-        the swap time."""
+        running from `swapping` is a bug), then record the new model, the
+        swap time and the new known-good model: the slot just loaded the
+        model and is about to serve it, so it is the model the slot last
+        served healthily until proven otherwise (Task 4, Q20)."""
         self._set_state("idle")
         self.loaded_model = model
+        self.known_good = model
         self.last_swap_utc = datetime.now(timezone.utc).isoformat()
 
     # ------------------------------------------------------------------
@@ -248,9 +265,10 @@ class SlotState:
         non-object first entry, or a first entry whose "id" is present and
         truthy but not a string -- e.g. some unrelated HTTP service answering
         on a collided port), records a probe_failed error and moves the
-        stored state to unhealthy, leaving loaded_model as whatever it was —
-        the last-known loaded model is still useful for status reporting
-        until a successful probe or swap updates it.
+        stored state to unhealthy -- unless it is already `failed`, which
+        stays `failed` (Task 4, Q20) -- leaving loaded_model as whatever it
+        was — the last-known loaded model is still useful for status
+        reporting until a successful probe or swap updates it.
 
         Two branches intentionally do NOT follow that "leave loaded_model
         alone" rule, and null it instead:
@@ -269,7 +287,9 @@ class SlotState:
 
         State moves (phase 5, Q19): an unhealthy slot moves to probing
         before the call and to idle (a usable model) or back to unhealthy
-        after it; an idle slot stays idle while the call runs and moves to
+        after it; a failed slot (Task 4, Q20) stays failed while the call
+        runs -- a healthy probe moves it to idle, a failed probe leaves it
+        failed; an idle slot stays idle while the call runs and moves to
         unhealthy only if it fails, so a routine refresh of a healthy slot
         logs nothing.
         """
@@ -279,22 +299,19 @@ class SlotState:
             resp = await client.get(f"{self.url}/v1/models", timeout=3)
         except Exception as exc:
             logger.warning("slot %s probe failed: %s", self.name, exc)
-            self.record_error("probe_failed", f"probe failed: {exc}")
-            self.mark_unhealthy()
+            self._probe_failed(f"probe failed: {exc}")
             return
 
         if resp.status_code != 200:
             logger.warning("slot %s probe returned %s", self.name, resp.status_code)
-            self.record_error("probe_failed", f"probe returned {resp.status_code}")
-            self.mark_unhealthy()
+            self._probe_failed(f"probe returned {resp.status_code}")
             return
 
         try:
             data = resp.json()
         except Exception as exc:
             logger.warning("slot %s probe returned non-JSON: %s", self.name, exc)
-            self.record_error("probe_failed", f"probe returned non-JSON: {exc}")
-            self.mark_unhealthy()
+            self._probe_failed(f"probe returned non-JSON: {exc}")
             return
 
         # A 200 with a JSON body that isn't shaped like /v1/models must not
@@ -306,12 +323,10 @@ class SlotState:
                 "slot %s /v1/models returned malformed payload (not an object): %s",
                 self.name, type(data).__name__,
             )
-            self.record_error(
-                "probe_failed",
+            self._probe_failed(
                 f"/v1/models returned malformed payload "
                 f"(not an object): {type(data).__name__}",
             )
-            self.mark_unhealthy()
             return
 
         entries = data.get("data")
@@ -320,19 +335,16 @@ class SlotState:
                 "slot %s /v1/models 'data' field is malformed (not a list): %s",
                 self.name, type(entries).__name__,
             )
-            self.record_error(
-                "probe_failed",
+            self._probe_failed(
                 f"/v1/models 'data' field is malformed "
                 f"(not a list): {type(entries).__name__}",
             )
-            self.mark_unhealthy()
             return
 
         if not entries:
             logger.warning("slot %s /v1/models returned no entries", self.name)
             self.loaded_model = None
-            self.record_error("probe_failed", "/v1/models returned no entries")
-            self.mark_unhealthy()
+            self._probe_failed("/v1/models returned no entries")
             return
 
         first = entries[0]
@@ -341,12 +353,10 @@ class SlotState:
                 "slot %s /v1/models first entry is malformed (not an object): %s",
                 self.name, type(first).__name__,
             )
-            self.record_error(
-                "probe_failed",
+            self._probe_failed(
                 f"/v1/models first entry is malformed "
                 f"(not an object): {type(first).__name__}",
             )
-            self.mark_unhealthy()
             return
 
         raw_id = first.get("id")
@@ -359,12 +369,10 @@ class SlotState:
                 "slot %s /v1/models first entry 'id' is malformed (not a string): %s",
                 self.name, type(raw_id).__name__,
             )
-            self.record_error(
-                "probe_failed",
+            self._probe_failed(
                 f"/v1/models first entry 'id' is malformed "
                 f"(not a string): {type(raw_id).__name__}",
             )
-            self.mark_unhealthy()
             return
 
         # Normalize to the clean display form (basename, no .gguf, original case).
@@ -372,18 +380,28 @@ class SlotState:
         # (missing/empty id), and "" -> None.
         self.loaded_model = display_name(raw_id or "")
         if self.loaded_model:
-            if self.stored_state == "probing":
-                # The slot was unhealthy when the probe started; a usable
-                # model puts it back. An idle slot stays idle here, so a
-                # routine refresh of a healthy slot logs nothing.
+            # Every healthy probe records the model as the slot's
+            # known-good (Task 4, Q20): the fallback target of a later
+            # failed swap.
+            self.known_good = self.loaded_model
+            if self.stored_state in ("probing", "failed"):
+                # The slot was unhealthy or failed when the probe ran; a
+                # usable model puts it back. An idle slot stays idle here,
+                # so a routine refresh of a healthy slot logs nothing.
                 self._set_state("idle")
         else:
             # The backend answered but has no model we can name (missing or
             # empty id): the same treatment as the empty-data branch above.
             logger.warning(
                 "slot %s /v1/models returned no usable model id", self.name)
-            self.record_error(
-                "probe_failed", "/v1/models returned no usable model id")
+            self._probe_failed("/v1/models returned no usable model id")
+
+    def _probe_failed(self, message: str) -> None:
+        """Record a failed probe and move the state (Task 4, Q20): a failed
+        slot stays failed -- its recovery is a /swap or a healthy probe, not
+        a fresh fault -- while every other state moves to unhealthy."""
+        self.record_error("probe_failed", message)
+        if self.stored_state != "failed":
             self.mark_unhealthy()
 
     async def reconcile_on_error(self, client) -> None:

@@ -268,49 +268,62 @@ class ServerState:
         for this slot -- is a refusal, not a failed swap: nothing was
         stopped, so the slot's health, loaded model and queue are left
         alone and the old model keeps serving. A swap that starts and then
-        fails (raises or times out) took the backend down, so it still
-        takes the failure tail: unhealthy slot, drained queue, False.
+        fails (raises or times out) took the backend down, so it takes the
+        failure tail (Task 4, Q20): one fallback swap to the slot's
+        known-good model, and -- when the fallback lands -- the slot is
+        idle again; when the fallback fails or there is no known-good
+        model, the slot is `failed` and its queued requests are answered
+        at once with 503 slot_failed.
         """
         slot = self.slots[slot_name]
         async with slot.swap_lock:
-            return await self._ensure_model_on_slot_locked(
+            outcome, _ = await self._ensure_model_on_slot_locked(
                 slot_name, model_name, force=force)
+        return outcome in ("ok", "already_loaded")
 
     async def _ensure_model_on_slot_locked(self, slot_name: str, model_name: str,
-                                           *, force: bool = False) -> bool:
+                                           *, force: bool = False
+                                           ) -> tuple[str, str | None]:
         """The body of ensure_model_on_slot, with the slot's swap_lock
         already held by the caller.
 
         The public wrapper takes the lock; the slot's queue consumer holds
         it itself, so its already-loaded decision and the swap run are one
-        atomic step a probe cannot land between and change the answer. A
-        failed swap leaves `slot.last_error` holding the swap_failed
-        message (set in the same synchronous step, before the drain) so
-        the caller can report it.
+        atomic step a probe cannot land between and change the answer.
+
+        Returns (outcome, message), outcome one of: "already_loaded" (the
+        shortcut), "refused" (the profile set cannot render the model;
+        nothing was stopped, the slot is untouched), "ok" (the swap
+        landed), "fell_back" (the swap failed but one fallback swap
+        landed; the message names the failure and the known-good model)
+        or "failed" (the swap failed and the fallback failed or was
+        unavailable; the slot is now `failed` and its queued requests
+        were answered at once with slot_failed -- Task 4, Q20).
         """
         slot = self.slots[slot_name]
         if not force and slot.healthy and same_model(model_name, slot.loaded_model):
-            return True
+            return "already_loaded", None
 
         profile = self.profiles.get(model_name)
         if profile is None:
             logger.error(
                 "No profile for model %s in %s; add a <name>.toml there",
                 model_name, self._config.profiles_dir)
-            return False
+            return "refused", None
 
         section = profile.section(slot_name)
         if section is None:
             logger.error(
                 "Model %s has no [slots.%s] section; it may run on: %s",
                 profile.name, slot_name, ", ".join(profile.sections))
-            return False
+            return "refused", None
 
         # From here the swap is real: the slot shows swapping -- and with
         # it, not healthy -- for its whole duration, so /status and a
         # concurrent request see the truth (phase 5, Q19). The move is
         # legal from wherever a swap can start: the slot was idle holding
-        # a different model, or unhealthy.
+        # a different model, unhealthy, or failed -- a /swap is the
+        # recovery from failed (Task 4, Q20).
         slot._set_state("swapping")
 
         logger.info("slot=%s swapping to %s", slot_name, profile.name)
@@ -320,59 +333,90 @@ class ServerState:
             success = await slot.swapper.swap_to(profile.name, env_text)
         except Exception as exc:
             # A raising swap is a failed swap, not a crash: the same
-            # failure tail as the timeout case (unhealthy, drained
-            # queue, False) so no caller ever sees an exception here.
+            # failure tail as the timeout case (Task 4, Q20) so no caller
+            # ever sees an exception here.
             logger.exception("slot=%s swap to %s raised", slot_name, profile.name)
             success = False
             msg = f"Model swap failed on slot {slot_name}: {profile.name}: {exc}"
         if success:
             slot.mark_swapped(profile.name)
-            return True
+            return "ok", None
 
         if msg is None:
             msg = f"Model swap timed out on slot {slot_name}: {model_name}"
-        slot.mark_unhealthy()
+        # Record the fault BEFORE the fallback, so a failed fallback keeps
+        # the original last_error (Task 4, Q20).
         slot.record_error("swap_failed", msg)
-        await self._drain_slot_queue_with_error(slot_name, msg)
-        return False
+        # One fallback swap to the slot's known-good model: a different
+        # model this slot has served healthily (a healthy probe or a
+        # successful swap set it). One direct swap_to under this
+        # already-held swap_lock -- not a second call into this method,
+        # and never the already-loaded shortcut: the known-good model is
+        # not what just failed, and a fallback must really load it.
+        known_good = slot.known_good
+        if known_good is not None and not same_model(known_good, model_name):
+            fb_profile = self.profiles.get(known_good)
+            fb_section = (fb_profile.section(slot_name)
+                          if fb_profile is not None else None)
+            if fb_section is not None:
+                try:
+                    fb_env = render_model_env(
+                        fb_profile, fb_section, self._config.models_dir)
+                    fb_ok = await slot.swapper.swap_to(known_good, fb_env)
+                except Exception:
+                    logger.exception(
+                        "slot=%s fallback swap to known-good %s raised",
+                        slot_name, known_good)
+                    fb_ok = False
+                if fb_ok:
+                    slot.mark_swapped(known_good)
+                    logger.warning(
+                        "slot=%s swap to %s failed; fell back to known-good "
+                        "%s: %s",
+                        slot_name, profile.name, known_good, msg)
+                    return "fell_back", f"{msg}; fell back to {known_good}"
+                msg = f"{msg}; fallback to {known_good} also failed"
+        slot._set_state("failed")
+        await self._fail_slot_queue(slot_name)
+        return "failed", msg
 
-    async def _drain_slot_queue_with_error(self, slot_name: str,
-                                           message: str) -> None:
-        """Drain the given slot's queue after a failed swap.
+    async def _fail_slot_queue(self, slot_name: str) -> None:
+        """Answer the given slot's queue after the slot moved to `failed`
+        (Task 4, Q20). Runs in the failure tail, under the slot's held
+        swap_lock.
 
-        Request items are signaled with the error at once: their endpoint
-        is waiting on the item's event and renders the error response.
-        Swap items are not answered here: a drained swap gets its line,
-        its last_swap entry and its event from the consumer, after the
-        swap whose failure drained it, so last_swap ends on the latest
-        swap -- they are marked and put back in the queue, in order,
-        where the consumer's next iterations take them. The queue is
-        empty after the drain and a put below capacity never yields, so
-        the put-back loop runs to completion without interleaving.
+        Request items -- including items without a kind -- are answered
+        with slot_failed at once: their endpoints are waiting on the
+        item's event and render the 503. Swap items are not answered
+        here: they are put back in the queue, in order, where the
+        consumer's next iterations take them -- a swap on a failed slot
+        is its recovery, so queued swaps still run. The queue is empty
+        after the drain and a put below capacity never yields, so the
+        put-back loop runs to completion without interleaving.
         """
         slot = self.slots[slot_name]
         items = slot.queue.drain()
         swaps: list[dict] = []
+        answered = 0
         for item in items:
             if item.get("kind") == "swap":
-                item["drained_by"] = message
                 swaps.append(item)
             else:
-                item["error"] = message
+                item["error"] = _slot_failed_message(slot_name, slot)
+                item["error_code"] = "slot_failed"
                 item["event"].set()
+                answered += 1
         for item in swaps:
             await slot.queue.enqueue(item)
-        if len(items) - len(swaps):
+        if answered:
             logger.warning(
-                "slot=%s drained %d queued requests with error: %s",
-                slot_name, len(items) - len(swaps), message,
-            )
+                "slot=%s failed; answered %d queued request(s) with "
+                "slot_failed: %s",
+                slot_name, answered, _slot_failed_message(slot_name, slot))
         if swaps:
             logger.warning(
-                "slot=%s leaving %d queued swap item(s) to the consumer "
-                "(drained by a failed swap): %s",
-                slot_name, len(swaps), message,
-            )
+                "slot=%s leaving %d queued swap item(s) to the consumer: %s",
+                slot_name, len(swaps), _slot_failed_message(slot_name, slot))
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +702,9 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
     """Process one queued request item for the named slot.
 
     The consumer's per-request body, extracted so the consumer itself stays
-    readable: readiness first (ready_for -- read-only, never swaps or
+    readable: a slot that failed while the item waited is answered at once
+    with slot_failed -- no readiness check, no backend call (Task 4, Q20);
+    otherwise readiness first (ready_for -- read-only, never swaps or
     restarts), then the proxy to the slot's backend URL. Early exits
     return; the item is always answered (response or error) and its event
     set exactly once. A relayed stream is answered at the handoff and
@@ -684,6 +730,17 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
         record.dequeued_at = time.monotonic()
 
     try:
+        if slot.stored_state == "failed":
+            # The slot failed before this item was processed -- a failed
+            # swap's tail answered most queued requests at once (Task 4,
+            # Q20), but an item can still be dequeued into a failed slot
+            # (enqueued ahead of the failed swap's failure tail drain, or
+            # by a direct enqueue). Answer it at once with slot_failed:
+            # no readiness check, no backend call.
+            item["error"] = _slot_failed_message(slot_name, slot)
+            item["error_code"] = "slot_failed"
+            event.set()
+            return
         body: dict = item["body"]
         model_name: str = body.get("model", "")
         backend_path = item.get("backend_path", "v1/chat/completions")
@@ -874,41 +931,27 @@ async def _run_swap_item(server: "ServerState", slot_name: str, item: dict) -> N
     trial: bool = item["trial"]
     rid: str = item["id"]
     try:
-        if item.get("drained_by") is not None:
-            # A failed swap ahead of this one in the queue drained it
-            # (_drain_slot_queue_with_error). It never runs; it is answered
-            # after that swap's own line, so last_swap ends on the latest
-            # swap.
-            outcome, message = "drained", item["drained_by"]
-        else:
-            async with slot.swap_lock:
-                if not trial and slot.healthy and same_model(
-                        model_name, slot.loaded_model):
-                    # The model was loaded while this item waited (something
-                    # ahead of it in the queue swapped it in): nothing to
-                    # run. Same condition as _ensure_model_on_slot_locked's
-                    # shortcut, checked under the same held lock, so the
-                    # two cannot disagree.
-                    outcome, message = "already_loaded", None
-                else:
-                    ok = await server._ensure_model_on_slot_locked(
-                        slot_name, model_name, force=trial)
-                    if ok:
-                        outcome, message = "ok", None
-                    else:
-                        # The failure tail set last_error to the swap_failed
-                        # message in the same synchronous step. The
-                        # no-profile and no-section refusals (unreachable
-                        # for a queued item -- the endpoint validated both
-                        # before enqueuing) carry no recorded error, so a
-                        # plain message stands in for them.
-                        outcome = "failed"
-                        message = (
-                            slot.last_error["message"]
-                            if slot.last_error is not None
-                            and slot.last_error.get("code") == "swap_failed"
-                            else (f"Model swap failed on slot {slot_name}: "
-                                  f"{model_name}"))
+        async with slot.swap_lock:
+            if not trial and slot.healthy and same_model(
+                    model_name, slot.loaded_model):
+                # The model was loaded while this item waited (something
+                # ahead of it in the queue swapped it in): nothing to
+                # run. Same condition as _ensure_model_on_slot_locked's
+                # shortcut, checked under the same held lock, so the
+                # two cannot disagree.
+                outcome, message = "already_loaded", None
+            else:
+                outcome, message = await server._ensure_model_on_slot_locked(
+                    slot_name, model_name, force=trial)
+                if outcome == "refused":
+                    # Unreachable for a queued item -- the endpoint
+                    # validated the profile and section before enqueuing.
+                    # If it happens anyway, answer it as a failed swap
+                    # with a plain message: nothing was stopped, so the
+                    # slot's state and queue were left alone.
+                    outcome = "failed"
+                    message = (f"Model swap failed on slot {slot_name}: "
+                               f"{model_name}")
         slot.last_swap = {
             "id": rid,
             "model": model_name,
@@ -964,6 +1007,17 @@ class _RouteDecision:
     response: Response | None = None
 
 
+def _slot_failed_message(slot_name: str, slot: SlotState) -> str:
+    """The 503 slot_failed message, shared by the routing path, the queue
+    consumer and the failure tail (Task 4, Q20): the slot and the fault
+    that failed it (its last_error), so the answer says what happened, not
+    just that the slot is down."""
+    detail = slot.last_error.get("message") if slot.last_error else None
+    if not detail:
+        detail = "no fault recorded"
+    return f"slot {slot_name} failed: {detail}"
+
+
 def _not_loaded_message(model_name: str, slots: dict[str, SlotState]) -> str:
     """The 409 'not loaded on any slot' message, shared by the routing path
     (a fresh request) and the queue consumer (a request routed before its
@@ -983,15 +1037,19 @@ def _not_loaded_message(model_name: str, slots: dict[str, SlotState]) -> str:
 def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
     """Map a queued item's error onto a _RouteDecision.
 
-    `error_code` None or "queue_error" (e.g. items drained by a failed
-    swap) is a 503 queue_error; "slot_unavailable" is the typed 503;
-    "upstream_timeout" is the 504 for a slow-but-healthy backend (F4);
-    "model_not_loaded" is the 409 for a request whose model was swapped
-    out while it was queued. The error shapers render these unchanged.
+    `error_code` None or "queue_error" (an exception while the consumer
+    processed the item) is a 503 queue_error; "slot_failed" is the typed
+    503 for a request queued on a slot that failed while it waited
+    (Task 4, Q20); "slot_unavailable" is the typed 503; "upstream_timeout"
+    is the 504 for a slow-but-healthy backend (F4); "model_not_loaded" is
+    the 409 for a request whose model was swapped out while it was queued.
+    The error shapers render these unchanged.
     """
     code = item.get("error_code")
     if code == "model_not_loaded":
         status, code = 409, "model_not_loaded"
+    elif code == "slot_failed":
+        status, code = 503, "slot_failed"
     elif code == "slot_unavailable":
         status, code = 503, "slot_unavailable"
     elif code == "upstream_timeout":
@@ -1062,6 +1120,17 @@ async def _validate_and_route(
                 code="model_not_loaded",
                 message=_not_loaded_message(model_name, server.slots),
             ), None
+        if slot.stored_state == "failed":
+            # The slot failed with the model still loaded (a failed swap
+            # and its failed fallback; Task 4, Q20). A failed slot cannot
+            # take requests until a /swap or a healthy probe recovers it,
+            # so answer now instead of enqueuing a request that would only
+            # be answered from the queue.
+            return _RouteDecision(
+                status=503, code="slot_failed",
+                message=_slot_failed_message(slot_name, slot),
+                slot_name=slot_name,
+            ), None
         # Still unhealthy on the same model: typed 503.
         return _RouteDecision(
             status=503, code="slot_unavailable",
@@ -1120,6 +1189,8 @@ def _openai_error_response(decision: _RouteDecision) -> JSONResponse:
     (pre-existing, unchanged)."""
     if decision.code == "slot_unavailable":
         err = {"type": f"{decision.slot_name}_unavailable", "message": decision.message}
+    elif decision.code == "slot_failed":
+        err = {"type": "slot_failed", "message": decision.message}
     elif decision.code in ("queue_full", "queue_error"):
         err = {"message": decision.message, "type": "server_error"}
     elif decision.code == "model_not_loaded":
@@ -1144,6 +1215,7 @@ def _anthropic_error_response(decision: _RouteDecision) -> JSONResponse:
         "model_not_found": "not_found_error",
         "model_not_loaded": "model_not_loaded",
         "slot_unavailable": "api_error",
+        "slot_failed": "api_error",
         "queue_full": "overloaded_error",
         "queue_error": "api_error",
         "upstream_timeout": "api_error",

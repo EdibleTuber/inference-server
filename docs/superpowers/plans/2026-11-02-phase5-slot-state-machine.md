@@ -273,3 +273,20 @@ Added while writing Task 6's tests (2026-11-04):
 - A `client_gone` row in `tests/test_consumer.py::test_item_error_codes_map_to_statuses`.
 
 Run `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_client_gone.py tests/test_client_gone_real.py tests/test_consumer.py -q -p no:cacheprovider` (expected: all pass), then the full suite twice.
+
+### Branch review round 1 (2026-11-04)
+
+Claude reviewed the whole branch against `main` after Task 6, looking at how the six tasks meet in `_process_request_item`, the consumer, the failure tail and the supervisor. Nothing was wrong across task boundaries. This round has four findings: one config gap from Task 5 and three README passages that earlier tasks made stale. Claude's tests are in `tests/test_supervisor.py`.
+
+1. **Supervisor settings out of range (Task 5).** `manager/config.py` accepts any float for `SUPERVISOR_PROBE_INTERVAL`, `SUPERVISOR_BACKOFF` and `SUPERVISOR_BACKOFF_MAX`, and any int for `SUPERVISOR_FAILURES`. Measured: `asyncio.sleep(-5)` returns at once and `asyncio.sleep(nan)` never returns. So an interval of 0 or below re-arms a probe on every loop tick (`supervisor.py`, `supervise`: `await asyncio.sleep(interval)`), and nan or inf leaves the supervisor silently dead. A backoff of 0, below 0 or nan never holds a restart back (`judge`: `now - sup._last_due < delay`).
+   - **The rule:** in `ManagerConfig.from_env`, the interval, the backoff and the cap must each be finite and > 0. `SUPERVISOR_FAILURES` must be >= 1. `SUPERVISOR_BACKOFF_MAX` must be >= `SUPERVISOR_BACKOFF`.
+   - Any violation raises `ValueError` with a message naming the key, like the existing `_int_env` and `_float_env` errors. For the cap rule, that key is `SUPERVISOR_BACKOFF_MAX`.
+   - Values at the edge are legal: 0.5, 1, and a base equal to its cap.
+   - Give each of the four `SUPERVISOR_*` rows in the README configuration table its range, and add the same ranges to the commented block in `config/manager.env`.
+2. **README `/swap` row in the endpoints table** (`README.md`, `| POST | /swap |`). It still says "Returns 200 if already loaded and no trial was requested, 202 when a swap starts". That was true before Task 1. Now 200 comes only when nothing is ahead: the slot is idle, its queue is empty, the model is already loaded and no trial was requested. Otherwise 202 means the swap is queued, and 503 `queue_full` means the queue is at its limit. The poll is `GET /status`, through `swapping`, `loaded_model`, `healthy` and `last_swap`. The rewrite must match the "Switch to a different model" section; don't restate any numbers.
+3. **README `SWAP_TIMEOUT` row in the configuration table.** It still says "Exceeding it marks the slot unhealthy." That was true before Task 4. Now a swap that exceeds it has failed and takes the failure tail: one fallback swap to the known-good model, and `failed` when that fails or there is none. Point to the "Switch to a different model" section instead of repeating it. Add one clause: the supervisor uses the same value as its loading grace, in which a 503 is loading, not failed. The supervisor paragraph gives the details.
+4. **README supervisor paragraph** ("Each slot has a supervisor…"). It reads as if only the supervisor's own probes count. In fact the consumer judges every probe it runs (`_serve_probe_requests` → `_apply_supervision`), including the ones `/status` and routing ask for through `refresh`. A client that polls `/status` faster than `SUPERVISOR_PROBE_INTERVAL` makes a restart due sooner than the interval alone would. Say that every probe counts, whoever asked for it. The behavior itself is not changed in this round.
+
+**Files:** `manager/config.py`, `README.md`, `config/manager.env`.
+
+Run `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_supervisor.py -q -p no:cacheprovider` (expected: all pass), then the full suite twice.

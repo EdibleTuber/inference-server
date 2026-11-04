@@ -497,6 +497,47 @@ def test_a_bad_supervisor_setting_names_its_key(monkeypatch, key, value):
         ManagerConfig.from_env()
 
 
+@pytest.mark.parametrize("key, value", [
+    # supervise() sleeps the interval: 0 or a negative interval re-arms a
+    # probe on every loop tick (the consumer probes back to back), and nan
+    # or inf never wakes (the supervisor is silently dead). Measured
+    # 2026-11-04: asyncio.sleep(-5) returns at once; sleep(nan) never does.
+    ("SUPERVISOR_PROBE_INTERVAL", "0"), ("SUPERVISOR_PROBE_INTERVAL", "-1"),
+    ("SUPERVISOR_PROBE_INTERVAL", "nan"), ("SUPERVISOR_PROBE_INTERVAL", "inf"),
+    # judge compares now - _last_due < delay: 0, negative or nan never
+    # holds a restart back (one per failed probe), inf holds it forever.
+    ("SUPERVISOR_BACKOFF", "0"), ("SUPERVISOR_BACKOFF", "-30"),
+    ("SUPERVISOR_BACKOFF", "nan"), ("SUPERVISOR_BACKOFF", "inf"),
+    ("SUPERVISOR_BACKOFF_MAX", "0"), ("SUPERVISOR_BACKOFF_MAX", "nan"),
+    ("SUPERVISOR_BACKOFF_MAX", "inf"),
+    # Below the base the cap shrinks the delay after the first restart.
+    ("SUPERVISOR_BACKOFF_MAX", "29.9"),
+    # At least one failed probe before a restart is due.
+    ("SUPERVISOR_FAILURES", "0"), ("SUPERVISOR_FAILURES", "-1"),
+])
+def test_an_out_of_range_supervisor_setting_names_its_key(monkeypatch, key, value):
+    """Branch review (2026-11-04). Every other supervisor setting is left at
+    its default, so SUPERVISOR_BACKOFF is 30 for the cap's 29.9."""
+    for k in SUPERVISOR_ENV:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=key):
+        ManagerConfig.from_env()
+
+
+@pytest.mark.parametrize("key, value", [
+    ("SUPERVISOR_PROBE_INTERVAL", "0.5"), ("SUPERVISOR_FAILURES", "1"),
+    ("SUPERVISOR_BACKOFF", "600"), ("SUPERVISOR_BACKOFF_MAX", "30"),
+])
+def test_the_edge_of_each_supervisor_range_is_accepted(monkeypatch, key, value):
+    """Small legal values, and a base equal to its cap (600 and 30, each
+    against the other's default)."""
+    for k in SUPERVISOR_ENV:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv(key, value)
+    ManagerConfig.from_env()
+
+
 def test_the_template_ships_with_restarts_off():
     """Turning restarts on is a deliberate one-line change in the deployed
     /etc/llama/manager.env, never something the template does."""

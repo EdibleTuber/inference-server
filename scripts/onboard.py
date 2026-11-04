@@ -8,15 +8,16 @@ model it held, and only if all of that succeeds appends a
 [slots.<s>.verified] block to the REPO profile. The deployed copy is never
 touched: the operator commits the profile and deploys (Q25).
 
-A swap has landed only when /status shows a last_swap_utc different from the
-one read just before the POST /swap, the slot healthy and not swapping, and
-loaded_model matching via names.same_model: /swap answers 202 before its
-background task takes the slot's lock, so the first polls can still show the
-slot exactly as it was, which looks like success when the model is already
-loaded. A swap has failed when the slot is not swapping and not healthy, once
-swapping has been observed or if the slot was healthy before the POST; a slot
-that was already down is not a failed trial. A non-202 from /swap fails at
-once, with no polling.
+Each POST /swap carries its own X-Request-Id, and the swap is decided only by
+the last_swap entry in /status that has that id: outcome "ok" has landed it;
+any other outcome (failed, fell_back) fails it at once, printing the outcome
+and its message. The id is what decides it, not the slot's health or
+last_swap_utc: /swap answers 202 before its background task takes the slot's
+lock, so the first polls can still show the slot exactly as it was --
+including an older swap's last_swap, which the id check ignores -- and a
+fallback that puts the slot back on its old model shows it healthy, which
+used to look like success. A non-202 from /swap fails at once, with no
+polling.
 
 Exit codes:
   0  verified: the repo profile carries the [slots.<s>.verified] block;
@@ -40,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
@@ -186,30 +188,27 @@ def onboard(
         return client.get("/status").json()["slots"][slot]
 
     def swap_and_wait(swap_model: str) -> bool:
-        """POST /swap (trial) and poll /status until the swap has landed or failed."""
-        pre = slot_status()
-        pre_swap_utc = pre.get("last_swap_utc")
-        was_healthy = bool(pre.get("healthy"))
-        saw_swapping = bool(pre.get("swapping"))
-        response = client.post("/swap",
-                               json={"model": swap_model, "target": slot, "trial": True})
+        """POST /swap (trial) and poll /status until this swap's own
+        last_swap entry decides it: outcome "ok" has landed it; any other
+        outcome (failed, fell_back) fails it at once."""
+        rid = uuid.uuid4().hex
+        response = client.post(
+            "/swap",
+            json={"model": swap_model, "target": slot, "trial": True},
+            headers={"X-Request-Id": rid})
         if response.status_code != 202:
             print(f"swap of '{swap_model}' onto '{slot}' was refused{refused_detail(response)}")
             return False
         deadline = time.monotonic() + timeout
         while True:
-            state = slot_status()
-            if state.get("swapping"):
-                saw_swapping = True
-            landed = (state.get("last_swap_utc") != pre_swap_utc
-                      and bool(state.get("healthy"))
-                      and not state.get("swapping")
-                      and same_model(swap_model, state.get("loaded_model")))
-            if landed:
-                return True
-            if (not state.get("swapping") and not state.get("healthy")
-                    and (saw_swapping or was_healthy)):
-                print(f"swap of '{swap_model}' onto '{slot}' failed: the slot is not healthy")
+            last_swap = slot_status().get("last_swap")
+            if isinstance(last_swap, dict) and last_swap.get("id") == rid:
+                outcome = last_swap.get("outcome")
+                if outcome == "ok":
+                    return True
+                message = last_swap.get("message")
+                print(f"swap of '{swap_model}' onto '{slot}' failed: {outcome}"
+                      + (f": {message}" if message else ""))
                 return False
             if time.monotonic() >= deadline:
                 print(f"timed out after {timeout:g}s waiting for '{swap_model}' to land "

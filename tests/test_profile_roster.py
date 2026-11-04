@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import wait_for_swap
+
 SAMPLING = """
 [slots.{slot}.sampling]
 temp = 1.0
@@ -71,7 +73,9 @@ def roster(roster_config, monkeypatch):
         return True
 
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap_to)
-    return TestClient(create_app(roster_config)), swaps
+    # A running lifespan: a swap is a queue item (phase 5), run by the consumer.
+    with TestClient(create_app(roster_config)) as client:
+        yield client, swaps
 
 
 def _error(r):
@@ -184,9 +188,11 @@ def test_the_checks_run_in_order(roster):
 @pytest.mark.parametrize("body", [{}, {"target": None}], ids=["absent", "null"])
 def test_an_untargeted_swap_goes_to_the_profiles_home(roster, body):
     client, swaps = roster
-    r = client.post("/swap", json={"model": "HOME-EGPU-Q4.gguf", **body})
+    r = client.post("/swap", json={"model": "HOME-EGPU-Q4.gguf", **body},
+                    headers={"X-Request-Id": "home"})
     assert r.status_code == 202, r.text
     assert r.json()["slot"] == "egpu"
+    wait_for_swap(client.app.state.server, "egpu", "home")
     assert swaps == [("egpu", "Home-Egpu-Q4")]
 
 
@@ -235,8 +241,10 @@ def test_an_untargeted_swap_to_an_unverified_home_is_refused(roster):
 
 def test_a_trial_swap_loads_an_unverified_pair(roster):
     client, swaps = roster
-    r = client.post("/swap", json={"model": "Home-Egpu-Q4", "target": "main", "trial": True})
+    r = client.post("/swap", json={"model": "Home-Egpu-Q4", "target": "main", "trial": True},
+                    headers={"X-Request-Id": "trial"})
     assert r.status_code == 202, r.text
+    wait_for_swap(client.app.state.server, "main", "trial")
     assert swaps == [("main", "Home-Egpu-Q4")]
     assert client.app.state.server.slots["main"].loaded_model == "Home-Egpu-Q4"
 
@@ -246,9 +254,11 @@ def test_a_trial_swap_restarts_even_when_the_model_is_loaded(roster):
     client, swaps = roster
     main = client.app.state.server.slots["main"]
     main.loaded_model, main.healthy = "test-model-q4", True
-    r = client.post("/swap", json={"model": "test-model-q4", "target": "main", "trial": True})
+    r = client.post("/swap", json={"model": "test-model-q4", "target": "main", "trial": True},
+                    headers={"X-Request-Id": "reload"})
     assert r.status_code == 202, r.text
     assert r.json()["status"] == "swapping"
+    wait_for_swap(client.app.state.server, "main", "reload")
     assert swaps == [("main", "test-model-q4")]
 
 
@@ -292,7 +302,9 @@ def test_status_reports_home_models_and_profile_errors(roster):
 
 def test_a_slot_with_no_home_models_reports_an_empty_list(three_slot_config):
     from manager.app import create_app
-    body = TestClient(create_app(three_slot_config)).get("/status").json()
+    # The lifespan runs: /status asks each slot's consumer to probe (phase 5).
+    with TestClient(create_app(three_slot_config)) as client:
+        body = client.get("/status").json()
     assert body["slots"]["aux"]["models"] == []
     assert body["profile_errors"] == {}
 

@@ -56,7 +56,10 @@ class FakeManager:
 
     stale: polls after a POST /swap that still show the slot unchanged.
     outcome: "ok" (lands), "fail" (shows swapping, then unhealthy),
-    "fast-fail" (unhealthy, never seen swapping), "never" (swapping forever).
+    "fast-fail" (unhealthy, never seen swapping), "never" (swapping forever),
+    "fell_back" (shows swapping, then healthy again on the model it had).
+    Like the manager (phase 5), a finished swap sets the slot's last_swap
+    with the X-Request-Id the /swap carried.
     """
 
     def __init__(self, slots, *, stale=0, outcome="ok", back_outcome="ok",
@@ -76,11 +79,18 @@ class FakeManager:
         self._pending = None             # [slot, model, outcome, phase-list]
         self._stamp = 0
         self.landed = set()              # slots whose last swap has landed
+        self.swap_ids: list[str | None] = []
+
+    def _finish(self, s, rid, model, outcome):
+        s["last_swap"] = {"id": rid, "model": model, "trial": True, "outcome": outcome,
+                          "message": (None if outcome == "ok"
+                                      else f"swap {outcome}: the reason the manager gave"),
+                          "at_utc": "2026-10-31T00:00:00+00:00"}
 
     def _advance(self):
         if self._pending is None:
             return
-        slot, model, outcome, phases = self._pending
+        slot, model, outcome, phases, rid = self._pending
         s = self.slots[slot]
         phase = phases.pop(0) if phases else "settled"
         if phase == "stale":
@@ -92,13 +102,23 @@ class FakeManager:
             self._stamp += 1
             s.update(swapping=False, healthy=True, loaded_model=model,
                      last_swap_utc=f"2026-10-31T00:00:00.{self._stamp:06d}+00:00")
+            self._finish(s, rid, model, "ok")
             self.landed.add(slot)
             self._pending = None
+        elif outcome == "fell_back":
+            # The fallback swap landed: healthy, on the model it had before.
+            self._stamp += 1
+            s.update(swapping=False, healthy=True,
+                     last_swap_utc=f"2026-10-31T00:00:00.{self._stamp:06d}+00:00")
+            self._finish(s, rid, model, "fell_back")
+            self.landed.add(slot)
+            self.polls_after_settle += 1
         elif outcome == "never":
             s.update(swapping=True, healthy=False)
             phases.append("final")
         else:
             s.update(swapping=False, healthy=False)
+            self._finish(s, rid, model, "failed")
             self.polls_after_settle += 1
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -110,12 +130,14 @@ class FakeManager:
         if request.method == "POST" and path == "/swap":
             body = json.loads(request.content)
             self.swaps.append(body)
+            self.swap_ids.append(request.headers.get("x-request-id"))
             outcome = self.outcome if len(self.swaps) == 1 else self.back_outcome
             phases = ["stale"] * self.stale
             if outcome != "fast-fail":
                 phases.append("swapping")
             phases.append("final")
-            self._pending = [body["target"], body["model"], outcome, phases]
+            self._pending = [body["target"], body["model"], outcome, phases,
+                             request.headers.get("x-request-id")]
             self.landed.discard(body["target"])
             return httpx.Response(202, json={"slot": body["target"], "model": body["model"],
                                              "status": "swapping"})
@@ -256,6 +278,40 @@ def test_a_failed_trial_swap_exits_1_promptly_and_still_swaps_back(env, outcome)
     assert fake.polls_after_settle <= 2
 
 
+def test_onboard_reports_a_failed_trial_that_fell_back(env, capsys):
+    """Review Focus 5 (phase 5, Task 4): the trial fails and the manager falls
+    back to the old model, so the slot ends healthy -- on the wrong model,
+    with last_swap_utc changed. onboard must read that swap's own outcome
+    and report the failure at once, not poll until it times out."""
+    fake = FakeManager(_two_slots(), outcome="fell_back")
+    assert _run(env, fake, timeout=3.0) == 1
+    assert (env["repo"] / f"{NEW}.toml").read_text() == PROFILE
+    assert fake.chats == []
+    assert fake.polls_after_settle <= 2
+    out = capsys.readouterr().out
+    assert "fell_back" in out
+    assert "the reason the manager gave" in out, "print the outcome and its message"
+    assert fake.swaps[1] == {"model": "Old-Model-Q4", "target": "main", "trial": True}
+
+
+def test_each_swap_carries_its_own_request_id(env):
+    fake = FakeManager(_two_slots())
+    assert _run(env, fake) == 0
+    assert len(fake.swap_ids) == 2
+    assert all(fake.swap_ids) and len(set(fake.swap_ids)) == 2
+
+
+def test_a_last_swap_from_another_request_is_not_taken_for_this_one(env):
+    """Stale polls still show the previous swap's last_swap, which failed;
+    only an entry with this swap's own id decides it."""
+    slots = _two_slots()
+    slots["main"]["last_swap"] = {"id": "someone-else", "model": NEW, "trial": True,
+                                  "outcome": "failed", "message": "old",
+                                  "at_utc": "2026-10-30T00:00:00+00:00"}
+    fake = FakeManager(slots, stale=2)
+    assert _run(env, fake) == 0
+
+
 def test_a_trial_that_never_lands_times_out(env):
     fake = FakeManager(_two_slots(), outcome="never")
     assert _run(env, fake, timeout=0.2) == 1
@@ -298,7 +354,7 @@ def test_a_refused_swap_exits_1_without_polling(env):
     assert _run(env, fake) == 1
     # After each refused POST: at most the next swap's one pre-read, never a poll.
     after = log[log.index("/swap"):]
-    assert after in (["/swap"], ["/swap", "/status", "/swap"]), log
+    assert after in (["/swap"], ["/swap", "/swap"], ["/swap", "/status", "/swap"]), log
     assert fake.chats == []
     assert (env["repo"] / f"{NEW}.toml").read_text() == PROFILE
 

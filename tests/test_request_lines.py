@@ -8,6 +8,7 @@ SlotState.probe is stubbed, and swaps are short-circuited.
 import asyncio
 import json
 import logging
+import time
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ from fastapi.testclient import TestClient
 from manager import app as app_mod
 from manager.request_log import RequestRecord
 from manager.slots import SlotState
+from tests.conftest import wait_for_swap
 from tests.test_consumer import (
     TrackedStream, answered, consumer, drive, load, make_item, sse_backend, submit,
 )
@@ -334,6 +336,14 @@ def test_swap_lines(client, caplog, swap_result, case):
     r = client.post("/swap", json=body, headers={"X-Request-Id": f"swap-{case}"})
     assert r.status_code == status
     assert r.headers["x-request-id"] == f"swap-{case}"
+    if status == 202:
+        # Phase 5: a 202's line is written by the consumer when the swap ends.
+        # The test reads from another thread than the consumer's, so wait for
+        # the line itself, not just last_swap.
+        wait_for_swap(client.app.state.server, "main", f"swap-{case}")
+        deadline = time.monotonic() + 2
+        while not lines(caplog, event="swap") and time.monotonic() < deadline:
+            time.sleep(0.005)
     (line,) = lines(caplog, event="swap")
     assert list(line) == SWAP_KEYS
     assert (line["id"], line["status"], line["outcome"], line["model"], line["trial"]) == (

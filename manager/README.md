@@ -75,7 +75,14 @@ Request arrives for model "Qwen3.6-35B-A3B-UD-IQ4_NL_XL" on slot "egpu"
 5. Poll health endpoint
    GET http://127.0.0.1:8081/health every 2 seconds, up to 120 seconds
    On 200: mark the slot healthy, process queued requests
-   On timeout: mark the slot unhealthy, drain its queue with 503 responses
+   On timeout: one fallback swap to the slot's known-good model (the
+   model it last served healthily). If that lands, the slot is healthy
+   again on that model and the swap's outcome is `fell_back`. If the
+   fallback fails too, or there is no fallback to make (no known-good
+   model, or it is the model that just failed), the slot is `failed`:
+   every queued request is answered at once with 503 `slot_failed`
+   (queued swaps still run), and requests while it stays failed get
+   the same 503.
 ```
 
 **Why rewrite a file and restart instead of a hot-reload API?** llama-server does not have a runtime model-swap API. The env file + systemd restart approach is the supported mechanism. The manager owns the generated model env file under `/var/lib/llama-manager` (the directory belongs to `_llama-mgr`), so it can rewrite it without elevated privileges; the static env file in `/etc/llama/` is never touched. The sudoers entry covers only the `systemctl restart` command — it cannot touch anything else.

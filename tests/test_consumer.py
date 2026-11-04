@@ -251,6 +251,7 @@ async def test_probe_raising_inside_ready_for_releases_lock(server, probes):
     ("queue_error", 503, "queue_error"),
     ("slot_unavailable", 503, "slot_unavailable"),
     ("model_not_loaded", 409, "model_not_loaded"),
+    ("client_gone", 499, "client_gone"),     # phase 5 Task 6 (Q26)
 ])
 def test_item_error_codes_map_to_statuses(code, status, decision_code):
     decide = app_mod._decision_from_item_error
@@ -356,7 +357,9 @@ async def test_unhealthy_slot_is_reprobed_and_routed(server, probes):
     load(server, "test-model-q4", healthy=False)
     probes.result = True
 
-    decision, slot_name = await _validate_and_route(server, {"model": "test-model-q4"})
+    # Phase 5 (Q19): routing asks the slot's consumer to probe.
+    async with consumer(server):
+        decision, slot_name = await _validate_and_route(server, {"model": "test-model-q4"})
 
     assert decision is None
     assert slot_name == "main"
@@ -367,7 +370,8 @@ async def test_unhealthy_slot_still_503s_when_the_probe_fails(server, probes):
     load(server, "test-model-q4", healthy=False)
     probes.result = False
 
-    decision, _ = await _validate_and_route(server, {"model": "test-model-q4"})
+    async with consumer(server):
+        decision, _ = await _validate_and_route(server, {"model": "test-model-q4"})
 
     assert probes.calls == ["main"]
     assert (decision.status, decision.code) == (503, "slot_unavailable")
@@ -378,7 +382,8 @@ async def test_unhealthy_slot_mid_swap_is_not_probed(server, probes):
     slot = load(server, "test-model-q4", healthy=False)
     probes.result = True
 
-    async with slot.swap_lock:
+    slot._set_state("swapping")             # phase 5 (Q19): mid swap is a state
+    async with consumer(server):
         decision, _ = await _validate_and_route(server, {"model": "test-model-q4"})
 
     assert probes.calls == []

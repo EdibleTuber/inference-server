@@ -107,3 +107,19 @@ def test_nothing_names_the_old_log_files(rel):
 
 def test_the_logrotate_config_is_gone():
     assert not (REPO / "config" / "llama-logrotate").exists()
+
+
+def test_no_setting_line_in_the_template_carries_a_trailing_comment():
+    """systemd's EnvironmentFile keeps a trailing `# ...` as part of the
+    value (measured 2026-11-04 with systemd-run: `KEY=15   # note` reads back
+    as `15   # note`). So a setting line, live or commented out for the
+    operator to uncomment, must hold only KEY=value; notes go on their own
+    comment lines. Branch review round 1: `# SUPERVISOR_PROBE_INTERVAL=15
+    # finite seconds > 0`, uncommented, would stop the manager starting."""
+    setting = re.compile(r"^#?\s*([A-Z][A-Z0-9_]*)=(.*)$")
+    bad = []
+    for n, line in enumerate((REPO / "config/manager.env").read_text().splitlines(), 1):
+        m = setting.match(line)
+        if m and "#" in m.group(2):
+            bad.append(f"{n}: {line}")
+    assert bad == []

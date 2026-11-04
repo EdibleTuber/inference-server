@@ -17,7 +17,10 @@ def app(test_config):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    # The lifespan runs (phase 5, Q19): each slot's consumer is the only
+    # thing that probes it, so /status and routing need the consumers.
+    with TestClient(app) as c:
+        yield c
 
 
 def test_health_endpoint(client):
@@ -99,7 +102,10 @@ async def test_status_endpoint_does_not_block_event_loop(app):
             ticks += 1
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    # ASGITransport runs no lifespan; /status asks each slot's consumer to
+    # probe (phase 5, Q19), so the consumers must run.
+    async with app.router.lifespan_context(app), \
+            httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         with patch("manager.gpu.subprocess.run", side_effect=slow_nvidia_smi):
             start = time.monotonic()
             await asyncio.gather(client.get("/status"), ticker())
@@ -373,19 +379,22 @@ def test_chat_completions_503_on_egpu_unhealthy(client, monkeypatch):
     assert body["error"]["type"] == "egpu_unavailable"
 
 
-def test_swap_valid_main(client, monkeypatch):
-    app = client.app
+def test_swap_valid_main(app, monkeypatch):
+    from tests.conftest import wait_for_swap
     server = app.state.server
     # Short-circuit the actual swap; ensure_model_on_slot calls mark_swapped on success.
     async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
-    r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
-    assert r.status_code == 202
-    body = r.json()
-    assert body == {"slot": "main", "model": "test-model-q4", "status": "swapping"}
-    # BackgroundTasks runs to completion in TestClient, so the swap has landed.
+    with TestClient(app) as client:
+        r = client.post("/swap", json={"model": "test-model-q4", "target": "main"},
+                        headers={"X-Request-Id": "valid-main"})
+        assert r.status_code == 202
+        body = r.json()
+        assert body == {"slot": "main", "model": "test-model-q4", "status": "swapping"}
+        # The swap is a queue item (phase 5): it lands on the consumer, after the 202.
+        assert wait_for_swap(server, "main", "valid-main")["outcome"] == "ok"
     assert server.slots["main"].loaded_model == "test-model-q4"
 
 
@@ -401,16 +410,19 @@ def test_swap_already_loaded_returns_200(client, monkeypatch):
     assert r.json() == {"slot": "main", "model": "test-model-q4", "status": "ok"}
 
 
-def test_swap_valid_egpu(client, monkeypatch):
-    app = client.app
+def test_swap_valid_egpu(app, monkeypatch):
+    from tests.conftest import wait_for_swap
     server = app.state.server
     async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
-    r = client.post("/swap", json={"model": "test-model-q8", "target": "egpu"})
-    assert r.status_code == 202
-    assert r.json()["slot"] == "egpu"
+    with TestClient(app) as client:
+        r = client.post("/swap", json={"model": "test-model-q8", "target": "egpu"},
+                        headers={"X-Request-Id": "valid-egpu"})
+        assert r.status_code == 202
+        assert r.json()["slot"] == "egpu"
+        assert wait_for_swap(server, "egpu", "valid-egpu")["outcome"] == "ok"
     assert server.slots["egpu"].loaded_model == "test-model-q8"
 
 
@@ -450,28 +462,48 @@ def test_swap_nonexistent_model_file(client):
     assert r.status_code == 404
 
 
-def test_swap_failure_visible_via_slot_state(client, monkeypatch):
-    """A failed swap returns 202 (the swap runs in the background). The failure
-    is visible afterwards via the slot's healthy flag, not an HTTP error."""
-    server = client.app.state.server
+def test_swap_failure_visible_via_slot_state(app, monkeypatch):
+    """A failed swap returns 202 (the swap is queued). The failure is visible
+    afterwards via the slot's healthy flag and last_swap, not an HTTP error.
+
+    Phase 5 rework: the slot now starts healthy on another model, so "not
+    healthy" can only come from the failed swap (it used to start unhealthy,
+    which made the assertion hold whether or not a swap ran)."""
+    from tests.conftest import wait_for_swap
+    server = app.state.server
     async def fake_swap(self, model, sampling_args=""):
         return False  # health timeout
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
-    r = client.post("/swap", json={"model": "test-model-q4", "target": "main"})
-    assert r.status_code == 202
-    assert r.json()["status"] == "swapping"
-    # BackgroundTasks completed: slot should be marked unhealthy.
+    with TestClient(app) as client:
+        main = server.slots["main"]
+        main.loaded_model, main.healthy = "test-model-q8", True
+        r = client.post("/swap", json={"model": "test-model-q4", "target": "main"},
+                        headers={"X-Request-Id": "fails"})
+        assert r.status_code == 202
+        assert r.json()["status"] == "swapping"
+        assert wait_for_swap(server, "main", "fails")["outcome"] == "failed"
     assert not server.slots["main"].healthy
 
 
-def test_background_swap_failure_is_logged_not_raised(client, monkeypatch, caplog):
+def test_a_raising_swap_is_reported_not_raised(app, monkeypatch, caplog):
+    """Phase 5 rework of test_background_swap_failure_is_logged_not_raised:
+    the swap is a queue item now, so the failure lands in last_swap (with
+    the reason) and an ERROR record, never in the consumer dying."""
+    import logging
+    from tests.conftest import wait_for_swap
     async def boom(self, model_path, sampling_args=""):
         raise RuntimeError("restart refused")
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", boom)
-    r = client.post("/swap", json={"model": "test-model-q8", "target": "main"})
-    assert r.status_code == 202
-    assert "background swap failed" in caplog.text
+    with TestClient(app) as client:
+        r = client.post("/swap", json={"model": "test-model-q8", "target": "main"},
+                        headers={"X-Request-Id": "boom"})
+        assert r.status_code == 202
+        last = wait_for_swap(app.state.server, "main", "boom")
+        assert client.get("/health").status_code == 200
+    assert last["outcome"] == "failed"
+    assert "restart refused" in last["message"]
+    assert any(r.levelno == logging.ERROR and r.name == "manager.app" for r in caplog.records)
 
 def test_swap_accepts_a_configured_third_slot(client_with_three_slots):
     """A slot beyond the main slot is a valid /swap target when configured."""
@@ -497,19 +529,21 @@ def test_swap_rejects_an_unconfigured_target(client_with_three_slots):
         assert name in body, f"400 message should name configured slot {name!r}: {body}"
 
 
-def test_swap_echo_is_canonical_after_completion(client, monkeypatch):
+def test_swap_echo_is_canonical_after_completion(app, monkeypatch):
     """After a swap, the slot's loaded_model is the canonical on-disk stem."""
-    app = client.app
+    from tests.conftest import wait_for_swap
     server = app.state.server
 
     async def fake_swap(self, model, sampling_args=""):
         return True
     monkeypatch.setattr("manager.swap.ModelSwapper.swap_to", fake_swap)
 
-    r = client.post("/swap", json={"model": "TEST-MODEL-Q4.gguf", "target": "main"})
-    assert r.status_code == 202
-    # The 202 echoes the requested name; the canonical name lands after the swap.
-    # BackgroundTasks completed in TestClient, so loaded_model is set.
+    with TestClient(app) as client:
+        r = client.post("/swap", json={"model": "TEST-MODEL-Q4.gguf", "target": "main"},
+                        headers={"X-Request-Id": "canon"})
+        assert r.status_code == 202
+        # The 202 echoes the requested name; the canonical name lands after the swap.
+        wait_for_swap(server, "main", "canon")
     assert server.slots["main"].loaded_model == "test-model-q4"
 
 
@@ -563,27 +597,6 @@ async def test_ensure_model_skips_swap_on_case_variant(test_config):
     result = await server.ensure_model_on_slot("main", "TEST-MODEL-Q4")
     assert result is True
     server.slots["main"].swapper.swap_to.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# reprobe swap_lock gate (Task 5)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_reprobe_waits_for_swap_lock(test_config):
-    """A post-5xx reprobe must not run while a swap holds the slot lock."""
-    from manager.app import ServerState, _reprobe_for
-    server = ServerState(test_config)
-    slot = server.slots["main"]
-    slot.reconcile_on_error = AsyncMock()
-
-    await slot.swap_lock.acquire()          # simulate an in-flight swap
-    task = asyncio.create_task(_reprobe_for(slot))
-    await asyncio.sleep(0.01)
-    slot.reconcile_on_error.assert_not_called()   # blocked on the lock
-    slot.swap_lock.release()
-    await task
-    slot.reconcile_on_error.assert_awaited_once()  # ran after release
 
 
 # --- a stale slot view must not be reported as "not loaded" ----------------
@@ -663,8 +676,9 @@ def test_a_genuinely_unloaded_model_still_409s_after_the_reprobe(client, monkeyp
 
 def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
     """A swap in flight is authoritative and already producing fresh state.
-    Waiting on its lock would stall this request behind a model load, and
-    probing past it could clobber a fresh mark_swapped."""
+    Waiting on it would stall this request behind a model load, and
+    probing past it could clobber a fresh mark_swapped. Phase 5 (Q19): mid
+    swap is the slot's `swapping` state."""
     from manager.slots import SlotState
 
     server = client.app.state.server
@@ -680,17 +694,10 @@ def test_the_reprobe_skips_a_slot_mid_swap(client, monkeypatch):
 
     monkeypatch.setattr(SlotState, "probe", fake_probe)
 
-    async def hold_and_request():
-        await server.slots["egpu"].swap_lock.acquire()
-        try:
-            return await asyncio.to_thread(
-                client.post, "/v1/chat/completions",
-                json={"model": "test-model-q8",
-                      "messages": [{"role": "user", "content": "hi"}]})
-        finally:
-            server.slots["egpu"].swap_lock.release()
-
-    r = asyncio.run(hold_and_request())
+    server.slots["egpu"]._set_state("swapping")
+    r = client.post("/v1/chat/completions",
+                    json={"model": "test-model-q8",
+                          "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 409
     assert "egpu" not in probed, probed
     assert "main" in probed, probed

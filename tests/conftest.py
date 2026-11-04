@@ -44,6 +44,20 @@ def block_live_ports(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
 
 
+def wait_for_swap(server, slot: str, rid: str, timeout: float = 3.0) -> dict:
+    """Block until the slot's consumer has finished the swap with this
+    X-Request-Id (phase 5: a swap is a queue item, so it finishes on the
+    consumer, after the 202). Needs a running lifespan (`with TestClient`)."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        last = getattr(server.slots[slot], "last_swap", None)
+        if last is not None and last["id"] == rid:
+            return last
+        time.sleep(0.01)
+    raise AssertionError(f"swap {rid!r} on slot {slot!r} did not finish within {timeout}s")
+
+
 @pytest.fixture
 def tmp_models_dir(tmp_path):
     """Create a temporary models directory with sample GGUF files."""

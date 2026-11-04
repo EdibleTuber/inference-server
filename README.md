@@ -175,17 +175,18 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 
 ### Switch to a different model
 
-Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its profile's `home` slot (every profile names exactly one). The call returns **202** as soon as the swap has started — the swap itself runs in the background and takes 30 seconds to several minutes for a large cold load. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up).
+Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its profile's `home` slot (every profile names exactly one). A swap is a FIFO item in that slot's queue: the call returns **202** as soon as the swap is queued, and the slot's consumer runs it after whatever is already ahead of it — requests in flight and queued on that slot run first, and requests queued behind the swap wait for it to finish (a large cold load takes 30 seconds to several minutes). It returns **200** only when nothing is ahead: the slot is idle (healthy, no request in flight, not mid-swap), its queue is empty, the model is already loaded, and no trial was requested. A queue at its limit refuses the swap **503** `queue_full`. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up, `last_swap` what the latest finished swap ended with).
 
 ```bash
 curl http://YOUR_LAN_IP:11434/swap \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL"}'
 # → 202, {"slot": "egpu", "model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL", "status": "swapping"}
-#   (or 200 with "status": "ok" if it is already loaded there and no trial was requested)
+#   (or 200 with "status": "ok" if nothing is ahead — the slot idle, its
+#    queue empty, the model already loaded there, and no trial requested)
 ```
 
-A model may only be swapped to a slot its profile names, and only once that pair has been verified; `"trial": true` relaxes the verification for one swap. That is how `scripts/onboard.py` verifies a new pair — and a trial reloads the model even when it is already loaded, so it really exercises the load. Errors: 400 for a missing `model`, a non-boolean `trial` (`invalid_trial`) or an unknown `target`; 404 `model_not_found` if no profile exists for the model (the message names the `config/models/<model>.toml` to add); 400 `slot_not_allowed` if the profile has no section for the target slot; 400 `not_verified` if the pair is not verified and no trial was requested. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error; it leaves the slot `healthy: false` in `GET /status`.
+A model may only be swapped to a slot its profile names, and only once that pair has been verified; `"trial": true` relaxes the verification for one swap. That is how `scripts/onboard.py` verifies a new pair — and a trial reloads the model even when it is already loaded, so it really exercises the load. Errors: 400 for a missing `model`, a non-boolean `trial` (`invalid_trial`) or an unknown `target`; 404 `model_not_found` if no profile exists for the model (the message names the `config/models/<model>.toml` to add); 400 `slot_not_allowed` if the profile has no section for the target slot; 400 `not_verified` if the pair is not verified and no trial was requested. A swap that starts returns 202 even if it later fails — a failed swap never surfaces as an HTTP error. When it fails, the slot makes one fallback swap to the model it last served healthily — and a fallback is to a different model, so when the known-good model is the one that just failed there is no fallback to make (reloading it would double the outage for nothing; a `POST /swap` retries if wanted). If the fallback lands, the slot is healthy again on that model and its `last_swap` outcome is `fell_back`. If the fallback fails too, or there is no fallback to make, the slot is `failed`: every request queued on it is answered at once with 503 `slot_failed`, and requests while it stays failed get the same 503 (error `type` `slot_failed` in the OpenAI shape, `api_error` in the Anthropic envelope), naming the fault that failed the slot. A `POST /swap` — or a healthy probe — recovers a failed slot; queued swaps on it still run.
 
 ### Anthropic Messages API
 
@@ -278,16 +279,17 @@ Per slot (`slots.<name>`):
 
 | Field | Meaning |
 |---|---|
-| `state` | What the slot is doing right now, most pressing first: `swapping` (a swap holds the slot's lock), then `unhealthy` (the slot is not healthy — see `healthy`), then `serving` (a request is in flight), else `idle`. |
-| `in_flight` | Requests the slot is currently serving or relaying. The consumer starts the next queued request while a relayed stream is still running, so this can reach 2 until phase 5. |
+| `state` | What the slot is doing right now, most pressing first: `swapping` (a swap is running), then `unhealthy` (the slot is not healthy — see `healthy`), then `failed` (its last swap failed and could not fall back — see `last_error` and `last_swap`), then `probing` (a probe is running), then `serving` (a request is in flight), else `idle`. |
+| `in_flight` | Requests the slot is currently serving or relaying: at most one, because the consumer takes the next queued request — a queued swap included — only after a relayed stream has closed, or after the start timeout closed one nobody started. |
 | `in_flight_age_seconds` | Age in seconds (rounded to 1 decimal) of the oldest in-flight request; `null` when none. |
 | `oldest_queue_wait_seconds` | How long in seconds (rounded to 1 decimal) the request at the head of the queue has been waiting; `null` when the queue is empty. |
 | `last_error` | The last slot fault, as `{"code", "message", "at_utc"}` with `code` one of `backend_error` (the backend answered 5xx), `upstream_timeout`, `proxy_error`, `queue_error`, `swap_failed` or `probe_failed`. Set only by slot faults — never by client errors — and never cleared: a later success leaves it in place, so it is the last thing that went wrong, not necessarily something happening now. `null` until a fault. |
 | `host`, `port` | The slot's backend address. |
 | `loaded_model` | What the backend reports loaded; `null` when nothing is. |
-| `healthy` | Whether the slot is healthy. The most recent probe sets it (it must reach the backend and find a loaded model), and a backend 5xx, a proxy error or a failed swap clear it; a successful probe or swap restores it. |
-| `swapping` | Whether a swap currently holds the slot's lock. |
+| `healthy` | Whether the slot is healthy: `true` while its state is `idle` or `serving`, `false` while `unhealthy`, `probing`, `swapping` or `failed` — so it drops the moment a swap starts and returns when the swap lands (or its fallback does). A successful probe or swap makes it `true`; a backend 5xx, a proxy error, a failed probe, or a swap that fails without a fallback make it `false`. |
+| `swapping` | Whether the slot is in the `swapping` state: `true` from the moment its consumer starts a queued swap until that swap lands or fails. |
 | `last_swap_utc` | ISO-8601 UTC time of the slot's last successful swap; `null` if it has never succeeded. |
+| `last_swap` | The swap the slot's consumer most recently finished, as `{"id", "model", "trial", "outcome", "message", "at_utc"}`; `outcome` is `ok`, `already_loaded` (the model was loaded by the time the item ran, so nothing swapped), `fell_back` (the swap failed but the slot recovered to the model it last served healthily), or `failed` (the swap failed and the fallback failed too, or there was no known-good model; the slot is now `failed`). `message` is the failure text, `null` otherwise. `null` until the slot's first finished swap. |
 | `queue_depth`, `queue_limit` | Requests waiting / the queue's capacity. |
 | `models` | The onboarded models whose profile names this slot as their `home`. |
 
@@ -332,7 +334,7 @@ The file keeps its upstream name, and that stem is the model name clients use. R
 2. Add `config/models/<stem>.toml` — copy an existing profile and change the values. The shipped profiles' comments record what each key means and how the value was measured.
 3. Commit and deploy: `scripts/deploy-manager.sh` validates every profile and refuses to ship one that fails (exit 5).
 4. Restart the manager, which reads the profiles at startup. The model is now known but verified on no slot, so `POST /swap` refuses it until step 5.
-5. Verify it with `scripts/onboard.py <model> --slot <slot>`: a trial load on that slot, a test chat, a swap back to the previous model, and a `[slots.<slot>.verified]` block appended to the profile. Commit the block and deploy again; afterwards `/swap` accepts the pair without a trial.
+5. Verify it with `scripts/onboard.py <model> --slot <slot>`: a trial load on that slot, a test chat, a swap back to the previous model, and — only if the trial's own `last_swap` entry says `ok` — a `[slots.<slot>.verified]` block appended to the profile. Each swap decides itself from the `last_swap` entry carrying the request id its `POST /swap` sent, so an entry with any other outcome fails the onboarding at once — including `fell_back`, where the slot ends healthy on the previous model and the old health-based check would have read it as a pass. Commit the block and deploy again; afterwards `/swap` accepts the pair without a trial.
 
 ### List available models
 
@@ -428,9 +430,14 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `PROFILES_DIR` | `/etc/llama/models.d` | Directory holding the per-model TOML profiles (the roster). `setup.sh` and `deploy-manager.sh` install `config/models/*.toml` here. |
 | `MODEL_ENV_DIR` | `/var/lib/llama-manager` | Directory holding the generated per-slot model env files (`<slot>.env`), rewritten by the manager on every swap and loaded by the slot's unit before its static env file. Owned by `_llama-mgr`. |
 | `QUEUE_LIMIT` | `20` | Maximum requests held in the `main` slot's FIFO queue (template: `50`). Requests beyond this get a 503. |
-| `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it marks the slot unhealthy. |
+| `SWAP_TIMEOUT` | `120` | Upper bound, in seconds, on waiting for a slot to become healthy after a swap (template: `600`). Health is polled, so a generous value costs nothing on a good load. Exceeding it fails the swap and takes the failure tail described in "Switch to a different model". The supervisor uses the same value as its loading grace, in which a 503 is loading, not failed; the supervisor paragraph below gives the details. |
 | `RESTART_TIMEOUT` | `150` | Upper bound, in seconds, on a `systemctl restart` of a slot's unit during a swap. Both slot units have `TimeoutStopUSec=1min 30s`, so a restart can legitimately take ~90s before the new process starts; 150s covers that. Exceeding it fails the swap. |
 | `PROXY_READ_TIMEOUT` | `1800` | The longest, in seconds, the manager waits for the next bytes from the backend. For a non-streaming request that is effectively the whole generation; for a stream it is the longest silence, such as prefill before the first token. A read or write timeout answers 504 `upstream_timeout` and leaves the slot healthy. |
+| `SUPERVISOR_PROBE_INTERVAL` | `15` | Seconds between the per-slot supervisor's probes, while the slot is `idle`, `unhealthy` or `failed`. Must be a finite number of seconds greater than 0. |
+| `SUPERVISOR_FAILURES` | `3` | Consecutive failed probes that make a supervisor restart due for an unhealthy slot. Must be at least 1. |
+| `SUPERVISOR_BACKOFF` | `30` | Base delay, in seconds, between two due supervisor restarts; it doubles after each due restart and resets to the base on a healthy probe. Must be a finite number of seconds greater than 0. |
+| `SUPERVISOR_BACKOFF_MAX` | `600` | Cap, in seconds, on the supervisor's restart backoff. Must be a finite number of seconds greater than 0, and at least `SUPERVISOR_BACKOFF`. |
+| `SUPERVISOR_RESTART` | `0` | Exactly `0` or `1`. `1` lets a due restart run `systemctl restart` on the slot's unit; `0` (the default) logs one `would restart` warning per due restart instead and counts it in `/status`. The template ships it commented out; enabling it is a deliberate edit to the deployed env file. |
 | `EMBEDDINGS_HOST` / `EMBEDDINGS_PORT` | `127.0.0.1` / `8082` | Where llama-embeddings listens. Always localhost. |
 | `COLLECTIONS_CONFIG` | `/etc/llama/collections.json` | Path to collection definitions JSON file. |
 | `SKILLS_DB_PATH` | `/opt/llama/data/skills.db` | Path to the SQLite-vec database for document retrieval. |
@@ -448,9 +455,9 @@ All endpoints are on `LAN_IP:11434`.
 | `POST` | `/v1/chat/completions` | OpenAI chat completions. Routes by the `model` field to the slot that has it loaded and queues there. 404 if no profile exists for the model, 409 if no slot has it loaded. Supports streaming (`"stream": true`). |
 | `POST` | `/v1/messages` | Anthropic Messages API. Byte passthrough to the slot's llama-server, with the same routing, queueing and status codes as chat completions; errors use the Anthropic error envelope. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. Same routing, but bypasses the queue. |
-| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>, "trial": <bool>}`; `target` defaults to the profile's home slot, and the pair must be verified unless `"trial"` is true (a trial reloads even a loaded model). Returns 200 if already loaded and no trial was requested, 202 when a swap starts; poll `GET /status` (`swapping`, `loaded_model`, `healthy`) for the outcome. Errors: `invalid_trial`, 404 `model_not_found` (no profile), `invalid_target`, `slot_not_allowed`, `not_verified`. |
+| `POST` | `/swap` | Load a model onto a slot. Body `{"model": ..., "target": <slot>, "trial": <bool>}`; `target` defaults to the profile's home slot, and the pair must be verified unless `"trial"` is true (a trial reloads even a loaded model). Returns 200 only when nothing is ahead: the slot is idle, its queue is empty, the model is already loaded, and no trial was requested; otherwise 202 means the swap is queued in the slot's FIFO and 503 `queue_full` means the queue is at its limit — see "Switch to a different model". Poll `GET /status` (`swapping`, `loaded_model`, `healthy`, `last_swap`) for the outcome. Errors: `invalid_trial`, 404 `model_not_found` (no profile), `invalid_target`, `slot_not_allowed`, `not_verified`. |
 | `GET` | `/v1/models` | Lists the onboarded profiles — models with at least one verified (model, slot) pair — as an OpenAI-compatible model list, each entry with `home_slot`, `verified_slots` and `loaded_on`. |
-| `GET` | `/status` | Per-slot state, health, in-flight and queue-wait ages, last fault, loaded model, home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Re-probes every slot before answering. |
+| `GET` | `/status` | Per-slot state, health, in-flight and queue-wait ages, last fault, loaded model, supervisor state (`restart_enabled`, `restarts`, `restarts_suppressed`, `consecutive_failures`), home-model list and queue depth; top-level `profile_errors`; GPU VRAM usage; uptime. Before answering, asks each idle, unhealthy or failed slot's consumer to probe it; a slot that is serving or swapping is reported as it stands. |
 | `GET` | `/health` | Returns `{"status": "ok"}` with HTTP 200. Use for uptime monitors. |
 | `GET` | `/collections` | Lists registered document collections with document counts. |
 | `POST` | `/collections/{id}/search` | Semantic search within a collection. Returns ranked summaries. |
@@ -463,9 +470,12 @@ All endpoints are on `LAN_IP:11434`.
 
 There is no single top-level readiness flag. Each entry under `/status`'s `slots` map reports its own state instead:
 
-- `healthy` (bool) — set from the outcome of the slot's most recent probe or swap attempt: `true` after a successful probe or swap, `false` at startup or after a failed one (backend unreachable, bad response, model file not found, or swap timeout). It is not updated while a swap is in progress — a slot that was healthy before a swap started still reports `healthy: true` until that swap resolves.
+- `healthy` (bool) — derived from the slot's state: `true` while the slot is `idle` (including while serving), `false` at startup, while `probing`, while `swapping`, while `failed`, or after a failed probe (backend unreachable, bad response, model file not found). A swap that fails and falls back leaves the slot healthy again on the model it fell back to; one whose fallback fails too — or that has no known-good model — leaves it `failed`.
 - `loaded_model` — the model currently loaded on that slot, or `null` if none has loaded successfully yet. It generally lags behind a swap in progress, and is only cleared to `null` when a probe explicitly reports nothing loaded.
 - `models` — the models whose profile names this slot as `home` (empty if none): the models an untargeted `/swap` sends to this slot. It comes from the profiles, not from any per-slot setting.
+- `supervisor` — the per-slot supervisor's view (Q21): `restart_enabled` (whether `SUPERVISOR_RESTART` is `1`), `restarts` (restarts the consumer actually ran), `restarts_suppressed` (restarts that were due while restarts were off) and `consecutive_failures` (failed probes since the last healthy probe or the last due restart).
+
+Each slot has a supervisor that asks its own consumer to probe the backend every `SUPERVISOR_PROBE_INTERVAL` seconds while the slot is `idle`, `unhealthy` or `failed`. Every probe counts, whoever asked for it: the consumer judges every probe it runs, including the ones a `GET /status` or a routed request asks for through a refresh — a client that polls `/status` faster than the interval makes a restart due sooner than the interval alone would. A failed probe (backend unreachable, any other status, a malformed response, or no usable model) counts against the slot; `SUPERVISOR_FAILURES` consecutive failures make a restart due while the slot is `unhealthy` and the backoff allows it — base `SUPERVISOR_BACKOFF`, doubling after each due restart, capped at `SUPERVISOR_BACKOFF_MAX`, reset to the base by a healthy probe. A backend answering 503 is loading, not failed, for `SWAP_TIMEOUT` seconds after the slot last left `idle`, was restarted, or the manager started, so a slow load is not restarted out from under itself. Restarting is opt-in: with `SUPERVISOR_RESTART=0` (the default) a due restart logs one `would restart` warning and counts in `restarts_suppressed`. A `failed` slot is probed but never restarted — its recovery is a `/swap` or a healthy probe.
 
 A chat request for a model that isn't loaded on any slot returns **409** rather than triggering an implicit swap; load it first via `POST /swap`. A request already queued when its model is swapped out gets the same 409, never a swap.
 
@@ -616,6 +626,8 @@ The manager writes one structured JSON line per inference request and per
 ```bash
 journalctl -u llama-manager -o cat | sed -n 's/^INFO manager.requests: //p' | jq
 ```
+
+A request whose client disconnected before it was served is not run, and its line has status 499 and outcome `client_gone`.
 
 ### Enable on boot
 

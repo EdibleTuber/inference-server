@@ -7,6 +7,7 @@ All configuration comes from environment variables, which are set in
 This module provides a typed config object so the rest of the app doesn't
 need to deal with raw env vars or string parsing.
 """
+import math
 import os
 from dataclasses import dataclass
 
@@ -24,6 +25,48 @@ def _int_env(key: str, default: int) -> int:
         raise ValueError(
             f"Configuration error: {key}={raw!r} is not a valid integer"
         ) from None
+
+
+def _float_env(key: str, default: float) -> float:
+    """Read a float from an env var with a clear error on bad values."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"Configuration error: {key}={raw!r} is not a valid float"
+        ) from None
+
+
+def _positive_finite_env(key: str, default: float) -> float:
+    """Read a float that must be a finite number of seconds greater than zero.
+
+    A supervisor interval of 0 or below re-arms a probe on every loop tick
+    (asyncio.sleep(0/-5) returns at once) and nan or inf never wakes it
+    (asyncio.sleep(nan) never returns), so both are refused.
+    """
+    value = _float_env(key, default)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"Configuration error: {key}={value!r} must be a finite "
+            f"number of seconds greater than 0"
+        )
+    return value
+
+
+def _bool01_env(key: str, default: bool) -> bool:
+    """Read a boolean from an env var that must be exactly 0 or 1, with a
+    clear error naming the key on any other value."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    if raw not in ("0", "1"):
+        raise ValueError(
+            f"Configuration error: {key}={raw!r} must be 0 or 1"
+        )
+    return raw == "1"
 
 
 @dataclass
@@ -51,6 +94,17 @@ class ManagerConfig:
         profiles_dir: Directory of per-model TOML profiles (the roster). Each
             swap renders its profile's section for the slot into the slot's
             generated model env file.
+        supervisor_probe_interval: Seconds between the per-slot supervisor's
+            probes, while the slot is idle, unhealthy or failed (Task 5, Q21).
+        supervisor_failures: Consecutive failed probes that make a restart due
+            for an unhealthy slot.
+        supervisor_backoff: Base delay, in seconds, between two supervisor
+            restarts (the start of the capped exponential backoff).
+        supervisor_backoff_max: Cap, in seconds, on the supervisor's restart
+            backoff.
+        supervisor_restart: Whether a due restart actually restarts the slot's
+            unit (env value exactly 0 or 1). Off by default: a due restart is
+            logged as "would restart" and counted in /status.
     """
     host: str
     port: int
@@ -69,6 +123,12 @@ class ManagerConfig:
     restart_timeout: int = 150
     proxy_read_timeout: int = 1800
     profiles_dir: str = "/etc/llama/models.d"
+    # The per-slot supervisor (Task 5, Q21).
+    supervisor_probe_interval: float = 15.0
+    supervisor_failures: int = 3
+    supervisor_backoff: float = 30.0
+    supervisor_backoff_max: float = 600.0
+    supervisor_restart: bool = False
 
     @property
     def llama_server_url(self) -> str:
@@ -82,7 +142,26 @@ class ManagerConfig:
 
     @classmethod
     def from_env(cls) -> "ManagerConfig":
-        """Load configuration from environment variables with sensible defaults."""
+        """Load configuration from environment variables with sensible defaults.
+
+        The supervisor settings are range-checked (branch review round 1):
+        the interval, the backoff and the cap must each be finite seconds
+        greater than 0, the failure count at least 1, and the cap not below
+        the base; a violation raises ValueError naming the key.
+        """
+        failures = _int_env("SUPERVISOR_FAILURES", 3)
+        if failures < 1:
+            raise ValueError(
+                f"Configuration error: SUPERVISOR_FAILURES={failures!r} "
+                f"must be an integer of at least 1"
+            )
+        backoff = _positive_finite_env("SUPERVISOR_BACKOFF", 30.0)
+        backoff_max = _positive_finite_env("SUPERVISOR_BACKOFF_MAX", 600.0)
+        if backoff_max < backoff:
+            raise ValueError(
+                f"Configuration error: SUPERVISOR_BACKOFF_MAX={backoff_max!r} "
+                f"must be at least SUPERVISOR_BACKOFF={backoff!r}"
+            )
         return cls(
             host=os.getenv("HOST", "0.0.0.0"),
             port=_int_env("PORT", 8080),
@@ -101,4 +180,11 @@ class ManagerConfig:
             restart_timeout=_int_env("RESTART_TIMEOUT", 150),
             proxy_read_timeout=_int_env("PROXY_READ_TIMEOUT", 1800),
             profiles_dir=os.getenv("PROFILES_DIR", "/etc/llama/models.d"),
+            supervisor_probe_interval=_positive_finite_env(
+                "SUPERVISOR_PROBE_INTERVAL", 15.0
+            ),
+            supervisor_failures=failures,
+            supervisor_backoff=backoff,
+            supervisor_backoff_max=backoff_max,
+            supervisor_restart=_bool01_env("SUPERVISOR_RESTART", False),
         )

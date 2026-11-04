@@ -290,3 +290,12 @@ Claude reviewed the whole branch against `main` after Task 6, looking at how the
 **Files:** `manager/config.py`, `README.md`, `config/manager.env`.
 
 Run `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_supervisor.py -q -p no:cacheprovider` (expected: all pass), then the full suite twice.
+
+### Branch review round 1, fix (2026-11-04)
+
+Qwen's round 1 (`19df4ee`) is right except for one thing in `config/manager.env`, and the gap was in this plan. Finding 1 said "add the same ranges to the commented block" without saying where. Qwen put each range at the end of its commented setting line (`# SUPERVISOR_PROBE_INTERVAL=15   # finite seconds > 0`), a reasonable reading. But systemd's `EnvironmentFile` keeps a trailing `# ...` as part of the value. Measured with `systemd-run --user -p EnvironmentFile=…`: the value read back as `15   # finite seconds > 0`. An operator who uncomments that line gets a manager that refuses to start (`is not a valid float`).
+
+- Put the ranges on their own comment lines: in the prose above the commented settings, or one comment line above each. Every setting line, live or commented, holds only `KEY=value`.
+- Test: `tests/test_repo_consistency.py::test_no_setting_line_in_the_template_carries_a_trailing_comment`. It fails at `19df4ee` on exactly the four `SUPERVISOR_*` lines and passes on the template as it was at `7bcf504`.
+
+**Files:** `config/manager.env` only.

@@ -627,6 +627,8 @@ The manager writes one structured JSON line per inference request and per
 journalctl -u llama-manager -o cat | sed -n 's/^INFO manager.requests: //p' | jq
 ```
 
+A request whose client disconnected before it was served is not run, and its line has status 499 and outcome `client_gone`.
+
 ### Enable on boot
 
 ```bash

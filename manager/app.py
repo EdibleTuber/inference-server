@@ -32,6 +32,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from manager import retrieval
 from manager.config import ManagerConfig
@@ -767,17 +768,49 @@ async def _queue_consumer(server: "ServerState", config: ManagerConfig, slot_nam
             await _serve_probe_requests(slot, config)
 
 
+async def _client_is_gone(slot_name: str, request) -> bool:
+    """Whether the client that sent a queued request is still connected
+    (phase 5, Q26).
+
+    One is_disconnected() check is not reliable on the production stack
+    (the unit passes no --http, so uvicorn picks httptools): with a body
+    over 64 KiB, uvicorn has paused reading the socket by the time the
+    body is read, so it has not seen the client close. Starlette's check
+    (starlette/requests.py) resumes the read but returns before it
+    completes, so the close shows only on a check one loop tick later.
+    Hence: check, yield one loop tick, check again. Neither check waits
+    for a disconnect, so a connected client is served at once.
+
+    Never raises: a check that raises counts the client as connected
+    (one warning naming the slot), so the item is served as before.
+    """
+    try:
+        if await request.is_disconnected():
+            return True
+        await asyncio.sleep(0)
+        return await request.is_disconnected()
+    except Exception as exc:
+        logger.warning(
+            "slot=%s client-gone check failed; serving the request: %s",
+            slot_name, exc,
+        )
+        return False
+
+
 async def _process_request_item(server: "ServerState", config: ManagerConfig,
                                 slot_name: str, item: dict) -> None:
     """Process one queued request item for the named slot.
 
     The consumer's per-request body, extracted so the consumer itself stays
-    readable: a slot that failed while the item waited is answered at once
-    with slot_failed -- no readiness check, no backend call (Task 4, Q20);
-    otherwise readiness first (ready_for -- read-only, never swaps or
-    restarts), then the proxy to the slot's backend URL. Early exits
-    return; the item is always answered (response or error) and its event
-    set exactly once. A relayed stream is answered at the handoff and
+    readable: first a check that the client is still connected -- a request
+    whose client has gone is answered at once with client_gone, no
+    readiness check, no backend call, the slot's state and in_flight
+    untouched (Task 6, Q26); then a slot that failed while the item waited
+    is answered at once with slot_failed -- no readiness check, no backend
+    call (Task 4, Q20); otherwise readiness first (ready_for -- read-only,
+    never swaps or restarts), then the proxy to the slot's backend URL.
+    Early exits return; the item is always answered (response or error) and
+    its event set exactly once. A relayed stream is answered at the handoff and
     then held: the function waits for the stream's closer before
     returning (phase 5, Q10), so the consumer takes no next item, serves
     no probe, and runs no queued swap while the stream relays. A per-item
@@ -800,6 +833,25 @@ async def _process_request_item(server: "ServerState", config: ManagerConfig,
         record.dequeued_at = time.monotonic()
 
     try:
+        # Q26: skip a request whose client has gone. First thing inside the
+        # try, after the record's slot and dequeue stamps above (so the
+        # line has queue_wait_ms) and before the failed branch, ready_for,
+        # begin_request and any backend call: nobody is there to read the
+        # answer, and the line should say why the request was not served.
+        # The endpoint puts its Request on the item as item["request"];
+        # an item with no "request" (internal callers, tests) is served
+        # exactly as before. Swap items never reach here: they are
+        # dispatched to _run_swap_item, and a swap's 202 is already
+        # answered, so its client would always read as gone.
+        request = item.get("request")
+        if request is not None and await _client_is_gone(slot_name, request):
+            item["error"] = (
+                f"client for {slot_name} request disconnected before "
+                f"the request was served"
+            )
+            item["error_code"] = "client_gone"
+            event.set()
+            return
         if slot.stored_state == "failed":
             # The slot failed before this item was processed -- a failed
             # swap's tail answered most queued requests at once (Task 4,
@@ -1111,12 +1163,17 @@ def _decision_from_item_error(item: dict, slot_name: str) -> _RouteDecision:
     503 for a request queued on a slot that failed while it waited
     (Task 4, Q20); "slot_unavailable" is the typed 503; "upstream_timeout"
     is the 504 for a slow-but-healthy backend (F4); "model_not_loaded" is
-    the 409 for a request whose model was swapped out while it was queued.
+    the 409 for a request whose model was swapped out while it was queued;
+    "client_gone" is the 499 for a request whose client disconnected
+    before the consumer served it (Task 6, Q26). Without that mapping it
+    would fall through to a 503 queue_error.
     The error shapers render these unchanged.
     """
     code = item.get("error_code")
     if code == "model_not_loaded":
         status, code = 409, "model_not_loaded"
+    elif code == "client_gone":
+        status, code = 499, "client_gone"
     elif code == "slot_failed":
         status, code = 503, "slot_failed"
     elif code == "slot_unavailable":
@@ -1212,6 +1269,7 @@ async def _validate_and_route(
 async def _route_and_wait(
     server: "ServerState", body: dict, backend_path: str,
     record: RequestRecord | None = None,
+    request: Request | None = None,
 ) -> _RouteDecision:
     """Validate, route, enqueue and wait -- the core of the queued endpoints.
 
@@ -1221,6 +1279,9 @@ async def _route_and_wait(
     When the endpoint passes a request record (phase 4, Q27), it is stamped
     with enqueued_at and travels with the item as item["record"]; the
     consumer stamps the rest and the closer or the endpoint finishes it.
+    When the endpoint passes its Request (phase 5, Q26), it travels with the
+    item as item["request"], so the consumer can ask at dequeue whether the
+    client is still connected.
     """
     decision, slot_name = await _validate_and_route(server, body)
     if decision is not None:
@@ -1235,6 +1296,8 @@ async def _route_and_wait(
     if record is not None:
         record.enqueued_at = time.monotonic()
         item["record"] = record
+    if request is not None:
+        item["request"] = request
     slot = server.slots[slot_name]
 
     try:
@@ -1266,6 +1329,8 @@ def _openai_error_response(decision: _RouteDecision) -> JSONResponse:
         err = {"type": "model_not_loaded", "message": decision.message}
     elif decision.code == "upstream_timeout":
         err = {"type": "upstream_timeout", "message": decision.message}
+    elif decision.code == "client_gone":
+        err = {"type": "client_gone", "message": decision.message}
     else:  # missing_model, model_not_found
         err = {"message": decision.message, "type": "invalid_request_error"}
     headers = {"Retry-After": "5"} if decision.status == 503 else None
@@ -1276,13 +1341,18 @@ def _anthropic_error_response(decision: _RouteDecision) -> JSONResponse:
     """Render a _RouteDecision failure in the Anthropic error shape:
     {"type": "error", "error": {"type": ..., "message": ...}}, with the inner
     type taken from Anthropic's error taxonomy where one exists (409 "not
-    loaded on any slot" has no Anthropic analog and keeps its manager type).
+    loaded on any slot" and 499 "client gone" have no Anthropic analog and
+    keep their manager types).
     """
+    # client_gone has no Anthropic equivalent either, so it keeps the
+    # manager's code, as model_not_loaded already does. Without the key
+    # the lookup below raises KeyError: a 500 and no line.
     type_by_code = {
         "invalid_body": "invalid_request_error",
         "missing_model": "invalid_request_error",
         "model_not_found": "not_found_error",
         "model_not_loaded": "model_not_loaded",
+        "client_gone": "client_gone",
         "slot_unavailable": "api_error",
         "slot_failed": "api_error",
         "queue_full": "overloaded_error",
@@ -1516,6 +1586,20 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     async def chat_completions(request: Request):
         try:
             body = await request.json()
+        except ClientDisconnect:
+            # Q26: the client left before the body was complete. Starlette
+            # raises ClientDisconnect from request.json(); before this
+            # handler it reached the except below and was answered 400
+            # invalid_body. Answer 499 client_gone and write the line here:
+            # nothing is queued, so the line's slot stays null.
+            record = RequestRecord.from_request(request, "/v1/chat/completions", None)
+            response = _openai_error_response(_RouteDecision(
+                status=499, code="client_gone",
+                message="client disconnected before the request body was complete",
+            ))
+            response.headers["x-request-id"] = record.id
+            record.finish(499, "client_gone")
+            return response
         except Exception:
             body = None
         record = RequestRecord.from_request(request, "/v1/chat/completions", body)
@@ -1528,7 +1612,8 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             return response
 
         decision = await _route_and_wait(
-            server, body, backend_path="v1/chat/completions", record=record
+            server, body, backend_path="v1/chat/completions", record=record,
+            request=request,
         )
         if decision.response is not None:
             response = decision.response
@@ -1561,6 +1646,18 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         """
         try:
             body = await request.json()
+        except ClientDisconnect:
+            # Q26: the client left before the body was complete (same
+            # handler as /v1/chat/completions, the Anthropic shape): 499
+            # client_gone and the line here, nothing queued.
+            record = RequestRecord.from_request(request, "/v1/messages", None)
+            response = _anthropic_error_response(_RouteDecision(
+                status=499, code="client_gone",
+                message="client disconnected before the request body was complete",
+            ))
+            response.headers["x-request-id"] = record.id
+            record.finish(499, "client_gone")
+            return response
         except Exception:
             body = None
         record = RequestRecord.from_request(request, "/v1/messages", body)
@@ -1574,7 +1671,7 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
             return response
 
         decision = await _route_and_wait(server, body, backend_path="v1/messages",
-                                         record=record)
+                                         record=record, request=request)
         if decision.response is not None:
             response = decision.response
             response.headers["x-request-id"] = record.id

@@ -251,6 +251,7 @@ async def test_probe_raising_inside_ready_for_releases_lock(server, probes):
     ("queue_error", 503, "queue_error"),
     ("slot_unavailable", 503, "slot_unavailable"),
     ("model_not_loaded", 409, "model_not_loaded"),
+    ("client_gone", 499, "client_gone"),     # phase 5 Task 6 (Q26)
 ])
 def test_item_error_codes_map_to_statuses(code, status, decision_code):
     decide = app_mod._decision_from_item_error

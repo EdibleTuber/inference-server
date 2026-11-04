@@ -75,7 +75,7 @@ Each item names the task whose tests pin it:
 - **`/status` per slot gains `last_swap`:** `null`, or `{"id", "model", "trial", "outcome", "message", "at_utc"}` for the last swap item the consumer finished. `id` is the swap's `X-Request-Id`. `onboard` sends its own id and polls for it (Task 4).
 - **`/status` gains `supervisor` per slot** (Task 5): `{"restart_enabled", "restarts", "restarts_suppressed", "consecutive_failures"}`. `restarts` counts real restarts only; `restarts_suppressed` counts the ones observe-only mode skipped.
 - **`/status` and routing no longer probe directly.** They ask the consumer (`SlotState.refresh`), wait at most 5 s, and report what the slot knows. A slot that is `serving` or `swapping` is not probed, and the call returns at once.
-- **Q26 uses Starlette's `Request.is_disconnected()`**, called by the consumer when it dequeues an item. A gone client's item is answered (event set) without a backend call, and its line has status 499 and outcome `client_gone`. Whether `is_disconnected()` is reliable for a body already read is **unverified**; Task 6 measures it with a real uvicorn server before relying on it.
+- **Q26 uses Starlette's `Request.is_disconnected()`**, called by the consumer when it dequeues an item. A gone client's item is answered (event set) without a backend call, and its line has status 499 and outcome `client_gone`. Measured on 2026-11-04: one check is not reliable for a large body on the production stack; a second check one loop tick later is. Task 6 has the details.
 
 ---
 
@@ -230,3 +230,46 @@ Added while writing Task 5's tests (2026-11-03):
 ### Task 6: Skip a request whose client has gone (Q26)
 
 **Interfaces:** a request item carries `"request": starlette.requests.Request`. At dequeue the consumer awaits `request.is_disconnected()`; if true, the item is answered without a backend call (event set; the endpoint finishes the line with 499 `client_gone`), and the slot never leaves `idle`. Step 1 of this task is a measurement: a real uvicorn server, a client that sends a body and disconnects while queued, and a check that `is_disconnected()` turns true. If it doesn't, the task stops and Claude redesigns it.
+
+**Step 1, done by Claude (2026-11-04).** The scratch app ran on uvicorn 0.42.0, Starlette 1.0.0 and httptools 0.7.1, on port 18991. Its endpoint reads the body and waits on a queue, and a separate consumer task calls `is_disconnected()` 0.3–1 s after the client closes.
+- **Production stack:** the unit passes no `--http`, so uvicorn chooses httptools. With a 1 KB body, the first check sees the disconnect. With a 2 MB body, the first check said "connected" 17 times in 20, and a second check after one `await asyncio.sleep(0)` was right 20 times in 20.
+- **Other stacks:** h11 saw it on the first check. A client still connected never read as gone on any stack.
+- **Why:** httptools stops reading the socket once more than 64 KiB of body is buffered (`uvicorn/protocols/http/httptools_impl.py:309-310`). Only `receive()` resumes reading (`:569`), so the client's close is not read and `connection_lost` (`:121-123`) never marks the request disconnected. `Request.is_disconnected()` (`starlette/requests.py:317-329`) calls `receive()` once under a cancel scope that is already cancelled. That resumes reading but returns before the event loop can read the close, so the disconnect shows on the next loop iteration.
+- So: **check, yield one loop tick, check again.**
+
+Added while writing Task 6's tests (2026-11-04):
+- **`_client_is_gone(slot_name: str, request) -> bool`** (`manager/app.py`):
+  - Returns True if `await request.is_disconnected()` is true; otherwise awaits `asyncio.sleep(0)` and returns the second check.
+  - Never raises. If the check raises, it logs one WARNING on `manager.app` naming the slot and returns False (connected), so the item is served as before.
+  - It must not wait for a disconnect: a connected client is served at once.
+- **The check in `_process_request_item`:**
+  - It is the first thing inside the outer `try`. That puts it after the `record.slot` and `record.dequeued_at` stamps, so the line has `queue_wait_ms`.
+  - It comes before the `failed` branch, `ready_for`, `begin_request` and any backend call. A gone client on a failed slot gets `client_gone`: nobody is there to read `slot_failed`, and the line should say why the request was not served.
+  - A gone client's item gets `item["error"]` (a message naming the slot) and `item["error_code"] = "client_gone"`, its event is set, and it returns. The slot's state, `in_flight` and `last_error` are untouched.
+  - An item with no `"request"` key is served exactly as before. Read it with `item.get("request")`.
+  - Stream and non-stream requests are checked the same way.
+  - **Swap items are never checked.** `/swap` has already answered 202 (`app.py`, the swap endpoint), and once a response is complete, uvicorn's `receive()` reports a disconnect (`httptools_impl.py:573`). So a swap item carrying its Request would always read as gone, and every queued swap would be skipped.
+- **Wiring:**
+  - `_route_and_wait` gains `request: Request | None = None` and sets `item["request"]` when it is given.
+  - `/v1/chat/completions` and `/v1/messages` pass their `request`.
+  - `count_tokens` and `/swap` do not queue requests and are unchanged.
+- **The 499:**
+  - `_decision_from_item_error` maps `client_gone` to status 499, code `client_gone`. Without that mapping it falls through to 503 `queue_error`.
+  - `_openai_error_response` renders `{"error": {"type": "client_gone", "message": ...}}`.
+  - `_anthropic_error_response`'s `type_by_code` gains `"client_gone": "client_gone"`. Anthropic has no equivalent error type, so it keeps the manager's code, as `model_not_loaded` already does. Without the key, the lookup raises `KeyError`: a 500 and no line.
+  - No `Retry-After`, because that header is only for 503.
+  - The endpoint writes the line, as it does for every other item error: one line, status 499, outcome `client_gone`, `slot` set, `queue_wait_ms` an int, `backend_ms` null. The endpoint is not cancelled when its client goes (measured), so it always gets there.
+- **A client gone mid-body:**
+  - In those two endpoints, `except ClientDisconnect` (from `starlette.requests`) comes before the existing `except Exception` around `await request.json()`.
+  - It answers 499 `client_gone` in the endpoint's error shape and writes the line with `record.finish(499, "client_gone")`. Nothing is queued, so the line's `slot` is null.
+  - Until now that disconnect reached `except Exception` and was answered 400 `invalid_body`.
+- **Accepted:** a client that leaves after the check is served in full. The check is best effort at dequeue, and the window is one consumer step. A stream whose client leaves mid-relay is still handled by Task 3's closer, with outcome `client_disconnected`. That is a different case and a different name; keep the two apart.
+
+**Files:** `manager/app.py`. In `README.md`, add one sentence after the paragraph about the `manager.requests` line ("View logs"): a request whose client disconnected before it was served is not run, and its line has status 499 and outcome `client_gone`.
+
+**Tests (Claude's commit):**
+- `tests/test_client_gone.py`: hermetic consumer tests with fake Requests (gone, connected, gone after a loop tick, raising), and endpoint tests driven as ASGI with a `receive()` that reports the disconnect.
+- `tests/test_client_gone_real.py`: real uvicorn with httptools and the real app on ephemeral ports. Four clients with a 1 MB body and one with a small body close while queued behind a held request. All five must be answered 499 `client_gone`, and the fake backend must see only the held request. Against a single-check version of the reference, this test failed 5 times in 5.
+- A `client_gone` row in `tests/test_consumer.py::test_item_error_codes_map_to_statuses`.
+
+Run `PYTHONPATH=. /opt/llama/manager/venv/bin/python -m pytest tests/test_client_gone.py tests/test_client_gone_real.py tests/test_consumer.py -q -p no:cacheprovider` (expected: all pass), then the full suite twice.

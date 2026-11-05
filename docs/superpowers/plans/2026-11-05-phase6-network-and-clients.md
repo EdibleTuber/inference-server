@@ -6,8 +6,8 @@
 
 **Architecture:**
 - **agent_core first** (Tasks 1–3, released as v1.13.0). It is what PAL and PARE run, so the manager can only require a token once agent_core sends one.
-- **Then the manager** (Tasks 4–5): the token check, then several bound addresses in one process.
-- **Then the clients and the cutover** (Tasks 6–7), in the order Q16 fixes: listen three ways, move the clients one at a time, confirm from the access log, drop the LAN.
+- **Then the manager** (Tasks 4–6): the token check, several bound addresses in one process, and a `/status` that only reads.
+- **Then the clients and the cutover** (Tasks 7–8), in the order Q16 fixes: listen three ways, move the clients one at a time, confirm from the access log, drop the LAN.
 
 **Tech Stack:** Python 3.12.3. Manager: FastAPI 0.135.2, uvicorn 0.42.0 (httptools). agent_core 1.12.1 → 1.13.0, httpx. PAL runs agent_core 1.6.2 today, and its pyproject pins `v1.4.0`.
 
@@ -35,8 +35,8 @@ What changed from phase 5 (heaviest):
 - **Code in the plan:** interfaces, values and invariants only. Most of this phase is wiring.
 - **Tests:** Claude writes them first, checks each one fails against the pre-task code, and checks they pass against a scratch reference.
 - **Review:** an ordinary diff review per task. Task 4 (the token check) is the security boundary, so it also gets an adversarial pass over request shapes walked through the middleware.
-- **Mutation runs:** Tasks 1, 3, 4 and 5. Task 2 is constructor wiring, Task 6 deletes code, and Task 7 is operations.
-- **Releases and deploys** happen outside Qwen's sessions: the agent_core tag, PAL's and PARE's reinstall, and every step of Task 7.
+- **Mutation runs:** Tasks 1, 3, 4, 5 and 6. Task 2 is constructor wiring, Task 7 deletes code, and Task 8 is operations.
+- **Releases and deploys** happen outside Qwen's sessions: the agent_core tag, PAL's and PARE's reinstall, and every step of Task 8.
 
 ## Implementer Rules (Qwen)
 
@@ -50,7 +50,7 @@ What changed from phase 5 (heaviest):
 ## Review Focus
 
 1. **The exemption is exactly `/health`.** `/health/`, `/HEALTH`, `//health` and `/healthz` all need the token, and so does every other path, including 404s. → Task 4, `test_only_the_exact_health_path_is_exempt`.
-2. **A client without the token, once the manager requires one.** agent_core's `trigger_reindex` and `get_reindex_*` turn any non-2xx into a logged `None` (`agent_core/retrieval.py:75-119`), so a missing token would quietly stop vault reindexing rather than fail. → Task 2, `test_every_retrieval_call_sends_the_token`, plus the Task 7 order: the clients get the token before the manager requires it.
+2. **A client without the token, once the manager requires one.** agent_core's `trigger_reindex` and `get_reindex_*` turn any non-2xx into a logged `None` (`agent_core/retrieval.py:75-119`), so a missing token would quietly stop vault reindexing rather than fail. → Task 2, `test_every_retrieval_call_sends_the_token`, plus the Task 8 order: the clients get the token before the manager requires it.
 3. **Tailscale not up yet when the manager starts.** Binding an address the host doesn't have fails with `EADDRNOTAVAIL`, which would stop the manager starting, LAN and localhost included. Measured 2026-11-05: binding `100.64.0.99` fails with errno 99, and succeeds with `IP_FREEBIND`. → Task 5, `test_an_address_the_host_does_not_have_yet_still_binds`.
 4. **A token read from an env file with stray whitespace** (`MANAGER_TOKEN=abc ` or an empty value) must not quietly become a different token, or no token. → Task 4, `test_an_empty_or_whitespace_token_refuses_to_start`.
 5. **A `/model` swap that falls back.** The slot ends healthy on the old model, so `/model` has to report the fallback rather than a success. → Task 3, `test_a_swap_that_fell_back_is_reported_as_a_failure`.
@@ -203,11 +203,37 @@ What changed from phase 5 (heaviest):
 
 **Mutants:** drop `IP_FREEBIND`; bind only the first host; allow a wildcard alongside other hosts; the scripts take the first host rather than the loopback one.
 
+### Task 6: `/status` only reads (design feedback, 2026-11-05)
+
+**Why:** `GET /status` asks every idle, unhealthy or failed slot's consumer to probe before it answers (`manager/app.py:1536`, `reprobe_all_slots_concurrently`). Every probe the consumer runs is judged for the supervisor (`_serve_probe_requests` → `_apply_supervision`). So reading `/status` has side effects:
+- a client polling it moves supervisor restarts earlier (phase 5's branch review, finding 4);
+- each poll puts load on the backends;
+- Task 3's `/model` polls `/status` every 2 s during a swap, which would probe the *other* slot every 2 s.
+
+The reason for the probe (`app.py:1528-1535`) was that a backend ready after startup showed as down for the life of the process. Since phase 5, the supervisor probes every idle, unhealthy or failed slot every `SUPERVISOR_PROBE_INTERVAL` seconds, so that case is covered without it.
+
+**Files:** `manager/app.py` (the `/status` handler, and `ServerState.reprobe_all_slots_concurrently` if nothing else calls it), `manager/slots.py`, `README.md` (the `/status` row, and the supervisor paragraph's "whoever asked for it" sentence). Test: `tests/test_status_read_only.py` (new). Existing tests that pin the probe-on-read are rewritten in Claude's commit, which names each one.
+
+**Interfaces:**
+- `SlotState.last_probe_at: float | None`, in `time.monotonic()`. Stamped by `SlotState.probe` when its backend call returns or fails, on every path, whoever asked. None until the first probe.
+- `/status` gains one key per slot, `last_probe_age_seconds`: the age of `last_probe_at`, rounded to 1 decimal like the other ages, or null. Every other key is unchanged.
+- `GET /status` asks for no probe and waits for nothing.
+- Unchanged: the routing path's `refresh` (an unhealthy slot with the requested model), the chat 409 path's `reprobe_all_slots`, and the startup refresh.
+
+**Tests (Claude):**
+- `test_status_asks_for_no_probe[idle|unhealthy|failed]`.
+- `test_polling_status_does_not_move_the_supervisor_count`.
+- `test_status_reports_the_age_of_the_last_probe`: null before any probe, then a number.
+- `test_every_probe_path_stamps_the_probe_time[healthy|loading|failed|raised]`.
+- `test_a_backend_that_comes_up_later_is_seen_by_the_supervisor`: the case the probe-on-read existed for, now covered by the ticker.
+
+**Mutants:** keep the probe for unhealthy slots only; stamp only healthy probes; stamp before the call.
+
 ---
 
 ## PAL and PARE (branch `phase6/agent-core-1.13` in PAL; PARE needs only its pin)
 
-### Task 6: PAL moves to agent_core 1.13 (Q18)
+### Task 7: PAL moves to agent_core 1.13 (Q18)
 
 **Files:**
 - Delete PAL's own `/model`: the `Model` command in `pal/commands/domain.py`, and `_get_manager_status`, `_model_status_text`, `_dispatch_model_command` and `_request_model_swap` in `pal/agent.py`, with their tests in `tests/test_model_command.py`. agent_core's builtin `/model` takes over.
@@ -220,13 +246,13 @@ What changed from phase 5 (heaviest):
 - `test_every_pal_inference_client_gets_the_token`.
 - Expected suite result: the baseline above, minus the deleted tests, plus these.
 
-**PARE:** pin bump to `v1.13.0` only. PARE sets no inference URL in its unit (it uses the default), so 1.13's localhost default moves it. That is the "new PARE inference-URL env" of Q16, confirmed as `PARE_INFERENCE_URL` (`pare/config.py:51-53`, `agent_name="pare"`). The pin bump is part of Task 7.
+**PARE:** pin bump to `v1.13.0` only. PARE sets no inference URL in its unit (it uses the default), so 1.13's localhost default moves it. That is the "new PARE inference-URL env" of Q16, confirmed as `PARE_INFERENCE_URL` (`pare/config.py:51-53`, `agent_name="pare"`). The pin bump is part of Task 8.
 
-### Task 7: Cutover (owner; Claude gives each command and checks each result)
+### Task 8: Cutover (owner; Claude gives each command and checks each result)
 
 Each step is checked before the next one:
 
-1. **Three-way listen, no token yet.** Deploy the manager (Tasks 4–5): `sudo ./scripts/deploy-manager.sh` from the merged main, plus the unit install and `daemon-reload` that deploy doesn't do. Add `LISTEN_HOSTS=127.0.0.1,192.168.1.14,100.82.222.92` to `/etc/llama/manager.env`. **Check:** `ss -ltn` shows all three `:11434`.
+1. **Three-way listen, no token yet.** Deploy the manager (Tasks 4–6): `sudo ./scripts/deploy-manager.sh` from the merged main, plus the unit install and `daemon-reload` that deploy doesn't do. Add `LISTEN_HOSTS=127.0.0.1,192.168.1.14,100.82.222.92` to `/etc/llama/manager.env`. **Check:** `ss -ltn` shows all three `:11434`.
 2. **agent_core v1.13.0 into PAL and PARE.** Reinstall each venv from its pin, restart `pal-daemon` and `pare-daemon`, and change `PAL_INFERENCE_URL` to `http://127.0.0.1:11434` (or remove it). opencode: `baseURL` to `http://127.0.0.1:11434/v1`. **Check:** each client's next request shows client `127.0.0.1` in the manager's access log.
 3. **The token.**
    - Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`, never in shell history or argv: write it straight into the files.
@@ -242,4 +268,9 @@ Each step is checked before the next one:
 - **Phase 7, named server setups.** One request switches the whole server between named setups, such as "agents" (Gemma 4 on `egpu`) and "coding" (Qwen 3.6 on `egpu`). The setups would be a file in the repo next to the profiles, and the request would queue one swap per slot through phase 5's queue. The agents show what's loaded and an operator can ask for a switch; the agents never switch on their own. Open questions for its design:
   - which slot each agent uses in each setup;
   - how an agent learns the model its setup gives it, instead of a fixed `PAL_MODEL`.
+- **Phase 7 must also decide** (from Claude's design feedback, 2026-11-05):
+  - **Who owns a slot.** Profiles pin each model to one slot, clients name models, and swaps are server-wide. A setup should say which agent uses which slot, not just which model each slot holds.
+  - **What a client sees during a switch.** Today a request for the outgoing model gets 503 `slot_unavailable`, and one for the incoming model gets 409. agent_core's 503 retry (5 tries at `Retry-After: 5`) gives up long before a cold swap ends.
+- **Before phase 7: move the consumer out of `app.py`.** `app.py` is 1921 lines, and `_process_request_item` alone is 238. Most phase 5 findings were in or next to it.
+- **For the agent audits: retrieval shares the manager's process.** The `/collections` routes, the vector DB and embeddings run with inference, so a manager restart takes PAL's memory down too, and one token guards both.
 - **Code audits of PAL, PARE and agent_core**, after the inference-server audit (this design review) is finished. The Qwen models' thinking handling inside the agents is one known item; it's why Gemma 4 currently does better there.

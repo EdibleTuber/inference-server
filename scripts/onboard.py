@@ -22,8 +22,8 @@ polling.
 Exit codes:
   0  verified: the repo profile carries the [slots.<s>.verified] block;
      commit it and deploy
-  1  the trial, the verification chat, or the swap back failed; nothing
-     was written
+  1  the trial, the verification chat, or the swap back failed, or the
+     manager answered 401 (export MANAGER_TOKEN); nothing was written
   2  the repo profile is missing or invalid, the manager has no such slot,
      or the profile has no section for the slot
   3  the target slot is already verified (delete [slots.<s>.verified] to
@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -54,6 +55,10 @@ import httpx
 
 from manager.names import same_model
 from manager.profiles import ProfileError, load_profile
+
+class _TokenRequired(Exception):
+    """The manager answered 401: it requires a token this run did not send."""
+
 
 MANAGER_ENV = "/etc/llama/manager.env"
 DEPLOYED_PROFILES = "/etc/llama/models.d"
@@ -302,9 +307,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             text = ""
         manager_url = manager_url_from_env(text)
 
+    # The token comes from the environment, never an argument (a command
+    # line is visible in ps). Set, every call carries it as a Bearer header;
+    # unset, no header at all.
+    token = os.environ.get("MANAGER_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+
+    # A 401 must be one line, not a traceback: the first /status call would
+    # otherwise raise KeyError on a body with no "slots".
+    def refuse_401(response: httpx.Response) -> None:
+        if response.status_code == 401:
+            raise _TokenRequired()
+
     # A cold load and the first chat can take minutes, so per-request timeouts
     # are generous; the swap deadline is enforced by the poll loop, not by them.
-    client = httpx.Client(base_url=manager_url, timeout=600.0)
+    client = httpx.Client(base_url=manager_url, timeout=600.0, headers=headers,
+                          event_hooks={"response": [refuse_401]})
     try:
         return onboard(
             args.model, args.slot,
@@ -315,6 +333,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             llama_version=_llama_version,
             today=date.today().isoformat,
         )
+    except _TokenRequired:
+        print("the manager answered 401: it requires a token — export "
+              "MANAGER_TOKEN (the manager's MANAGER_TOKEN) and retry")
+        return 1
     except httpx.HTTPError as exc:
         print(f"cannot talk to the manager at {manager_url}: {exc}")
         return 1

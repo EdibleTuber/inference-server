@@ -26,6 +26,10 @@ Group=_llama-mgr
 
 # Load manager configuration
 EnvironmentFile=/etc/llama/manager.env
+# The bearer token, when the manager requires one (phase 6, Q15), in its own
+# file: manager.env is 0644, this one is 0640 root:_llama-mgr. Optional: no
+# file means no token and no check.
+EnvironmentFile=-/etc/llama/manager-token.env
 
 # WorkingDirectory is /opt/llama so Python can import the 'manager' package.
 # The package lives at /opt/llama/manager/ (with __init__.py).

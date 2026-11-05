@@ -9,7 +9,8 @@ need to deal with raw env vars or string parsing.
 """
 import math
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 from manager.slot_config import SlotConfig, build_slots
 
@@ -69,6 +70,24 @@ def _bool01_env(key: str, default: bool) -> bool:
     return raw == "1"
 
 
+def validate_manager_token(value: str | None) -> str | None:
+    """Validate MANAGER_TOKEN (phase 6, Q15).
+
+    None (unset) means no token and no check. An empty value, or one that
+    carries any whitespace, is refused: a stray space in an env file must
+    never quietly become a different token, or no token. The error goes to
+    the journal, so it names the key and never the value.
+    """
+    if value is None:
+        return None
+    if not value or re.search(r"\s", value):
+        raise ValueError(
+            "Configuration error: MANAGER_TOKEN is empty or contains "
+            "whitespace; it must be a single unbroken string"
+        )
+    return value
+
+
 @dataclass
 class ManagerConfig:
     """Typed configuration for the model manager service.
@@ -105,6 +124,9 @@ class ManagerConfig:
         supervisor_restart: Whether a due restart actually restarts the slot's
             unit (env value exactly 0 or 1). Off by default: a due restart is
             logged as "would restart" and counted in /status.
+        manager_token: Bearer token every client must send (phase 6, Q15).
+            None (unset) means no check at all. Excluded from repr: the token
+            must never appear in logs, argv or error messages.
     """
     host: str
     port: int
@@ -129,6 +151,7 @@ class ManagerConfig:
     supervisor_backoff: float = 30.0
     supervisor_backoff_max: float = 600.0
     supervisor_restart: bool = False
+    manager_token: str | None = field(default=None, repr=False)
 
     @property
     def llama_server_url(self) -> str:
@@ -187,4 +210,5 @@ class ManagerConfig:
             supervisor_backoff=backoff,
             supervisor_backoff_max=backoff_max,
             supervisor_restart=_bool01_env("SUPERVISOR_RESTART", False),
+            manager_token=validate_manager_token(os.getenv("MANAGER_TOKEN")),
         )

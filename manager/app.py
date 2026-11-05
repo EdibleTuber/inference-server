@@ -20,6 +20,7 @@ Endpoints:
     GET  /collections/{collection_id}/reindex/{job_id}      - Specific reindex job state
 """
 import asyncio
+import hmac
 import logging
 import sys
 import time
@@ -35,7 +36,7 @@ from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from manager import retrieval
-from manager.config import ManagerConfig
+from manager.config import ManagerConfig, validate_manager_token
 from manager.request_log import (
     RequestRecord,
     StreamTokens,
@@ -1410,6 +1411,72 @@ class JsonOnlyMiddleware:
         )(scope, receive, send)
 
 
+class TokenMiddleware:
+    """Gate: when a token is set, refuse every request that does not carry
+    it (phase 6, Q15).
+
+    Deliberately plain ASGI, like JsonOnlyMiddleware: no wrapped receive,
+    no re-streamed responses. Registered outermost, so a 401 comes before
+    the JSON gate's 415.
+
+    With the token set, the exemption is exactly the path ``/health``
+    (checked against the raw scope path, whatever the method): ``/health/``,
+    ``//health`` and ``/healthz`` all need the token, and so does every
+    other path, including 404s. Everything else needs
+    ``Authorization: Bearer <token>`` (the scheme in any case) or
+    ``x-api-key: <token>`` (the header Anthropic clients send to
+    /v1/messages), compared with hmac.compare_digest on bytes. A refusal is
+    401 with ``WWW-Authenticate: Bearer`` and no manager.requests line --
+    the client address uvicorn records is what the operator reads -- and
+    the answer never echoes what the client sent. The body takes the
+    Anthropic shape on the /v1/messages paths and the manager's everywhere
+    else. With the token unset, nothing is checked.
+    """
+
+    def __init__(self, app, token: str | None):
+        self.app = app
+        self.token = token.encode() if token is not None else None
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or self.token is None
+            or scope["path"] == "/health"
+        ):
+            await self.app(scope, receive, send)
+            return
+        if self._authorized(scope["headers"]):
+            await self.app(scope, receive, send)
+            return
+        await self._unauthorized(scope["path"])(scope, receive, send)
+
+    def _authorized(self, headers) -> bool:
+        def value(name: bytes) -> bytes | None:
+            return next((v for k, v in headers if k == name), None)
+
+        auth = value(b"authorization")
+        if auth is not None:
+            scheme, sep, credentials = auth.partition(b" ")
+            if sep and scheme.lower() == b"bearer":
+                return hmac.compare_digest(credentials, self.token)
+        api_key = value(b"x-api-key")
+        if api_key is not None:
+            return hmac.compare_digest(api_key, self.token)
+        return False
+
+    def _unauthorized(self, path: str) -> JSONResponse:
+        message = ("authentication required: present the token as "
+                   "'Authorization: Bearer <token>' or 'x-api-key: <token>'")
+        if path.startswith("/v1/messages"):
+            body = {"type": "error",
+                    "error": {"type": "authentication_error", "message": message}}
+        else:
+            body = {"error": {"type": "unauthorized", "message": message}}
+        return JSONResponse(
+            body, status_code=401, headers={"WWW-Authenticate": "Bearer"}
+        )
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -1425,6 +1492,12 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     """
     if config is None:
         config = ManagerConfig.from_env()
+
+    # Refuse an empty or whitespace token here, at construction, not in the
+    # middleware's __init__: Starlette builds the middleware stack lazily on
+    # the first request, and an empty token built directly would make an
+    # empty x-api-key match it. from_env runs the same check.
+    validate_manager_token(config.manager_token)
 
     _setup_logging(config)
 
@@ -1510,6 +1583,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     app.state.server = server
     # Q8 (X1): refuse every POST whose Content-Type is not application/json.
     app.add_middleware(JsonOnlyMiddleware)
+    # Phase 6 (Q15): outermost, so a 401 comes before the 415. add_middleware
+    # inserts at the front, so the last one added wraps all the rest.
+    app.add_middleware(TokenMiddleware, token=config.manager_token)
 
     # ------------------------------------------------------------------
     # GET /health
@@ -1775,7 +1851,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         and the section must be verified unless trial is true: trial is how
         scripts/onboard.py verifies a pair, and it reloads even a model
         that is already loaded, because a trial that skips the load would
-        verify nothing. No auth; LAN-only is the trust boundary.
+        verify nothing. With MANAGER_TOKEN set, the bearer token is the
+        trust boundary (phase 6, Q15): every path except exactly /health
+        must present it; the binding addresses add the network boundary.
 
         The swap is a FIFO item in the target slot's queue (phase 5, Q12):
         the slot's consumer runs it after whatever is ahead of it. 200 is
@@ -1843,9 +1921,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         target = body.get("target")
         if target is None:
             # Untargeted: the profile's home slot decides, never "the first
-            # slot". agent_core clients send exactly this after a
-            # model_not_loaded 409; guessing a slot here is what used to
-            # evict main.
+            # slot". A client that wants the home slot sends the swap
+            # without a target (agent_core's /model does); guessing a slot
+            # here is what used to evict main.
             target = profile.home
         if not isinstance(target, str) or target not in server.slots:
             return refuse(400, "invalid_target", f"'target' must be one of: {valid}",

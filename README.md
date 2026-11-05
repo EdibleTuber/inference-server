@@ -444,6 +444,16 @@ Configuration for the model manager proxy service. The **Default** column is wha
 | `SLOTS` | `main` | Comma-separated slot names the manager fronts, in routing-priority order (template: `main,egpu`). Every name listed needs a running backend, or that slot reports permanently unhealthy. |
 | `SLOT_<NAME>_HOST` / `_PORT` / `_ENV` / `_UNIT` / `_QUEUE_LIMIT` / `_DEVICE` | `127.0.0.1` / _(required)_ / `/etc/llama/llama-server-<name>.env` / `llama-server-<name>.service` / `20` / _(unset)_ | Per-slot configuration, read by `manager/slot_config.py`. For `main` a `SLOT_*` variable overrides the legacy `LLAMA_SERVER_*` name; any other slot (e.g. `egpu`) must set at least `SLOT_<NAME>_PORT` or the manager refuses to start. The template sets `SLOT_EGPU_PORT=8084`. `SLOT_EGPU_DEVICE` mirrors the P40's UUID from `CUDA_VISIBLE_DEVICES` in `llama-server-egpu.env`; `_DEVICE` is not yet read by any code. |
 
+### `/etc/llama/manager-token.env` (optional bearer token)
+
+When the manager should require a token from clients, set `MANAGER_TOKEN` in its own file, `/etc/llama/manager-token.env`, mode `0640` owned by `root:_llama-mgr` — not in `manager.env`, which is `0644`. The unit loads it as an optional second `EnvironmentFile` (`-/etc/llama/manager-token.env`): no file means no token and no check. An empty value, or one containing any whitespace, refuses to start (the error goes to the journal without the value), so a stray space in the file can never quietly become a different token, or no token.
+
+When a token is set:
+
+- Every request sends it as `Authorization: Bearer <token>` (the scheme is matched in any case) or, for the Anthropic clients that send one, as `x-api-key: <token>`. The comparison is constant-time.
+- The exemption is exactly the path `/health`, whatever the method: `/health/`, `/HEALTH`, `//health` and `/healthz` all need the token, and so does every other path, including 404s.
+- A refused request gets 401 with `WWW-Authenticate: Bearer`: the Anthropic error shape (`authentication_error`) on the `/v1/messages` paths, the manager's `unauthorized` shape everywhere else. A 401 writes no `manager.requests` line — the client address uvicorn records is what an operator reads.
+
 ---
 
 ## API Endpoints

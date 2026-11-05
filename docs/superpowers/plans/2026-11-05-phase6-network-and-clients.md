@@ -158,19 +158,23 @@ What changed from phase 5 (heaviest):
 **Interfaces:**
 - `ManagerConfig.manager_token: str | None = field(default=None, repr=False)`, from `MANAGER_TOKEN`.
   - Unset: None, and no check at all.
-  - Set but empty, or containing any whitespace: `ValueError` naming `MANAGER_TOKEN`, so the manager refuses to start.
+  - Set but empty, or containing any whitespace: `ValueError` naming `MANAGER_TOKEN`, so the manager refuses to start. The message never contains the value: it goes to the journal.
+  - `create_app` makes the same check on `config.manager_token` itself, at construction, not in the middleware's `__init__` (Starlette builds the middleware stack lazily, on the first request). A config built directly with `manager_token=""` would otherwise make an empty `x-api-key` match.
 - `class TokenMiddleware` is pure ASGI, like `JsonOnlyMiddleware`, and outermost, so a 401 comes before a 415.
   - It checks HTTP scopes only, and only when the token is set.
   - `scope["path"] == "/health"` passes, whatever the method.
   - Every other request needs `Authorization: Bearer <token>` (the scheme matched case-insensitively) or `x-api-key: <token>`, compared with `hmac.compare_digest` on bytes.
   - Otherwise it answers 401 with `WWW-Authenticate: Bearer`. The body is `{"type": "error", "error": {"type": "authentication_error", "message": ...}}` for paths starting `/v1/messages`, and `{"error": {"type": "unauthorized", "message": ...}}` for everything else.
   - The message never echoes what the client sent.
-- **`onboard.py`** sends `Authorization: Bearer $MANAGER_TOKEN` when that variable is set in its environment. On a 401 it exits 1 with one line saying to export `MANAGER_TOKEN`. Never take the token as an argument (argv is visible in `ps`).
-- **`deploy-manager.sh`** runs as root. It reads `MANAGER_TOKEN` from `/etc/llama/manager-token.env` (overridable as `DEPLOY_MGR_TOKEN_ENV` for tests) and sends the header on its `/status` call. Its `/health` call is unchanged.
+- **`onboard.py`** sends `Authorization: Bearer $MANAGER_TOKEN` when that variable is set in its environment, as a default header on the `httpx.Client` that `main` builds. A 401 on any call exits 1 with one line saying to export `MANAGER_TOKEN`, and no traceback: today `onboard()`'s first call does `client.get("/status").json()["slots"]`, which would raise `KeyError` on a 401 body, so `main` has to catch the 401 itself (an httpx response event hook is one way). Never take the token as an argument (argv is visible in `ps`).
+- **`deploy-manager.sh`** runs as root. It reads `MANAGER_TOKEN` from `/etc/llama/manager-token.env` (overridable as `DEPLOY_MGR_TOKEN_ENV` for tests) with `sed`, like its other settings, never `source`. It sends the header on its `/status` call. Its `/health` call is unchanged.
+  - **The token never goes on curl's command line** (root's argv is readable by every user): pass the header on stdin, `-H @-`, or from a 0600 file, `-H @<file>`.
+  - **New `--verify` mode:** the post-restart check (poll `/health` up to `HEALTH_WAIT`, then print the slot lines from `/status`) moves into a function. The deploy calls it after the restart, and `deploy-manager.sh --verify` runs it alone and exits with its result (0 healthy, 1 not), with no git, drift or root checks. That is what makes the token path testable without root, and it gives the owner a check to run in Task 8.
+  - **Pre-existing bug, fix it here:** the slot dump's Python one-liner (`scripts/deploy-manager.sh:255-259` at `8d75522`) puts `\"` inside f-string braces, which Python 3.12.3 (this host's `python3`) rejects as a SyntaxError. `2>/dev/null || true` hides that, so the slot lines have never printed. Use `%` formatting or `.format()`; `test_deploy_sends_the_token_on_its_status_call` checks that a slot line prints.
 
-**Tests (Claude):**
+**Tests (Claude):** committed in `tests/test_manager_token.py`. The list below is the plan's; the file also has `test_the_401_never_echoes_what_was_sent`, `test_health_is_exempt_whatever_the_method`, `test_the_401_uses_the_manager_shape_elsewhere`, `test_the_lifespan_still_runs_with_a_token`, `test_the_token_is_read_from_manager_token`, `test_create_app_refuses_an_empty_or_whitespace_token_too`, `test_the_unit_loads_the_token_file_optionally_after_manager_env` (exactly `/etc/llama/manager.env` then `-/etc/llama/manager-token.env`), `test_the_manager_env_template_carries_no_token`, `test_onboard_without_the_token_sends_no_header`, `test_onboard_on_a_401_exits_1_saying_to_export_the_token`, `test_onboard_takes_no_token_argument` and `test_deploy_without_a_token_file_sends_no_header`. The exemption test drives the app at the ASGI level with the exact `scope["path"]`, since an HTTP client rewrites `//health` and `/a/../b` before sending.
 - `test_without_a_token_nothing_is_checked`.
-- `test_a_request_without_the_token_gets_401[every route]`: the route list is derived from `app.routes`, not written out, plus an unknown path.
+- `test_a_request_without_the_token_gets_401_on_every_route`: the route list is derived from `app.routes`, not written out, plus an unknown path.
 - `test_the_token_is_accepted_as_bearer_or_x_api_key`.
 - `test_a_wrong_token_gets_401`, including a prefix of the right token, the right token with a trailing space, and `Basic`.
 - `test_only_the_exact_health_path_is_exempt`: `/health` passes; `/health/`, `/HEALTH`, `//health` and `/healthz` get 401.
@@ -179,7 +183,7 @@ What changed from phase 5 (heaviest):
 - `test_an_empty_or_whitespace_token_refuses_to_start`.
 - `test_the_token_is_not_in_the_config_repr_or_any_log_line`.
 - `test_onboard_sends_the_token_from_its_environment`.
-- `test_deploy_sends_the_token_on_its_status_call`.
+- `test_deploy_sends_the_token_on_its_status_call`: through `--verify`, with a fake `curl` on `PATH` that records each call's argv and headers. The token is on the `/status` call, not on `/health`, never in any argv, and a slot line prints.
 
 **Mutants:** `startswith("/health")`; `==` in place of `compare_digest`; check only `/v1/*`; middleware registered inside `JsonOnlyMiddleware`; empty token treated as unset; Bearer matched case-sensitively.
 
@@ -252,6 +256,7 @@ The reason for the probe (`app.py:1528-1535`) was that a backend ready after sta
 **Tests (Claude):**
 - `test_pal_registers_agent_cores_model_command`: the registry's `model` command is agent_core's `Model`.
 - `test_every_pal_inference_client_gets_the_token`.
+- PAL's `tests/test_config.py:14,40,92` pin the old `192.168.1.14` defaults and fail against agent_core 1.13 (measured 2026-11-05: 3 failed, 625 passed, the 5 baseline collection errors). Claude updates them with these tests, comparing against `BaseConfig()` rather than a new literal.
 - Expected suite result: the baseline above, minus the deleted tests, plus these.
 
 **PARE:** pin bump to `v1.13.0` only. PARE sets no inference URL in its unit (it uses the default), so 1.13's localhost default moves it. That is the "new PARE inference-URL env" of Q16, confirmed as `PARE_INFERENCE_URL` (`pare/config.py:51-53`, `agent_name="pare"`). The pin bump is part of Task 8.

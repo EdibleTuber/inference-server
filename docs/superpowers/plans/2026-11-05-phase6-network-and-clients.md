@@ -53,7 +53,7 @@ What changed from phase 5 (heaviest):
 2. **A client without the token, once the manager requires one.** agent_core's `trigger_reindex` and `get_reindex_*` turn any non-2xx into a logged `None` (`agent_core/retrieval.py:75-119`), so a missing token would quietly stop vault reindexing rather than fail. → Task 2, `test_every_retrieval_call_sends_the_token`, plus the Task 7 order: the clients get the token before the manager requires it.
 3. **Tailscale not up yet when the manager starts.** Binding an address the host doesn't have fails with `EADDRNOTAVAIL`, which would stop the manager starting, LAN and localhost included. Measured 2026-11-05: binding `100.64.0.99` fails with errno 99, and succeeds with `IP_FREEBIND`. → Task 5, `test_an_address_the_host_does_not_have_yet_still_binds`.
 4. **A token read from an env file with stray whitespace** (`MANAGER_TOKEN=abc ` or an empty value) must not quietly become a different token, or no token. → Task 4, `test_an_empty_or_whitespace_token_refuses_to_start`.
-5. **A `/model` swap that falls back.** The slot ends healthy on the old model, so the session must not be repointed at a model that isn't loaded. → Task 3, `test_a_swap_that_fell_back_is_reported_and_does_not_repoint`.
+5. **A `/model` swap that falls back.** The slot ends healthy on the old model, so `/model` has to report the fallback rather than a success. → Task 3, `test_a_swap_that_fell_back_is_reported_as_a_failure`.
 
 ## Decisions made while planning (beyond the spec)
 
@@ -63,6 +63,7 @@ What changed from phase 5 (heaviest):
   - Client side: `<PREFIX>MANAGER_TOKEN` (`PAL_MANAGER_TOKEN`, `PARE_MANAGER_TOKEN`), set from a 0600 `EnvironmentFile` in each user unit, never as an inline `Environment=`.
 - **A 401 writes no `manager.requests` line.** uvicorn's access log records it with the client address, which is what Q16 step 3 reads.
 - **Several addresses in one process:** uvicorn's `--host` takes one address. `uvicorn.Server.run(sockets=...)` serves a list (`Server.startup` loops over the sockets; checked in 0.42.0), so a small entry point binds the sockets itself. `IP_FREEBIND` makes the Tailscale address independent of boot order, so there is no `After=` on the tailscale snap unit.
+- **`/model` never repoints the session (owner, 2026-11-05).** A swap changes what a slot holds for every client, but repointing changes one session. The owner's real need is switching the whole server between agent work and coding, and that is a separate design: named server setups, phase 7, below. Until then, each agent sends the model its config names, and `/model` only shows what's loaded and asks for swaps. This drops agent_core's current repoint-after-a-`main`-swap.
 - **The backends are already localhost-only.** From `/etc/llama/manager.env` and `ss -ltn` (2026-11-05): main's llama-server is on `127.0.0.1:8081`, egpu's on `127.0.0.1:8084`, and embeddings on `127.0.0.1:8082`. The `0.0.0.0:8080` listener is SearXNG in Docker (PAL's web search, `PAL/docs/searxng-setup.md`), and `0.0.0.0:2929` is ArcticBase. Neither belongs to this repo, and both are outside this phase.
 ---
 
@@ -114,26 +115,27 @@ What changed from phase 5 (heaviest):
 - **`list` and `default`:** unchanged, apart from the token.
 - **Swap: `/model [--target <slot>] <name>`.**
   - POST `/swap` with `{"model": name}`, plus `"target"` only when given: no target means the profile's home slot. The request carries `X-Request-Id: <uuid4 hex>`. No slot names are checked on the client; the manager's 400 `invalid_target` message names the valid slots and is shown as is.
-  - **200:** already loaded. Repoint the session.
+  - **200:** already loaded; report it.
   - **202:** yield one interim `swapping <slot> -> <name>` message, with `<slot>` from the 202 body. Then poll `GET /status` every 2 s until that slot's `last_swap.id` equals the request id.
-    - Outcome `ok` or `already_loaded`: repoint the session, then report.
-    - `fell_back` or `failed`: report the outcome and `last_swap.message` as an error; don't repoint.
-    - The wait is capped at 1500 s (two `SWAP_TIMEOUT`s of 600 plus restarts). At the cap, report that the swap is still running and that `/model` shows its state; don't repoint.
+    - Outcome `ok` or `already_loaded`: report success.
+    - `fell_back` or `failed`: report the outcome and `last_swap.message` as an error.
+    - The wait is capped at 1500 s (two `SWAP_TIMEOUT`s of 600 plus restarts). At the cap, report that the swap is still running and that `/model` shows its state.
   - **Any other status:** an error with the manager's `error.message`.
-  - **Repointing:** a successful swap repoints the session whatever the target, because the manager routes by model name, not slot.
+  - **The session is never repointed** (see the decision above). Every outcome leaves `default_model` as it was, and the report ends with `session sends: <default_model>`.
 
 **Tests (Claude)** (manager mocked with `httpx.MockTransport`; poll interval and cap patched small):
 - `test_status_lists_every_slot_the_manager_reports`: three slots, `egpu` among them.
 - `test_a_swap_without_target_sends_no_target`.
-- `test_a_202_is_polled_until_its_own_last_swap_and_then_repoints`: an older `last_swap` id is shown first and must be ignored.
-- `test_a_swap_that_fell_back_is_reported_and_does_not_repoint`.
-- `test_a_failed_swap_is_reported_and_does_not_repoint`.
-- `test_a_200_repoints_at_once`.
+- `test_a_202_is_polled_until_its_own_last_swap`: an older `last_swap` id is shown first and must be ignored.
+- `test_a_swap_that_fell_back_is_reported_as_a_failure`.
+- `test_a_failed_swap_is_reported_as_a_failure`.
+- `test_a_200_is_reported_at_once`.
+- `test_no_swap_outcome_repoints_the_session[200|ok|fell_back|failed|cap]`.
 - `test_a_refused_swap_shows_the_managers_message` (400 `invalid_target`).
-- `test_a_swap_still_running_at_the_cap_does_not_repoint`.
+- `test_a_swap_still_running_at_the_cap_says_so`.
 - `test_every_model_call_sends_the_token`.
 
-**Mutants:** match any `last_swap` rather than its own id; repoint on `fell_back`; always send `target`; poll the wrong slot.
+**Mutants:** match any `last_swap` rather than its own id; report `fell_back` as success; repoint on success; always send `target`; poll the wrong slot.
 
 **After Task 3:** the owner tags `v1.13.0` and pushes it. Claude gives the commands; Qwen never tags.
 
@@ -232,3 +234,12 @@ Each step is checked before the next one:
    - Then write `/etc/llama/manager-token.env` (0640 `root:_llama-mgr`) and restart the manager.
    - **Check:** `/status` without the header gets 401, and with it gets 200; one chat each from PAL, PARE and opencode succeeds.
 4. **Confirm nothing uses the LAN.** Watch the access log for a full day of normal use: `journalctl -u llama-manager -o cat | grep -E '^INFO: +192\.168\.1\.'` must be empty after step 2's restarts. Then drop `192.168.1.14` from `LISTEN_HOSTS` and restart. **Check:** `ss -ltn` shows only `127.0.0.1:11434` and `100.82.222.92:11434`.
+
+---
+
+## After this phase (owner, 2026-11-05)
+
+- **Phase 7, named server setups.** One request switches the whole server between named setups, such as "agents" (Gemma 4 on `egpu`) and "coding" (Qwen 3.6 on `egpu`). The setups would be a file in the repo next to the profiles, and the request would queue one swap per slot through phase 5's queue. The agents show what's loaded and an operator can ask for a switch; the agents never switch on their own. Open questions for its design:
+  - which slot each agent uses in each setup;
+  - how an agent learns the model its setup gives it, instead of a fixed `PAL_MODEL`.
+- **Code audits of PAL, PARE and agent_core**, after the inference-server audit (this design review) is finished. The Qwen models' thinking handling inside the agents is one known item; it's why Gemma 4 currently does better there.

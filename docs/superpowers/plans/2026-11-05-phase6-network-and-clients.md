@@ -88,21 +88,25 @@ What changed from phase 5 (heaviest):
 **Files:** `agent_core/config.py`, `agent_core/inference.py`, `agent_core/retrieval.py`, `agent_core/runtime.py`. Test: `tests/test_manager_token.py` (new).
 
 **Interfaces (produces):**
-- `BaseConfig.manager_token: str | None = field(default=None, repr=False)`, read from `<PREFIX>MANAGER_TOKEN`. An empty value means None.
+- `BaseConfig.manager_token: str | None = field(default=None, repr=False)`, read from `<PREFIX>MANAGER_TOKEN`. An empty or whitespace-only value means None. The manager's own `MANAGER_TOKEN` name is not read.
 - `InferenceClient(base_url, model, is_batch=False, token: str | None = None)`, with a public read-only property `token`. When the token is set, every request it sends carries `Authorization: Bearer <token>` (set on its `httpx.AsyncClient`'s default headers).
 - `RetrievalClient(base_url, collection_id, token: str | None = None)`, with the same header on every call.
+- The token goes only to the manager: `WebSearchClient` (SearXNG) and the URL fetcher never send it.
 - `runtime.py` passes `config.manager_token` to both.
 - `BaseConfig.inference_url` and `batch_inference_url` default to `"http://127.0.0.1:11434"`. `searxng_url` is unchanged.
 
-**Tests (Claude):**
+**Tests (Claude):** committed in agent_core `tests/test_manager_token.py`; `tests/test_config.py`'s default-URL assertions now say localhost. The header tests swap a `MockTransport` into every `httpx.AsyncClient` the code builds and check the wire, so they hold whether the header is a client default or set per request.
 - `test_every_inference_call_sends_the_token` (complete, stream).
+- `test_a_503_retry_sends_the_token_again`.
 - `test_every_retrieval_call_sends_the_token`: `search`, `get_document`, `trigger_reindex`, `get_reindex_status` and `get_reindex_job`.
-- `test_no_token_sends_no_authorization_header`.
-- `test_the_token_is_read_from_the_agents_env[pal|pare]`.
-- `test_an_empty_token_env_means_no_token`.
-- `test_the_token_is_not_in_the_config_repr`.
-- `test_the_runtime_passes_the_token_to_both_clients`.
+- `test_no_token_sends_no_authorization_header` (complete, stream, retrieval).
+- `test_the_inference_clients_token_is_readable_and_read_only`.
+- `test_the_token_is_read_from_the_agents_env[pal|pare]`, with the other agent's variable set to a different value.
+- `test_no_token_env_means_no_token`, with the manager's `MANAGER_TOKEN` set.
+- `test_an_empty_token_env_means_no_token` (`""`, spaces, a tab).
+- `test_the_token_is_not_in_the_config_repr` (`BaseConfig` and a subclass).
 - `test_the_default_inference_urls_are_localhost`.
+- `test_the_runtime_passes_the_token_to_both_clients`: six manager calls carry it; the SearXNG call does not.
 
 ### Task 3: `/model` speaks the phase 5 contract (Q18)
 

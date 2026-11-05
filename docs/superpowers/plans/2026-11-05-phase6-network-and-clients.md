@@ -63,8 +63,7 @@ What changed from phase 5 (heaviest):
   - Client side: `<PREFIX>MANAGER_TOKEN` (`PAL_MANAGER_TOKEN`, `PARE_MANAGER_TOKEN`), set from a 0600 `EnvironmentFile` in each user unit, never as an inline `Environment=`.
 - **A 401 writes no `manager.requests` line.** uvicorn's access log records it with the client address, which is what Q16 step 3 reads.
 - **Several addresses in one process:** uvicorn's `--host` takes one address. `uvicorn.Server.run(sockets=...)` serves a list (`Server.startup` loops over the sockets; checked in 0.42.0), so a small entry point binds the sockets itself. `IP_FREEBIND` makes the Tailscale address independent of boot order, so there is no `After=` on the tailscale snap unit.
-- **The main backend.** `llama-server` (main) listens on `0.0.0.0:8080` (`ss -ltn`, 2026-11-05), so the LAN can reach inference without the manager's queue or token. It can't reach the vault documents Q15 protects; only the manager serves those. Q14 names only the manager, so this plan leaves `:8080` alone. **Open for the owner:** add binding it to `127.0.0.1` to Task 7, as egpu (`:8081`) already is?
-
+- **The backends are already localhost-only.** From `/etc/llama/manager.env` and `ss -ltn` (2026-11-05): main's llama-server is on `127.0.0.1:8081`, egpu's on `127.0.0.1:8084`, and embeddings on `127.0.0.1:8082`. The `0.0.0.0:8080` listener is SearXNG in Docker (PAL's web search, `PAL/docs/searxng-setup.md`), and `0.0.0.0:2929` is ArcticBase. Neither belongs to this repo, and both are outside this phase.
 ---
 
 ## agent_core (branch `phase6/manager-contract`)

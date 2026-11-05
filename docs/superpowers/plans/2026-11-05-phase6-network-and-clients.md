@@ -110,7 +110,7 @@ What changed from phase 5 (heaviest):
 
 ### Task 3: `/model` speaks the phase 5 contract (Q18)
 
-**Files:** `agent_core/commands/_builtin_impls.py` (`Model`), and `pyproject.toml` (version `1.13.0`). Test: `tests/test_builtin_commands.py` (the `/model` tests).
+**Files:** `agent_core/commands/_builtin_impls.py` (`Model`), and `pyproject.toml` (version `1.13.0`). Tests: `tests/test_model_command.py` (new); `tests/test_builtin_commands.py` keeps the `list`, `default`, no-`/status` and unreachable-manager tests and loses the three that pinned repointing and main/batch.
 
 **Interfaces (consumes):** `InferenceClient.token` from Task 2. Every manager call here sends it.
 
@@ -120,14 +120,16 @@ What changed from phase 5 (heaviest):
 - **Swap: `/model [--target <slot>] <name>`.**
   - POST `/swap` with `{"model": name}`, plus `"target"` only when given: no target means the profile's home slot. The request carries `X-Request-Id: <uuid4 hex>`. No slot names are checked on the client; the manager's 400 `invalid_target` message names the valid slots and is shown as is.
   - **200:** already loaded; report it.
-  - **202:** yield one interim `swapping <slot> -> <name>` message, with `<slot>` from the 202 body. Then poll `GET /status` every 2 s until that slot's `last_swap.id` equals the request id.
+  - **202:** yield `ToolProgressMessage(tool="model", arguments={"status": "swapping <slot> -> <name>"})`, with `<slot>` from the 202 body. Then poll `GET /status` every `MODEL_SWAP_POLL_SECONDS` (module constant in `_builtin_impls.py`, 2.0, read at call time) until that slot's `last_swap.id` equals the request id. A poll that fails (503, connection error) does not end the wait.
+    - **Correction (Claude, 2026-11-05):** this plan first said "one interim message". It must not be a `ResponseMessage`: `DaemonConnection.command`/`command_stream` (`agent_core/client.py:104,128,152`), the CLI REPL (`agent_core/adapters/cli.py:202`) and PAL's CLI and Discord readers all stop at the first `ResponseMessage`, so the real outcome would be left in the socket and read as the next command's answer. A `StreamChunkMessage` is no better: PAL's Discord reader replaces the final text with the joined chunks (`pal/discord_interactions.py:668-671`). `ToolProgressMessage` with `arguments["status"]` is the progress convention PAL already uses.
     - Outcome `ok` or `already_loaded`: report success.
     - `fell_back` or `failed`: report the outcome and `last_swap.message` as an error.
-    - The wait is capped at 1500 s (two `SWAP_TIMEOUT`s of 600 plus restarts). At the cap, report that the swap is still running and that `/model` shows its state.
+    - The wait is capped at `MODEL_SWAP_WAIT_SECONDS` (module constant, 1500.0: two `SWAP_TIMEOUT`s of 600 plus restarts). At the cap, report that the swap is still running and that `/model` shows its state.
+  - Exactly one `ResponseMessage` or `ErrorMessage` per run, and it comes last. Success and the cap are a `ResponseMessage`; `fell_back`, `failed`, a refusal and a network error are an `ErrorMessage`.
   - **Any other status:** an error with the manager's `error.message`.
   - **The session is never repointed** (see the decision above). Every outcome leaves `default_model` as it was, and the report ends with `session sends: <default_model>`.
 
-**Tests (Claude)** (manager mocked with `httpx.MockTransport`; poll interval and cap patched small):
+**Tests (Claude)** (committed in agent_core; manager scripted as a `MockTransport` swapped into every `httpx.AsyncClient`; poll interval and cap patched to 0.01 s and 0.3 s). The list below is the plan's; the file also has `test_a_swap_with_target_sends_it_unchecked`, `test_a_swap_carries_a_fresh_request_id`, `test_the_slot_polled_is_the_one_the_202_names`, `test_a_202_yields_progress_not_an_interim_response`, `test_a_status_error_while_polling_does_not_end_the_wait`, `test_a_landed_swap_is_reported_as_success[ok|already_loaded]`, `test_target_without_a_name_shows_usage` and `test_no_token_sends_no_authorization_header`.
 - `test_status_lists_every_slot_the_manager_reports`: three slots, `egpu` among them.
 - `test_a_swap_without_target_sends_no_target`.
 - `test_a_202_is_polled_until_its_own_last_swap`: an older `last_swap` id is shown first and must be ignored.
@@ -148,6 +150,8 @@ What changed from phase 5 (heaviest):
 ## inference-server (branch `phase6/network-and-clients`)
 
 ### Task 4: The token (Q15)
+
+**Note (Claude, from the Task 3 read):** `swap_slot`'s docstring in `manager/app.py` says "No auth; LAN-only is the trust boundary" and its untargeted branch says "agent_core clients send exactly this after a model_not_loaded 409". Both go stale in this phase: update them in this task.
 
 **Files:** `manager/config.py`, `manager/app.py` (the new middleware and its registration), `systemd/llama-manager.service` (the second `EnvironmentFile`), `scripts/onboard.py`, `scripts/deploy-manager.sh` (its `/status` call), `README.md` (the client contract, Q18). Test: `tests/test_manager_token.py` (new), plus the scripts' existing tests.
 

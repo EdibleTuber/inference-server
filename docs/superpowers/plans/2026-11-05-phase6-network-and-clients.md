@@ -185,7 +185,13 @@ What changed from phase 5 (heaviest):
 - `test_onboard_sends_the_token_from_its_environment`.
 - `test_deploy_sends_the_token_on_its_status_call`: through `--verify`, with a fake `curl` on `PATH` that records each call's argv and headers. The token is on the `/status` call, not on `/health`, never in any argv, and a slot line prints.
 
-**Mutants:** `startswith("/health")`; `==` in place of `compare_digest`; check only `/v1/*`; middleware registered inside `JsonOnlyMiddleware`; empty token treated as unset; Bearer matched case-sensitively.
+**Mutants:** `startswith("/health")`; `==` in place of `compare_digest`; check only `/v1/*`; middleware registered inside `JsonOnlyMiddleware`; empty token treated as unset; Bearer matched case-sensitively. Also, in the scripts and the rest of the middleware: strip the presented token before comparing; accept `x-api-key` only; accept Bearer only; skip the `create_app` check; put the value in the error message; let onboard's 401 reach the KeyError; deploy's header on curl's command line; deploy's token on `/health` too; the slot dump back to the f-string; the slot dump silent again on a failed `/status`; no note when the token file is unreadable. (`==` in place of `compare_digest` is expected to survive: both sides are bytes, so it is equivalent but for timing.)
+
+**Fix round 1 (Claude's review of `a29a00c`).** One finding, from the plan, not the implementation: `--verify` needs no root, but the token file is 0640 `root:_llama-mgr`, so run unprivileged it reads no token, `/status` answers 401, and the slot dump fails silently behind `2>/dev/null || true`. That is the same silence that hid the f-string bug. Tests `test_deploy_verify_says_when_it_cannot_read_the_token_file` and `test_deploy_verify_says_when_the_slot_dump_fails[401|empty|garbage]` fail on `a29a00c`. Required lines, exactly:
+- when the token file exists and is not readable, after the healthy line: `  note: <token file path> is not readable; run with sudo for the slot dump`
+- when the dump prints no slots, for any reason: `  no slot dump: /status did not answer with slots`
+
+The health verdict and exit code do not change.
 
 ### Task 5: Several addresses, one process (Q14, Q16)
 
@@ -271,6 +277,7 @@ Each step is checked before the next one:
    - Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`, never in shell history or argv: write it straight into the files.
    - Write it first to the clients' 0600 env files and opencode's `apiKey`, and restart the clients.
    - Then write `/etc/llama/manager-token.env` (0640 `root:_llama-mgr`) and restart the manager.
+   - Write the line as `MANAGER_TOKEN=<token>` with no quotes: systemd strips quotes, but the deploy script reads the file with `sed` and would send them, so its `/status` call would get 401.
    - **Check:** `/status` without the header gets 401, and with it gets 200; one chat each from PAL, PARE and opencode succeeds.
 4. **Confirm nothing uses the LAN.** Watch the access log for a full day of normal use: `journalctl -u llama-manager -o cat | grep -E '^INFO: +192\.168\.1\.'` must be empty after step 2's restarts. Then drop `192.168.1.14` from `LISTEN_HOSTS` and restart. **Check:** `ss -ltn` shows only `127.0.0.1:11434` and `100.82.222.92:11434`.
 

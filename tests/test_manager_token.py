@@ -395,11 +395,14 @@ with open(os.environ["FAKE_CURL_LOG"], "a") as f:
 if url and url.endswith("/health"):
     sys.stdout.write("200")
 elif url and url.endswith("/status"):
-    sys.stdout.write(json.dumps({"slots": {"main": {"loaded_model": "M", "healthy": True}}}))
+    if "FAKE_CURL_STATUS_BODY" in os.environ:  # e.g. the manager's 401 body
+        sys.stdout.write(os.environ["FAKE_CURL_STATUS_BODY"])
+    else:
+        sys.stdout.write(json.dumps({"slots": {"main": {"loaded_model": "M", "healthy": True}}}))
 '''
 
 
-def _deploy_verify(tmp_path, token_file_text):
+def _deploy_verify(tmp_path, token_file_text, *, token_mode=None, extra_env=None):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     curl = bin_dir / "curl"
@@ -409,13 +412,15 @@ def _deploy_verify(tmp_path, token_file_text):
     token_env = tmp_path / "manager-token.env"
     if token_file_text is not None:
         token_env.write_text(token_file_text)
+        if token_mode is not None:
+            token_env.chmod(token_mode)
     log = tmp_path / "curl.log"
     env = {"PATH": f"{bin_dir}:/usr/bin:/bin",
            "DEPLOY_MGR_ENV": str(tmp_path / "manager.env"),
            "DEPLOY_MGR_TOKEN_ENV": str(token_env),
            "DEPLOY_DEST": str(tmp_path / "dest"),
            "HEALTH_WAIT": "3",
-           "FAKE_CURL_LOG": str(log)}
+           "FAKE_CURL_LOG": str(log), **(extra_env or {})}
     proc = subprocess.run(["bash", str(REPO / "scripts" / "deploy-manager.sh"), "--verify"],
                           capture_output=True, text=True, env=env, cwd=tmp_path)
     calls = [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
@@ -444,3 +449,33 @@ def test_deploy_without_a_token_file_sends_no_header(tmp_path):
     assert calls
     assert all(not any(h.lower().startswith("authorization") for h in c["headers"])
                for c in calls), calls
+
+
+_UNAUTHORIZED = json.dumps({"error": {"type": "unauthorized", "message": "authentication required"}})
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_deploy_verify_says_when_it_cannot_read_the_token_file(tmp_path):
+    """`--verify` needs no root, but the token file is 0640 root:_llama-mgr.
+    Run unprivileged, the token is unreadable and /status answers 401: the
+    health verdict stands, and the operator is told why no slot lines print,
+    not left with silence."""
+    proc, calls = _deploy_verify(tmp_path, f"MANAGER_TOKEN={TOKEN}\n", token_mode=0,
+                                 extra_env={"FAKE_CURL_STATUS_BODY": _UNAUTHORIZED})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "healthy after" in proc.stdout
+    token_env = str(tmp_path / "manager-token.env")
+    assert f"note: {token_env} is not readable; run with sudo for the slot dump" in proc.stdout, proc.stdout
+    assert TOKEN not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("body", [_UNAUTHORIZED, "", "not json"])
+def test_deploy_verify_says_when_the_slot_dump_fails(tmp_path, body):
+    """A /status that answers without slots (a 401, nothing, garbage) still
+    leaves the deploy healthy, but says the dump is missing in one line."""
+    proc, _ = _deploy_verify(tmp_path, f"MANAGER_TOKEN={TOKEN}\n",
+                             extra_env={"FAKE_CURL_STATUS_BODY": body})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "  no slot dump: /status did not answer with slots" in proc.stdout.splitlines(), proc.stdout
+    assert "slot main" not in proc.stdout
+    assert "Traceback" not in proc.stdout + proc.stderr

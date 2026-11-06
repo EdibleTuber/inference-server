@@ -259,14 +259,27 @@ The reason for the probe (`app.py:1528-1535`) was that a backend ready after sta
 - `GET /status` asks for no probe and waits for nothing.
 - Unchanged: the routing path's `refresh` (an unhealthy slot with the requested model), the chat 409 path's `reprobe_all_slots`, and the startup refresh.
 
-**Tests (Claude):**
-- `test_status_asks_for_no_probe[idle|unhealthy|failed]`.
-- `test_polling_status_does_not_move_the_supervisor_count`.
-- `test_status_reports_the_age_of_the_last_probe`: null before any probe, then a number.
-- `test_every_probe_path_stamps_the_probe_time[healthy|loading|failed|raised]`.
-- `test_a_backend_that_comes_up_later_is_seen_by_the_supervisor`: the case the probe-on-read existed for, now covered by the ticker.
+**Notes from writing the tests (Claude, 2026-11-06):**
+- **Stamp after the call.** Stamp `last_probe_at` with `time.monotonic()` read after `client.get` returns or raises, as `time.monotonic()` from `slots.py`'s own `import time`; the stamp test replaces `manager.slots.time`. Every return path of `probe` must have stamped by the time it returns: the exception path, non-200 (503 included), non-JSON, malformed and healthy.
+- **Remove `ServerState.reprobe_all_slots_concurrently`.** `/status` was its only caller. Leave `reprobe_all_slots` (the chat 409 path) and `refresh` as they are.
+- **Fix the comments.** The comment block above the `/status` handler and `_serve_probe_requests`'s docstring ("startup, /status and routing ask for a probe") both go stale and need updating.
 
-**Mutants:** keep the probe for unhealthy slots only; stamp only healthy probes; stamp before the call.
+**Tests (Claude)** (`tests/test_status_read_only.py`, reusing `tests/test_state_machine.py`'s fixtures). Before the fix, all fail except the last, which guards behaviour already correct:
+- `test_status_asks_for_no_probe[idle|unhealthy|failed]`: no backend probe, no `probe` call, nothing pending, and the slot shows what it already held.
+- `test_status_waits_for_no_consumer`: answers in under 1 s with no consumer running (it used to wait out `REFRESH_TIMEOUT`).
+- `test_polling_status_does_not_move_the_supervisor_count`: `supervisor_failures + 2` polls with egpu answering 500. The failure count, `restarts_suppressed` and `restarts` stay 0.
+- `test_status_reports_the_age_of_the_last_probe`: null before any probe. A number after one. Rounded to 1 decimal. The key set is exactly the old keys plus `last_probe_age_seconds`.
+- `test_every_probe_path_stamps_the_probe_time[healthy|loading|failed|raised|malformed]`: the clock moves during the call, and the stamp must be the later value.
+- `test_a_backend_that_comes_up_later_is_seen_by_the_supervisor` (guard).
+
+**Removed in Claude's commit,** because they pin the probe-on-read:
+- `tests/test_endpoints.py::test_status_reprobes_before_reporting`;
+- `tests/test_endpoints.py::test_status_survives_a_raising_slot_probe`, with its now-unused `_FakeV1ModelsServer` and `fake_v1_models_backend`;
+- `tests/test_state_machine.py::test_status_probes_an_idle_or_unhealthy_slot_through_its_consumer`.
+
+The module docstring of `test_state_machine.py` now says `/status` asks for no probe.
+
+**Mutants:** keep the probe for unhealthy slots only; stamp only healthy probes; stamp before the call. Also: stamp only on the exception path; skip the stamp on a non-JSON or malformed 200; report the age unrounded; report `last_probe_at` itself instead of its age; `/status` still awaits `refresh` on a slot with a failed state.
 
 ---
 

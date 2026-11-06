@@ -2,7 +2,8 @@
 #
 # Systemd unit for the model manager proxy.
 #
-# Runs the FastAPI model manager as _llama-mgr, bound to the LAN IP.
+# Runs the FastAPI model manager as _llama-mgr, on every address in
+# LISTEN_HOSTS (loopback, LAN, tailnet): one process answers on all of them.
 # Single entry point for all inference requests.
 #
 # Install: sudo cp systemd/llama-manager.service /etc/systemd/system/
@@ -35,15 +36,10 @@ EnvironmentFile=-/etc/llama/manager-token.env
 # The package lives at /opt/llama/manager/ (with __init__.py).
 WorkingDirectory=/opt/llama
 
-# Run FastAPI via uvicorn.
-# --factory tells uvicorn to call create_app() to get the ASGI app.
-ExecStart=/opt/llama/manager/venv/bin/python -m uvicorn \
-    manager.app:create_app \
-    --factory \
-    --host ${HOST} \
-    --port ${PORT} \
-    --timeout-keep-alive 120 \
-    --log-level info
+# Run the manager: manager/serve.py binds every LISTEN_HOSTS address in one
+# process (phase 6, Q14) and hands the sockets to uvicorn -- uvicorn's
+# --host takes a single address, so it cannot bind several itself.
+ExecStart=/opt/llama/manager/venv/bin/python -m manager.serve
 
 Restart=on-failure
 RestartSec=5

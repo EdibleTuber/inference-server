@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import os
 import re
 import subprocess
@@ -81,14 +82,31 @@ def parse_llama_version(text: str) -> tuple[int, str]:
     return int(match.group(1)), match.group(2)
 
 
-def manager_url_from_env(text: str) -> str:
-    """http://<HOST>:<PORT> from the body of /etc/llama/manager.env.
+def _dialable(raw: str) -> str:
+    """The address to dial when a bind address is not one to connect to.
 
-    HOST absent or 0.0.0.0 means 127.0.0.1; PORT absent means 11434. On this
-    host the manager binds the LAN address (192.168.1.14), so a hardcoded
-    127.0.0.1 default would refuse every connection.
+    A wildcard means every interface, so loopback answers; an address that
+    is not an IP at all cannot be dialed either.
     """
-    host, port = "", ""
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return "127.0.0.1"
+    if addr.is_unspecified:
+        return "::1" if addr.version == 6 else "127.0.0.1"
+    return raw
+
+
+def manager_url_from_env(text: str) -> str:
+    """The manager's base URL from the body of /etc/llama/manager.env.
+
+    The manager answers on every address in LISTEN_HOSTS (phase 6, Q14), so
+    prefer the first loopback among them; with none, a lone wildcard means
+    loopback, otherwise the first host. Without LISTEN_HOSTS the old rule:
+    HOST, absent or 0.0.0.0 meaning 127.0.0.1. PORT absent means 11434.
+    IPv6 addresses are bracketed in the URL.
+    """
+    host, listen_hosts, port = "", "", ""
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -97,13 +115,29 @@ def manager_url_from_env(text: str) -> str:
         key, value = key.strip(), value.strip()
         if key == "HOST" and value:
             host = value
+        elif key == "LISTEN_HOSTS" and value:
+            listen_hosts = value
         elif key == "PORT" and value:
             port = value
-    if host in ("", "0.0.0.0"):
-        host = "127.0.0.1"
+    if listen_hosts:
+        items = [i.strip() for i in listen_hosts.split(",") if i.strip()]
+    else:
+        items = [host] if host else []
+    chosen = None
+    for item in items:
+        try:
+            if ipaddress.ip_address(item).is_loopback:
+                chosen = item
+                break
+        except ValueError:
+            continue
+    if chosen is None:
+        chosen = _dialable(items[0]) if items else "127.0.0.1"
+    if ":" in chosen:
+        chosen = f"[{chosen}]"
     if not port:
         port = "11434"
-    return f"http://{host}:{port}"
+    return f"http://{chosen}:{port}"
 
 
 def onboard(

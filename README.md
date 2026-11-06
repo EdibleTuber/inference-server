@@ -423,7 +423,8 @@ Configuration for the model manager proxy service. The **Default** column is wha
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOST` | `0.0.0.0` | Bind address for the manager. Set to your LAN IP to restrict access, or `0.0.0.0` for all interfaces. |
+| `HOST` | `0.0.0.0` | Bind address for the manager. Set to your LAN IP to restrict access, or `0.0.0.0` for all interfaces. Replaced by `LISTEN_HOSTS` when that is set. |
+| `LISTEN_HOSTS` | _(unset: `HOST`)_ | Every address the manager listens on, comma separated (template: `127.0.0.1,192.168.1.14,100.82.222.92`). One process answers on all of them, so loopback, the LAN and the tailnet share the same slots, queues and request ids. Each item must be an IP address; no duplicates; `0.0.0.0` or `::` only alone. |
 | `PORT` | `8080` | Port the manager listens on. The template sets `11434`, which is what every example in this README assumes. |
 | `LLAMA_SERVER_HOST` / `LLAMA_SERVER_PORT` / `LLAMA_SERVER_ENV` / `LLAMA_SERVER_UNIT` | `127.0.0.1` / `8081` / `/etc/llama/llama-server.env` / `llama-server.service` | The `main` slot's backend address, static env file (the manager never writes it — per-model settings go to the generated model env file) and systemd unit. |
 | `MODELS_DIR` | `/opt/llama/models` | Directory containing GGUF model files. |

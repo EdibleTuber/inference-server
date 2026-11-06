@@ -45,8 +45,34 @@ STAMP="$DEST/DEPLOYED_FROM"
 MGR_ENV="${DEPLOY_MGR_ENV:-/etc/llama/manager.env}"
 MGR_HOST="$(sed -n 's/^HOST=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
 MGR_PORT="$(sed -n 's/^PORT=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
+# LISTEN_HOSTS (phase 6, Q14) replaces HOST when set: the manager answers on
+# every address in it, so verify through the first loopback among them.
+MGR_LISTEN_HOSTS="$(sed -n 's/^LISTEN_HOSTS=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
+if [ -n "$MGR_LISTEN_HOSTS" ]; then
+  MGR_HOST=""
+  # Loopback first: 127.0.0.0/8 or ::1. Word splitting strips the spaces
+  # around the comma-separated items.
+  for h in $(printf '%s' "$MGR_LISTEN_HOSTS" | tr ',' ' '); do
+    case "$h" in
+      127.*|::1) MGR_HOST="$h"; break ;;
+    esac
+  done
+  # No loopback: a lone wildcard means loopback, otherwise the first host.
+  if [ -z "$MGR_HOST" ]; then
+    MGR_HOST="$(printf '%s' "$MGR_LISTEN_HOSTS" | tr ',' '\n' |
+      sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1 || true)"
+    case "$MGR_HOST" in
+      0.0.0.0) MGR_HOST=127.0.0.1 ;;
+      ::) MGR_HOST=::1 ;;
+    esac
+  fi
+fi
 if [ -z "$MGR_HOST" ] || [ "$MGR_HOST" = "0.0.0.0" ]; then
   MGR_HOST=127.0.0.1
+fi
+# A lone v6 wildcard is the same bind-address-not-destination case.
+if [ "$MGR_HOST" = "::" ]; then
+  MGR_HOST=::1
 fi
 if [ -z "$MGR_PORT" ]; then
   MGR_PORT=11434
@@ -63,7 +89,11 @@ MODELS_DIR="${DEPLOY_MODELS_DIR:-$(sed -n 's/^MODELS_DIR=//p' "$MGR_ENV" 2>/dev/
 if [ -z "$MODELS_DIR" ]; then
   MODELS_DIR=/opt/llama/models
 fi
-BASE="http://${MGR_HOST}:${MGR_PORT}"
+# An IPv6 address needs brackets in a URL.
+case "$MGR_HOST" in
+  *:*) BASE="http://[${MGR_HOST}]:${MGR_PORT}" ;;
+  *) BASE="http://${MGR_HOST}:${MGR_PORT}" ;;
+esac
 HEALTH="$BASE/health"
 # The bearer token (phase 6, Q15), read from its own root-only file like the
 # other settings: /etc/llama/manager.env is 0644, so the token lives in

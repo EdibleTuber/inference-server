@@ -209,17 +209,38 @@ The health verdict and exit code do not change.
 - The unit's `ExecStart` becomes `/opt/llama/manager/venv/bin/python -m manager.serve`. The template sets `LISTEN_HOSTS=127.0.0.1,192.168.1.14,100.82.222.92` with a comment line above it (no trailing comment; see phase 5's branch review).
 - The scripts' base URL comes from the first loopback address in `LISTEN_HOSTS`. With none, the rule is the old one: a wildcard means 127.0.0.1, otherwise the first host. With `LISTEN_HOSTS` unset, the old `HOST` rule applies.
 
-**Tests (Claude):**
-- `test_listen_hosts_default_to_host`.
-- `test_listen_hosts_are_parsed_and_stripped`.
-- `test_a_bad_listen_hosts_names_the_key[not-an-ip|duplicate|wildcard-with-another|empty-item]`.
-- `test_one_server_answers_on_every_bound_address`: real uvicorn on 127.0.0.1 and 127.0.0.2, same ephemeral port, `/health` on both.
-- `test_an_address_the_host_does_not_have_yet_still_binds` (`100.64.0.99`).
-- `test_a_port_already_taken_fails_naming_the_host`.
-- `test_the_scripts_use_a_loopback_listen_host`.
-- `test_the_unit_runs_manager_serve`.
+**Corrections from writing the tests (Claude, 2026-11-06).** These override the interface lines above where they differ:
+- **`IP_FREEBIND` has no constant in this host's Python (3.12.3).** `socket.IP_FREEBIND` and `socket.IPV6_FREEBIND` raise AttributeError. Use `getattr(socket, "IP_FREEBIND", 15)` and `getattr(socket, "IPV6_FREEBIND", 78)` (the Linux values).
+- **`bind_sockets`:**
+  - picks the family from the address (`AF_INET6` for a v6 address);
+  - listens, then sets non-blocking;
+  - on a failed bind, closes every socket it already bound, then raises `OSError` whose message contains the host;
+  - `main` catches it and exits non-zero with a message containing the host and the error's `strerror` (for example `Address already in use`).
+- **`main`:** reference `uvicorn.Server` and `uvicorn.Config` as attributes of `import uvicorn` (the tests replace `uvicorn.Server`). The tests run `main` in-process: a subprocess that a mutant let start would run `create_app`'s lifespan against the live slot ports, outside conftest's guard.
+- **`listen_hosts`:**
+  - the field defaults to `()` for configs built directly; `from_env` always fills it;
+  - set but empty or blank is refused like an empty item;
+  - duplicates are compared as addresses, so `::1` and `0:0:0:0:0:0:0:1` are the same;
+  - when `LISTEN_HOSTS` is unset, `(HOST,)` gets the same checks, and the error names `HOST`.
+- **Scripts' base URL:**
+  - any `127.0.0.0/8` address and `::1` count as loopback (`ip_address(...).is_loopback`);
+  - a v6 address is bracketed (`http://[::1]:PORT`);
+  - a lone `::` means `[::1]`, a lone `0.0.0.0` means `127.0.0.1`;
+  - the deploy script reads `LISTEN_HOSTS` with `sed`, like its other settings.
+- **Template:** keep `HOST`; its comment says that `LISTEN_HOSTS`, when set, replaces it.
 
-**Mutants:** drop `IP_FREEBIND`; bind only the first host; allow a wildcard alongside other hosts; the scripts take the first host rather than the loopback one.
+**Tests (Claude)** (`tests/test_listen.py`; before the fix, all fail except 4 cases of `LISTEN_HOSTS` unset, which guard today's behaviour):
+- `test_listen_hosts_default_to_host`, `test_listen_hosts_are_parsed_and_stripped`, `test_listen_hosts_take_ipv6_and_a_lone_wildcard`.
+- `test_a_bad_listen_hosts_names_the_key[not-an-ip|duplicate|duplicate-spelled-differently|wildcard-with-another|v6-wildcard-with-another|two-wildcards|empty-item|empty|blank]`, `test_a_bad_host_without_listen_hosts_names_host`.
+- `test_each_socket_is_bound_listening_nonblocking_and_freebind`: v4 and v6, and the FREEBIND option read back from the socket.
+- `test_an_address_the_host_does_not_have_yet_still_binds[100.64.0.99|fd00::99]`: first checks that a plain socket cannot bind the address, so the test can't pass vacuously on a host with `ip_nonlocal_bind`.
+- `test_a_port_already_taken_raises_naming_the_host`, which also checks that nothing bound before the failure is leaked.
+- `test_one_server_answers_on_every_bound_address`: real uvicorn on 127.0.0.1, 127.0.0.2 and ::1, same port. A shared counter proves one process answers all three.
+- `test_main_runs_one_uvicorn_on_every_listen_host`: config `app`, `factory`, `timeout_keep_alive`, `log_level` and `http == "auto"`. `test_main_exits_nonzero_naming_the_host_when_a_bind_fails`.
+- `test_the_unit_runs_manager_serve`, `test_the_template_listens_on_loopback_lan_and_tailnet`.
+- `test_onboard_uses_a_loopback_listen_host[...]` and `test_deploy_uses_a_loopback_listen_host[...]`: the same nine cases for both scripts.
+
+**Mutants:** drop `IP_FREEBIND`; bind only the first host; allow a wildcard alongside other hosts; the scripts take the first host rather than the loopback one. Also: drop `IPV6_FREEBIND`; leave a socket blocking; leak the sockets bound before a failure; compare duplicates as strings; accept an empty `LISTEN_HOSTS` as unset; skip the checks on the `HOST` fallback; `http="h11"` in `main`; no brackets on a v6 URL; `::` mapped to `127.0.0.1`; `main` swallows the bind error and exits 0.
 
 ### Task 6: `/status` only reads (design feedback, 2026-11-05)
 

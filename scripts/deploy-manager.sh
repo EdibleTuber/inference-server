@@ -86,6 +86,13 @@ verify_manager() {
     code=$(curl -s -m3 -o /dev/null -w '%{http_code}' "$HEALTH" 2>/dev/null || true)
     if [ "$code" = "200" ]; then
       echo "  $UNIT healthy after ${i}s"
+      # --verify needs no root, but the token file is 0640 root:_llama-mgr,
+      # so run unprivileged it reads no token, /status answers 401 and no
+      # slot lines print: say so, instead of the silence that hid the
+      # f-string bug.
+      if [ -e "$TOKEN_ENV" ] && [ ! -r "$TOKEN_ENV" ]; then
+        echo "  note: $TOKEN_ENV is not readable; run with sudo for the slot dump"
+      fi
       if [ -n "$MGR_TOKEN" ]; then
         status_json="$(printf 'Authorization: Bearer %s\n' "$MGR_TOKEN" |
           curl -s -m5 -H @- "$BASE/status" 2>/dev/null || true)"
@@ -94,11 +101,18 @@ verify_manager() {
       fi
       # || true: a status dump is cosmetic; a failure here must not turn a
       # healthy deploy into a non-zero exit.
-      printf '%s' "$status_json" |
+      slot_lines="$(printf '%s' "$status_json" |
         python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for n,s in d["slots"].items():
-    print("    slot %-6s loaded=%r healthy=%s" % (n, s["loaded_model"], s["healthy"]))' 2>/dev/null || true
+    print("    slot %-6s loaded=%r healthy=%s" % (n, s["loaded_model"], s["healthy"]))' 2>/dev/null || true)"
+      # A /status that answers without slots (a 401, nothing, garbage) still
+      # leaves the manager healthy -- but one line says the dump is missing.
+      if [ -n "$slot_lines" ]; then
+        printf '%s\n' "$slot_lines"
+      else
+        echo "  no slot dump: /status did not answer with slots"
+      fi
       return 0
     fi
   done

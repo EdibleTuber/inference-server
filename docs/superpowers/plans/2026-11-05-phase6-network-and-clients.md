@@ -299,6 +299,28 @@ The module docstring of `test_state_machine.py` now says `/status` asks for no p
 - PAL's `tests/test_config.py:14,40,92` pin the old `192.168.1.14` defaults and fail against agent_core 1.13 (measured 2026-11-05: 3 failed, 625 passed, the 5 baseline collection errors). Claude updates them with these tests, comparing against `BaseConfig()` rather than a new literal.
 - Expected suite result: the baseline above, minus the deleted tests, plus these.
 
+**Notes from writing the tests (Claude, 2026-11-07):**
+- Work in the PAL worktree `/mnt/secondary/PAL-wt-phase6` (branch `phase6/agent-core-1.13`). It has no venv of its own. Run the suite with PAL's venv against the worktree and agent_core 1.13:
+  `PYTHONPATH=/mnt/secondary/PAL-wt-phase6:/mnt/secondary/agent_core-wt-phase6 /mnt/secondary/PAL/.venv/bin/python -m pytest -q -p no:cacheprovider --continue-on-collection-errors`
+  The 5 collection errors (`test_chat_research_integration`, `test_client`, `test_daemon`, `test_integration`, `test_prompt_injection`: modules removed long ago) are the baseline and make the exit status 1. Judge by the summary line: no failures, and errors in those 5 files only.
+- **A third manager client the plan missed:** `scripts/retrieval_eval/run.py:61` builds a `RetrievalClient` with no token, and the manager will refuse it with 401. It reads `PAL_INFERENCE_URL` from the environment already. Pass `token=os.environ.get("PAL_MANAGER_TOKEN") or None` the same way.
+- Delete the whole `PALModel` class from `pal/commands/domain.py`, its export from `pal/commands/__init__.py` (import and `__all__`), its import and `commands` entry in `pal/agent.py`, and the four helpers. Update the comment above `PALAgent.commands` that lists "model" among the overridden builtins. Drop any import left unused.
+- Tests (Claude's commit), in `tests/test_agent_core_1_13.py`:
+  - `test_pal_registers_agent_cores_model_command`;
+  - `test_pals_own_model_helpers_are_gone[4 names]`;
+  - `test_pal_commands_no_longer_exports_its_model_command`;
+  - `test_the_batch_client_gets_the_token[same-manager|own-url]`;
+  - `test_the_backfill_client_gets_the_token`;
+  - `test_every_pal_manager_client_is_given_the_token`: an AST scan of `pal/` and `scripts/` for every `InferenceClient(...)` or `RetrievalClient(...)` call without a `token=` keyword.
+  Also: `tests/test_config.py` compares against `BaseConfig()` and gains `test_load_config_reads_the_manager_token` (a guard; it passes before the fix). `tests/test_commands.py` and `tests/test_commands_drift.py` drop `PALModel`. `tests/conftest.py`'s `make_pal_agent` passes the token like 1.13's `run_daemon`. `tests/test_model_command.py` is deleted.
+- Measured before the fix: exactly the new tests fail (10), 620 pass, the 5 baseline errors. With a reference fix: no failures twice, the 5 baseline errors.
+- **Mutants:**
+  - `PALModel` kept in `PALAgent.commands`;
+  - the batch client built without the token;
+  - the backfill client built without the token;
+  - the retrieval_eval client built without the token;
+  - the batch client given `token=config.manager_token` only when `config.batch_inference_url == config.inference_url`.
+
 **PARE:** pin bump to `v1.13.0` only. PARE sets no inference URL in its unit (it uses the default), so 1.13's localhost default moves it. That is the "new PARE inference-URL env" of Q16, confirmed as `PARE_INFERENCE_URL` (`pare/config.py:51-53`, `agent_name="pare"`). The pin bump is part of Task 8.
 
 ### Task 8: Cutover (owner; Claude gives each command and checks each result)

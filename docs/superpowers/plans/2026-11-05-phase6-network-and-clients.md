@@ -149,6 +149,9 @@ What changed from phase 5 (heaviest):
 
 ## inference-server (branch `phase6/network-and-clients`)
 
+**Task 3 review fix (2026-11-07):** agent_core `main` carried `c7a037a` (2026-10-20, after `v1.12.1`), an older `/model` 202+poll adaptation that Tasks 1–3 replace. Merge `8c4957f` records it as merged and keeps this branch's tree (its 4 tests pinned the replaced design). One fix of it is not carried: an httpx timeout stringifies to `''`, so `_builtin_impls.py`'s `"Swap failed ({name}): {exc}"` (the `/swap` POST) and `"Could not reach inference manager: {exc}"` (`list`) read blank. Name the exception type in both, keeping its text. Test: `tests/test_model_command.py::test_a_failed_call_says_what_went_wrong[blank-timeout|with-message × list|swap]` (`3ab4b82`). Add a line to the CHANGELOG 1.13.0 entry. The `v1.13.0` tag goes on this fix's commit, not `f9629aa`.
+**Mutants:** the type name dropped on the `/swap` path; dropped on the `list` path; the exception text dropped (type name only) on either path.
+
 ### Task 4: The token (Q15)
 
 **Note (Claude, from the Task 3 read):** `swap_slot`'s docstring in `manager/app.py` says "No auth; LAN-only is the trust boundary" and its untargeted branch says "agent_core clients send exactly this after a model_not_loaded 409". Both go stale in this phase: update them in this task.

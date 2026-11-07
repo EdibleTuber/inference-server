@@ -4,6 +4,8 @@
 # scripts/setup.sh is the first-time installer.
 #
 #   ./scripts/deploy-manager.sh --check    # read-only, no sudo, exits 1 on drift
+#   ./scripts/deploy-manager.sh --verify   # just the post-restart health check
+#                                          # (no git, drift or root checks)
 #   sudo ./scripts/deploy-manager.sh       # test, install, stamp, restart, verify
 #
 # Exit codes: 0 clean or healthy, 1 drift or other failure, 2 not a git
@@ -43,8 +45,34 @@ STAMP="$DEST/DEPLOYED_FROM"
 MGR_ENV="${DEPLOY_MGR_ENV:-/etc/llama/manager.env}"
 MGR_HOST="$(sed -n 's/^HOST=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
 MGR_PORT="$(sed -n 's/^PORT=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
+# LISTEN_HOSTS (phase 6, Q14) replaces HOST when set: the manager answers on
+# every address in it, so verify through the first loopback among them.
+MGR_LISTEN_HOSTS="$(sed -n 's/^LISTEN_HOSTS=//p' "$MGR_ENV" 2>/dev/null | tail -1 || true)"
+if [ -n "$MGR_LISTEN_HOSTS" ]; then
+  MGR_HOST=""
+  # Loopback first: 127.0.0.0/8 or ::1. Word splitting strips the spaces
+  # around the comma-separated items.
+  for h in $(printf '%s' "$MGR_LISTEN_HOSTS" | tr ',' ' '); do
+    case "$h" in
+      127.*|::1) MGR_HOST="$h"; break ;;
+    esac
+  done
+  # No loopback: a lone wildcard means loopback, otherwise the first host.
+  if [ -z "$MGR_HOST" ]; then
+    MGR_HOST="$(printf '%s' "$MGR_LISTEN_HOSTS" | tr ',' '\n' |
+      sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1 || true)"
+    case "$MGR_HOST" in
+      0.0.0.0) MGR_HOST=127.0.0.1 ;;
+      ::) MGR_HOST=::1 ;;
+    esac
+  fi
+fi
 if [ -z "$MGR_HOST" ] || [ "$MGR_HOST" = "0.0.0.0" ]; then
   MGR_HOST=127.0.0.1
+fi
+# A lone v6 wildcard is the same bind-address-not-destination case.
+if [ "$MGR_HOST" = "::" ]; then
+  MGR_HOST=::1
 fi
 if [ -z "$MGR_PORT" ]; then
   MGR_PORT=11434
@@ -61,12 +89,80 @@ MODELS_DIR="${DEPLOY_MODELS_DIR:-$(sed -n 's/^MODELS_DIR=//p' "$MGR_ENV" 2>/dev/
 if [ -z "$MODELS_DIR" ]; then
   MODELS_DIR=/opt/llama/models
 fi
-BASE="http://${MGR_HOST}:${MGR_PORT}"
+# An IPv6 address needs brackets in a URL.
+case "$MGR_HOST" in
+  *:*) BASE="http://[${MGR_HOST}]:${MGR_PORT}" ;;
+  *) BASE="http://${MGR_HOST}:${MGR_PORT}" ;;
+esac
 HEALTH="$BASE/health"
+# The bearer token (phase 6, Q15), read from its own root-only file like the
+# other settings: /etc/llama/manager.env is 0644, so the token lives in
+# /etc/llama/manager-token.env (0640), sed'd, never sourced. No file means
+# no token and no check.
+TOKEN_ENV="${DEPLOY_MGR_TOKEN_ENV:-/etc/llama/manager-token.env}"
+MGR_TOKEN="$(sed -n 's/^MANAGER_TOKEN=//p' "$TOKEN_ENV" 2>/dev/null | tail -1 || true)"
+
+# Poll /health until the manager answers, then dump the slot lines from
+# /status. Runs after the restart and, alone, as `--verify`: exits 0
+# healthy, 1 not, with no git, drift or root checks -- that is what makes
+# the token path testable without root. /health is token-exempt and stays
+# as it was; /status needs the token, passed on stdin (-H @-) so it never
+# appears on a command line: root's argv is readable by every user in ps.
+verify_manager() {
+  for i in $(seq 1 "$HEALTH_WAIT"); do
+    sleep 1
+    # || true: connection refused right after the restart is normal; keep
+    # polling instead of aborting.
+    code=$(curl -s -m3 -o /dev/null -w '%{http_code}' "$HEALTH" 2>/dev/null || true)
+    if [ "$code" = "200" ]; then
+      echo "  $UNIT healthy after ${i}s"
+      # --verify needs no root, but the token file is 0640 root:_llama-mgr,
+      # so run unprivileged it reads no token, /status answers 401 and no
+      # slot lines print: say so, instead of the silence that hid the
+      # f-string bug.
+      if [ -e "$TOKEN_ENV" ] && [ ! -r "$TOKEN_ENV" ]; then
+        echo "  note: $TOKEN_ENV is not readable; run with sudo for the slot dump"
+      fi
+      if [ -n "$MGR_TOKEN" ]; then
+        status_json="$(printf 'Authorization: Bearer %s\n' "$MGR_TOKEN" |
+          curl -s -m5 -H @- "$BASE/status" 2>/dev/null || true)"
+      else
+        status_json="$(curl -s -m5 "$BASE/status" 2>/dev/null || true)"
+      fi
+      # || true: a status dump is cosmetic; a failure here must not turn a
+      # healthy deploy into a non-zero exit.
+      slot_lines="$(printf '%s' "$status_json" |
+        python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for n,s in d["slots"].items():
+    print("    slot %-6s loaded=%r healthy=%s" % (n, s["loaded_model"], s["healthy"]))' 2>/dev/null || true)"
+      # A /status that answers without slots (a 401, nothing, garbage) still
+      # leaves the manager healthy -- but one line says the dump is missing.
+      if [ -n "$slot_lines" ]; then
+        printf '%s\n' "$slot_lines"
+      else
+        echo "  no slot dump: /status did not answer with slots"
+      fi
+      return 0
+    fi
+  done
+  echo "  WARNING: $UNIT did not report healthy within ${HEALTH_WAIT}s"
+  echo "  journalctl -u $UNIT -n 40 --no-pager"
+  return 1
+}
 
 CHECK_ONLY=0
+VERIFY_ONLY=0
 if [ "${1:-}" = "--check" ]; then
   CHECK_ONLY=1
+elif [ "${1:-}" = "--verify" ]; then
+  VERIFY_ONLY=1
+fi
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+  if verify_manager; then
+    exit 0
+  fi
+  exit 1
 fi
 
 # -d "$REPO/.git" is NOT the right test: in a git worktree, .git is a file
@@ -243,23 +339,7 @@ systemctl restart "$UNIT"
 
 # Verify it came back. A deploy that leaves the manager dead is worse than the
 # drift it fixed, and the slots reload their own state on startup.
-for i in $(seq 1 "$HEALTH_WAIT"); do
-  sleep 1
-  # || true: connection refused right after the restart is normal; keep
-  # polling instead of aborting.
-  code=$(curl -s -m3 -o /dev/null -w '%{http_code}' "$HEALTH" 2>/dev/null || true)
-  if [ "$code" = "200" ]; then
-    echo "  $UNIT healthy after ${i}s"
-    # || true: a status dump is cosmetic; a failure here must not turn a
-    # healthy deploy into a non-zero exit.
-    curl -s -m5 "$BASE/status" 2>/dev/null |
-      python3 -c 'import json,sys
-d=json.load(sys.stdin)
-for n,s in d["slots"].items():
-    print(f"    slot {n:<6} loaded={s[\"loaded_model\"]!r} healthy={s[\"healthy\"]}")' 2>/dev/null || true
-    exit 0
-  fi
-done
-echo "  WARNING: $UNIT did not report healthy within ${HEALTH_WAIT}s"
-echo "  journalctl -u $UNIT -n 40 --no-pager"
+if verify_manager; then
+  exit 0
+fi
 exit 1

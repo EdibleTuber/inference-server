@@ -20,6 +20,7 @@ Endpoints:
     GET  /collections/{collection_id}/reindex/{job_id}      - Specific reindex job state
 """
 import asyncio
+import hmac
 import logging
 import sys
 import time
@@ -35,7 +36,7 @@ from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from manager import retrieval
-from manager.config import ManagerConfig
+from manager.config import ManagerConfig, validate_manager_token
 from manager.request_log import (
     RequestRecord,
     StreamTokens,
@@ -199,12 +200,10 @@ class ServerState:
         behind a model load and can never clobber a fresh mark_swapped.
 
         Sequential: worst case is N slots times REFRESH_TIMEOUT if every
-        slot's consumer is slow to get to its probe. That is deliberate
-        and unchanged here -- this is the chat 409 path's reprobe, called
-        for one request already in flight that is about to fail anyway, so
-        a few extra seconds of serialized, easy-to-reason-about refresh
-        costs little. GET /status calls the concurrent variant below
-        instead; see its docstring for why.
+        slot's consumer is slow to get to its probe. That is deliberate --
+        this is the chat 409 path's reprobe, called for one request already
+        in flight that is about to fail anyway, so a few extra seconds of
+        serialized, easy-to-reason-about refresh costs little.
         """
         for name, slot in self.slots.items():
             try:
@@ -213,49 +212,6 @@ class ServerState:
                 logger.exception(
                     "slot=%s refresh raised (should not happen; refresh is "
                     "expected to never raise)", name,
-                )
-
-    async def reprobe_all_slots_concurrently(self) -> None:
-        """Ask every slot's consumer to probe, all at once. Never raises.
-
-        Used only by GET /status. reprobe_all_slots (above) is sequential by
-        design for the chat 409 path, where that's fine. /status is a
-        monitoring endpoint: its worst case matters most exactly when slots
-        are down, since that's when someone is anxiously checking it or an
-        automated health check is polling it on a tight timeout. Sequential
-        refresh there would cost up to N * REFRESH_TIMEOUT if every slot's
-        consumer is slow to get to its probe -- multiplying the outage's
-        visible cost instead of just reporting it. Refreshing concurrently
-        bounds /status's worst case to one refresh timeout regardless of
-        slot count.
-
-        Phase 5 (Q19): each refresh runs on that slot's own consumer, so
-        there is no cross-slot contention to manage, and a slot that is
-        serving or swapping answers at once and is not probed.
-
-        return_exceptions=True is load-bearing, not decorative. Without it,
-        asyncio.gather re-raises the first child exception immediately,
-        without awaiting or cancelling its siblings, and that exception
-        would propagate straight out of this method -- past nothing that
-        would catch it -- and 500 /status. slot.refresh is expected to
-        never raise (the probe itself is contained on the consumer), so
-        this is defense in depth; gather waits for every child regardless,
-        and any exception a child does produce is logged and otherwise
-        ignored rather than propagated to the /status caller.
-        """
-        results = await asyncio.gather(
-            *(
-                slot.refresh(REFRESH_TIMEOUT)
-                for name, slot in self.slots.items()
-            ),
-            return_exceptions=True,
-        )
-        for name, result in zip(self.slots, results):
-            if isinstance(result, BaseException):
-                logger.warning(
-                    "slot=%s refresh raised during concurrent /status "
-                    "reprobe (should not happen; refresh is expected "
-                    "to never raise): %s", name, result,
                 )
 
     async def ensure_model_on_slot(self, slot_name: str, model_name: str,
@@ -457,9 +413,10 @@ async def _serve_probe_requests(slot, config: ManagerConfig) -> None:
     """Run this slot's pending probes, if any (phase 5, Q19), judging each
     for the supervisor (Task 5, Q21).
 
-    The consumer is the only probe writer: startup, /status and routing ask
-    for a probe through refresh, which arms the handshake and wakes the
-    consumer on the queue event. A probe is contained here -- the contract
+    The consumer is the only probe writer: startup, routing and the chat 409
+    reprobe ask for a probe through refresh, which arms the handshake and
+    wakes the consumer on the queue event. (GET /status asks for no probe
+    since phase 6, Task 6.) A probe is contained here -- the contract
     says it never raises, but a bug past that guarantee must not end the
     consumer or strand the refresh waiters, so finish_probe always runs.
     The queue event is deliberately NOT cleared here: a refresh that joins
@@ -1410,6 +1367,72 @@ class JsonOnlyMiddleware:
         )(scope, receive, send)
 
 
+class TokenMiddleware:
+    """Gate: when a token is set, refuse every request that does not carry
+    it (phase 6, Q15).
+
+    Deliberately plain ASGI, like JsonOnlyMiddleware: no wrapped receive,
+    no re-streamed responses. Registered outermost, so a 401 comes before
+    the JSON gate's 415.
+
+    With the token set, the exemption is exactly the path ``/health``
+    (checked against the raw scope path, whatever the method): ``/health/``,
+    ``//health`` and ``/healthz`` all need the token, and so does every
+    other path, including 404s. Everything else needs
+    ``Authorization: Bearer <token>`` (the scheme in any case) or
+    ``x-api-key: <token>`` (the header Anthropic clients send to
+    /v1/messages), compared with hmac.compare_digest on bytes. A refusal is
+    401 with ``WWW-Authenticate: Bearer`` and no manager.requests line --
+    the client address uvicorn records is what the operator reads -- and
+    the answer never echoes what the client sent. The body takes the
+    Anthropic shape on the /v1/messages paths and the manager's everywhere
+    else. With the token unset, nothing is checked.
+    """
+
+    def __init__(self, app, token: str | None):
+        self.app = app
+        self.token = token.encode() if token is not None else None
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or self.token is None
+            or scope["path"] == "/health"
+        ):
+            await self.app(scope, receive, send)
+            return
+        if self._authorized(scope["headers"]):
+            await self.app(scope, receive, send)
+            return
+        await self._unauthorized(scope["path"])(scope, receive, send)
+
+    def _authorized(self, headers) -> bool:
+        def value(name: bytes) -> bytes | None:
+            return next((v for k, v in headers if k == name), None)
+
+        auth = value(b"authorization")
+        if auth is not None:
+            scheme, sep, credentials = auth.partition(b" ")
+            if sep and scheme.lower() == b"bearer":
+                return hmac.compare_digest(credentials, self.token)
+        api_key = value(b"x-api-key")
+        if api_key is not None:
+            return hmac.compare_digest(api_key, self.token)
+        return False
+
+    def _unauthorized(self, path: str) -> JSONResponse:
+        message = ("authentication required: present the token as "
+                   "'Authorization: Bearer <token>' or 'x-api-key: <token>'")
+        if path.startswith("/v1/messages"):
+            body = {"type": "error",
+                    "error": {"type": "authentication_error", "message": message}}
+        else:
+            body = {"error": {"type": "unauthorized", "message": message}}
+        return JSONResponse(
+            body, status_code=401, headers={"WWW-Authenticate": "Bearer"}
+        )
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -1425,6 +1448,12 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     """
     if config is None:
         config = ManagerConfig.from_env()
+
+    # Refuse an empty or whitespace token here, at construction, not in the
+    # middleware's __init__: Starlette builds the middleware stack lazily on
+    # the first request, and an empty token built directly would make an
+    # empty x-api-key match it. from_env runs the same check.
+    validate_manager_token(config.manager_token)
 
     _setup_logging(config)
 
@@ -1510,6 +1539,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
     app.state.server = server
     # Q8 (X1): refuse every POST whose Content-Type is not application/json.
     app.add_middleware(JsonOnlyMiddleware)
+    # Phase 6 (Q15): outermost, so a 401 comes before the 415. add_middleware
+    # inserts at the front, so the last one added wraps all the rest.
+    app.add_middleware(TokenMiddleware, token=config.manager_token)
 
     # ------------------------------------------------------------------
     # GET /health
@@ -1525,15 +1557,16 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status():
-        # Refresh before reporting. The startup probe runs once, and until this
-        # was added the only other reprobe was on the chat 409 path -- so a
-        # backend that became ready later showed here as a total outage for the
-        # life of the process, while requests to it succeeded. Uses the
-        # concurrent variant (see ServerState.reprobe_all_slots_concurrently)
-        # so this endpoint's worst case is one probe timeout, not one per
-        # slot; slots mid-swap are still skipped, so this cannot stall behind
-        # a model load either way.
-        await server.reprobe_all_slots_concurrently()
+        # Read-only (phase 6, Task 6): report what each slot already holds
+        # and how long ago it was last probed (last_probe_age_seconds); ask
+        # for no probe and wait for nothing. The probe-on-read existed for a
+        # backend that became ready after the manager's startup probe; since
+        # phase 5 the supervisor's ticker probes every idle, unhealthy or
+        # failed slot every SUPERVISOR_PROBE_INTERVAL, so that case is
+        # covered without the read. The probes also moved supervisor restarts
+        # earlier with every poll, loaded the backends, and -- with
+        # agent_core's /model polling /status during a swap -- probed the
+        # other slot every 2 s.
         gpu = await get_gpu_info_async()
         return {
             "slots": {
@@ -1775,7 +1808,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         and the section must be verified unless trial is true: trial is how
         scripts/onboard.py verifies a pair, and it reloads even a model
         that is already loaded, because a trial that skips the load would
-        verify nothing. No auth; LAN-only is the trust boundary.
+        verify nothing. With MANAGER_TOKEN set, the bearer token is the
+        trust boundary (phase 6, Q15): every path except exactly /health
+        must present it; the binding addresses add the network boundary.
 
         The swap is a FIFO item in the target slot's queue (phase 5, Q12):
         the slot's consumer runs it after whatever is ahead of it. 200 is
@@ -1843,9 +1878,9 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
         target = body.get("target")
         if target is None:
             # Untargeted: the profile's home slot decides, never "the first
-            # slot". agent_core clients send exactly this after a
-            # model_not_loaded 409; guessing a slot here is what used to
-            # evict main.
+            # slot". A client that wants the home slot sends the swap
+            # without a target (agent_core's /model does); guessing a slot
+            # here is what used to evict main.
             target = profile.home
         if not isinstance(target, str) or target not in server.slots:
             return refuse(400, "invalid_target", f"'target' must be one of: {valid}",

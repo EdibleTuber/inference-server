@@ -7,9 +7,11 @@ All configuration comes from environment variables, which are set in
 This module provides a typed config object so the rest of the app doesn't
 need to deal with raw env vars or string parsing.
 """
+import ipaddress
 import math
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 from manager.slot_config import SlotConfig, build_slots
 
@@ -69,6 +71,66 @@ def _bool01_env(key: str, default: bool) -> bool:
     return raw == "1"
 
 
+def validate_manager_token(value: str | None) -> str | None:
+    """Validate MANAGER_TOKEN (phase 6, Q15).
+
+    None (unset) means no token and no check. An empty value, or one that
+    carries any whitespace, is refused: a stray space in an env file must
+    never quietly become a different token, or no token. The error goes to
+    the journal, so it names the key and never the value.
+    """
+    if value is None:
+        return None
+    if not value or re.search(r"\s", value):
+        raise ValueError(
+            "Configuration error: MANAGER_TOKEN is empty or contains "
+            "whitespace; it must be a single unbroken string"
+        )
+    return value
+
+
+def _listen_hosts_env() -> tuple[str, ...]:
+    """Parse LISTEN_HOSTS (phase 6, Q14) into the addresses the manager binds.
+
+    Comma separated, whitespace around each item stripped, order kept. When
+    unset, (HOST,): an env file without the setting binds as today. Every
+    item must parse as an IP address; there are no duplicates (compared as
+    addresses, so ::1 and 0:0:0:0:0:0:0:1 are one address); and a wildcard
+    (0.0.0.0 or ::) is only allowed alone. Any violation raises ValueError
+    naming the key that carried it.
+    """
+    raw = os.getenv("LISTEN_HOSTS")
+    if raw is None:
+        items = [os.getenv("HOST", "0.0.0.0")]
+        key = "HOST"
+    else:
+        items = [item.strip() for item in raw.split(",")]
+        key = "LISTEN_HOSTS"
+    if any(not item for item in items):
+        raise ValueError(
+            f"Configuration error: {key} has an empty item; addresses are "
+            f"comma separated, with no empty or whitespace-only entries"
+        )
+    addrs: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for item in items:
+        try:
+            addr = ipaddress.ip_address(item)
+        except ValueError:
+            raise ValueError(
+                f"Configuration error: {key} item {item!r} is not an IP address"
+            ) from None
+        if addr in addrs:
+            raise ValueError(
+                f"Configuration error: {key} lists the address {item!r} twice"
+            )
+        addrs.append(addr)
+    if len(addrs) > 1 and any(a.is_unspecified for a in addrs):
+        raise ValueError(
+            f"Configuration error: {key} wildcard must be the only address"
+        )
+    return tuple(items)
+
+
 @dataclass
 class ManagerConfig:
     """Typed configuration for the model manager service.
@@ -105,6 +167,13 @@ class ManagerConfig:
         supervisor_restart: Whether a due restart actually restarts the slot's
             unit (env value exactly 0 or 1). Off by default: a due restart is
             logged as "would restart" and counted in /status.
+        manager_token: Bearer token every client must send (phase 6, Q15).
+            None (unset) means no check at all. Excluded from repr: the token
+            must never appear in logs, argv or error messages.
+        listen_hosts: Addresses the manager binds, one process on all of
+            them (phase 6, Q14). from_env fills it from LISTEN_HOSTS, or
+            (host,) when that is unset. Empty default: configs built
+            directly bind nowhere until it is set.
     """
     host: str
     port: int
@@ -129,6 +198,10 @@ class ManagerConfig:
     supervisor_backoff: float = 30.0
     supervisor_backoff_max: float = 600.0
     supervisor_restart: bool = False
+    manager_token: str | None = field(default=None, repr=False)
+    # Phase 6, Q14: every address one process answers on. from_env always
+    # fills it; the empty default is for configs built directly.
+    listen_hosts: tuple[str, ...] = ()
 
     @property
     def llama_server_url(self) -> str:
@@ -187,4 +260,6 @@ class ManagerConfig:
             supervisor_backoff=backoff,
             supervisor_backoff_max=backoff_max,
             supervisor_restart=_bool01_env("SUPERVISOR_RESTART", False),
+            manager_token=validate_manager_token(os.getenv("MANAGER_TOKEN")),
+            listen_hosts=_listen_hosts_env(),
         )

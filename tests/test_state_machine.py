@@ -5,8 +5,9 @@ Each slot stores one state, moved only through manager.slots.TRANSITIONS,
 and only by the slot's own queue consumer (the task named
 queue_consumer_<slot>). `serving` is not stored: it is `idle` with a request
 in flight. `healthy` and `swapping` in /status derive from the state.
-/status, routing and startup ask the consumer to probe (SlotState.refresh)
-instead of probing themselves.
+Routing and startup ask the consumer to probe (SlotState.refresh) instead
+of probing themselves; /status asks for no probe (phase 6 Task 6, see
+tests/test_status_read_only.py).
 
 The backends are one httpx.MockTransport that answers /v1/models per slot
 (by port) and chat calls; the real SlotState.probe runs against it.
@@ -542,21 +543,6 @@ async def test_status_answers_at_once_and_does_not_probe_a_busy_slot(app_client,
     assert elapsed < 1.0
     s = r.json()["slots"]["main"]
     assert (s["state"], s["healthy"], s["in_flight"]) == ("serving", True, 1)
-
-
-@pytest.mark.asyncio
-async def test_status_probes_an_idle_or_unhealthy_slot_through_its_consumer(
-        app_client, backends, writes):
-    app, client = app_client
-    server = app.state.server
-    backends.models["egpu"] = "test-model-q8"   # came up after our last look
-    async with running(server):
-        writes.clear()
-        r = await asyncio.wait_for(client.get("/status"), 3)
-    egpu = r.json()["slots"]["egpu"]
-    assert (egpu["loaded_model"], egpu["healthy"], egpu["state"]) == ("test-model-q8", True, "idle")
-    probes = {(slot, task) for name, slot, task in writes if name == "probe"}
-    assert probes == {("main", "queue_consumer_main"), ("egpu", "queue_consumer_egpu")}
 
 
 @pytest.mark.asyncio

@@ -118,7 +118,7 @@ async def test_probe_malformed_top_level_payload_does_not_raise():
     Pre-fix, `data.get("data")` on a list raises AttributeError, which
     propagates out of probe() -- violating "never raises" and, when probe()
     is fanned out via asyncio.gather, capable of tearing down a shared
-    client out from under a sibling probe (see reprobe_all_slots_concurrently).
+    client out from under a sibling probe.
     """
     slot = _make_slot()
     slot.loaded_model = "old-model"

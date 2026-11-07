@@ -111,6 +111,12 @@ class SlotState:
     # SWAP_TIMEOUT a 503 is a backend still loading its model, not a
     # failed probe (Task 5, Q21, Review Focus 3).
     grace_started: float = field(default_factory=time.monotonic)
+    # When the slot's last probe's backend call returned or failed, in
+    # time.monotonic(): stamped by probe after the call, on every return
+    # path, whoever asked (phase 6, Task 6) -- the stamp says when the slot
+    # was last looked at, whatever was seen. None until the first probe;
+    # /status reports its age as last_probe_age_seconds.
+    last_probe_at: Optional[float] = None
     # request_id -> time.monotonic() begin. A request is in flight from just
     # before the consumer calls the backend until the response is complete; a
     # relayed stream stays in flight until its closer runs.
@@ -336,16 +342,22 @@ class SlotState:
         model id. The consumer hands the result to judge
         (manager/supervisor.py); what the probe records and how it moves
         the state are unchanged by the return value.
+
+        Stamps last_probe_at (phase 6, Task 6) with time.monotonic() read
+        after the backend call has returned or raised, on every return
+        path, whoever asked for the probe.
         """
         if self.stored_state == "unhealthy":
             self._set_state("probing")
         try:
             resp = await client.get(f"{self.url}/v1/models", timeout=3)
         except Exception as exc:
+            self.last_probe_at = time.monotonic()
             logger.warning("slot %s probe failed: %s", self.name, exc)
             self._probe_failed(f"probe failed: {exc}")
             return PROBE_FAILED
 
+        self.last_probe_at = time.monotonic()
         if resp.status_code != 200:
             logger.warning("slot %s probe returned %s", self.name, resp.status_code)
             self._probe_failed(f"probe returned {resp.status_code}")
@@ -474,6 +486,13 @@ class SlotState:
             "in_flight_age_seconds": _round_1(self.oldest_in_flight_seconds(now)),
             "oldest_queue_wait_seconds": _round_1(
                 self.queue.oldest_wait_seconds(now)),
+            # How long ago the last probe's backend call returned or failed
+            # (phase 6, Task 6); None until the slot's first probe. /status
+            # no longer probes, so this is the endpoint's honest answer to
+            # "how fresh is that state".
+            "last_probe_age_seconds": _round_1(
+                None if self.last_probe_at is None
+                else now - self.last_probe_at),
             "last_error": self.last_error,
             "last_swap": self.last_swap,
         }

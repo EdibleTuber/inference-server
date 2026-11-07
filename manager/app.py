@@ -200,12 +200,10 @@ class ServerState:
         behind a model load and can never clobber a fresh mark_swapped.
 
         Sequential: worst case is N slots times REFRESH_TIMEOUT if every
-        slot's consumer is slow to get to its probe. That is deliberate
-        and unchanged here -- this is the chat 409 path's reprobe, called
-        for one request already in flight that is about to fail anyway, so
-        a few extra seconds of serialized, easy-to-reason-about refresh
-        costs little. GET /status calls the concurrent variant below
-        instead; see its docstring for why.
+        slot's consumer is slow to get to its probe. That is deliberate --
+        this is the chat 409 path's reprobe, called for one request already
+        in flight that is about to fail anyway, so a few extra seconds of
+        serialized, easy-to-reason-about refresh costs little.
         """
         for name, slot in self.slots.items():
             try:
@@ -214,49 +212,6 @@ class ServerState:
                 logger.exception(
                     "slot=%s refresh raised (should not happen; refresh is "
                     "expected to never raise)", name,
-                )
-
-    async def reprobe_all_slots_concurrently(self) -> None:
-        """Ask every slot's consumer to probe, all at once. Never raises.
-
-        Used only by GET /status. reprobe_all_slots (above) is sequential by
-        design for the chat 409 path, where that's fine. /status is a
-        monitoring endpoint: its worst case matters most exactly when slots
-        are down, since that's when someone is anxiously checking it or an
-        automated health check is polling it on a tight timeout. Sequential
-        refresh there would cost up to N * REFRESH_TIMEOUT if every slot's
-        consumer is slow to get to its probe -- multiplying the outage's
-        visible cost instead of just reporting it. Refreshing concurrently
-        bounds /status's worst case to one refresh timeout regardless of
-        slot count.
-
-        Phase 5 (Q19): each refresh runs on that slot's own consumer, so
-        there is no cross-slot contention to manage, and a slot that is
-        serving or swapping answers at once and is not probed.
-
-        return_exceptions=True is load-bearing, not decorative. Without it,
-        asyncio.gather re-raises the first child exception immediately,
-        without awaiting or cancelling its siblings, and that exception
-        would propagate straight out of this method -- past nothing that
-        would catch it -- and 500 /status. slot.refresh is expected to
-        never raise (the probe itself is contained on the consumer), so
-        this is defense in depth; gather waits for every child regardless,
-        and any exception a child does produce is logged and otherwise
-        ignored rather than propagated to the /status caller.
-        """
-        results = await asyncio.gather(
-            *(
-                slot.refresh(REFRESH_TIMEOUT)
-                for name, slot in self.slots.items()
-            ),
-            return_exceptions=True,
-        )
-        for name, result in zip(self.slots, results):
-            if isinstance(result, BaseException):
-                logger.warning(
-                    "slot=%s refresh raised during concurrent /status "
-                    "reprobe (should not happen; refresh is expected "
-                    "to never raise): %s", name, result,
                 )
 
     async def ensure_model_on_slot(self, slot_name: str, model_name: str,
@@ -458,9 +413,10 @@ async def _serve_probe_requests(slot, config: ManagerConfig) -> None:
     """Run this slot's pending probes, if any (phase 5, Q19), judging each
     for the supervisor (Task 5, Q21).
 
-    The consumer is the only probe writer: startup, /status and routing ask
-    for a probe through refresh, which arms the handshake and wakes the
-    consumer on the queue event. A probe is contained here -- the contract
+    The consumer is the only probe writer: startup, routing and the chat 409
+    reprobe ask for a probe through refresh, which arms the handshake and
+    wakes the consumer on the queue event. (GET /status asks for no probe
+    since phase 6, Task 6.) A probe is contained here -- the contract
     says it never raises, but a bug past that guarantee must not end the
     consumer or strand the refresh waiters, so finish_probe always runs.
     The queue event is deliberately NOT cleared here: a refresh that joins
@@ -1601,15 +1557,16 @@ def create_app(config: ManagerConfig | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status():
-        # Refresh before reporting. The startup probe runs once, and until this
-        # was added the only other reprobe was on the chat 409 path -- so a
-        # backend that became ready later showed here as a total outage for the
-        # life of the process, while requests to it succeeded. Uses the
-        # concurrent variant (see ServerState.reprobe_all_slots_concurrently)
-        # so this endpoint's worst case is one probe timeout, not one per
-        # slot; slots mid-swap are still skipped, so this cannot stall behind
-        # a model load either way.
-        await server.reprobe_all_slots_concurrently()
+        # Read-only (phase 6, Task 6): report what each slot already holds
+        # and how long ago it was last probed (last_probe_age_seconds); ask
+        # for no probe and wait for nothing. The probe-on-read existed for a
+        # backend that became ready after the manager's startup probe; since
+        # phase 5 the supervisor's ticker probes every idle, unhealthy or
+        # failed slot every SUPERVISOR_PROBE_INTERVAL, so that case is
+        # covered without the read. The probes also moved supervisor restarts
+        # earlier with every poll, loaded the backends, and -- with
+        # agent_core's /model polling /status during a swap -- probed the
+        # other slot every 2 s.
         gpu = await get_gpu_info_async()
         return {
             "slots": {

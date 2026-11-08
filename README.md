@@ -11,7 +11,7 @@ A native llama.cpp inference server that fronts several llama-server backends ("
 │                      Ubuntu Server (Headless)                        │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │  Model Manager (Python/FastAPI)              LAN_IP:11434      │  │
+│  │  Model Manager (Python/FastAPI)              LISTEN_HOSTS:11434│  │
 │  │  user: _llama-mgr                                              │  │
 │  │   OpenAI API     POST /v1/chat/completions, GET /v1/models     │  │
 │  │   Anthropic API  POST /v1/messages, /v1/messages/count_tokens  │  │
@@ -150,10 +150,12 @@ curl http://localhost:11434/v1/models
 
 ## Usage Examples
 
+The examples call the manager on loopback. From another machine, use one of its `LISTEN_HOSTS` addresses. If the manager has a token ([below](#etcllamamanager-tokenenv-optional-bearer-token)), add `-H "Authorization: Bearer $MANAGER_TOKEN"` to every call except `/health`.
+
 ### Basic chat completion
 
 ```bash
-curl http://YOUR_LAN_IP:11434/v1/chat/completions \
+curl http://127.0.0.1:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-7b-instruct-q4_k_m",
@@ -164,7 +166,7 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 ### Streaming response
 
 ```bash
-curl http://YOUR_LAN_IP:11434/v1/chat/completions \
+curl http://127.0.0.1:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-7b-instruct-q4_k_m",
@@ -178,7 +180,7 @@ curl http://YOUR_LAN_IP:11434/v1/chat/completions \
 Chat requests never trigger a swap: a request for a model that is not loaded on any slot gets **409**. Load it explicitly with `POST /swap`, naming the slot as `target`. Without a `target`, the model goes to its profile's `home` slot (every profile names exactly one). A swap is a FIFO item in that slot's queue: the call returns **202** as soon as the swap is queued, and the slot's consumer runs it after whatever is already ahead of it — requests in flight and queued on that slot run first, and requests queued behind the swap wait for it to finish (a large cold load takes 30 seconds to several minutes). It returns **200** only when nothing is ahead: the slot is idle (healthy, no request in flight, not mid-swap), its queue is empty, the model is already loaded, and no trial was requested. A queue at its limit refuses the swap **503** `queue_full`. Poll `GET /status` until the target slot's `swapping` is `false` and its `loaded_model` is the new model (`healthy` tells you whether it came up, `last_swap` what the latest finished swap ended with).
 
 ```bash
-curl http://YOUR_LAN_IP:11434/swap \
+curl http://127.0.0.1:11434/swap \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL"}'
 # → 202, {"slot": "egpu", "model": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL", "status": "swapping"}
@@ -193,12 +195,12 @@ A model may only be swapped to a slot its profile names, and only once that pair
 The same endpoint serves the Anthropic API, so Anthropic-dialect clients (e.g. Claude Code) can point at it. Both routes are a byte passthrough to llama-server's native Anthropic support, with the same model validation, slot routing and queueing as the OpenAI routes. `count_tokens` skips the queue.
 
 ```bash
-curl http://YOUR_LAN_IP:11434/v1/messages \
+curl http://127.0.0.1:11434/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model": "qwen2.5-7b-instruct-q4_k_m", "max_tokens": 256,
        "messages": [{"role": "user", "content": "Hello!"}]}'
 
-curl http://YOUR_LAN_IP:11434/v1/messages/count_tokens \
+curl http://127.0.0.1:11434/v1/messages/count_tokens \
   -H "Content-Type: application/json" \
   -d '{"model": "qwen2.5-7b-instruct-q4_k_m",
        "messages": [{"role": "user", "content": "Hello!"}]}'
@@ -211,7 +213,7 @@ Manager-level errors on these routes use the Anthropic error envelope, `{"type":
 Useful if you want to avoid waiting through a model swap, or to check queue depth before submitting work.
 
 ```bash
-curl http://YOUR_LAN_IP:11434/status
+curl http://127.0.0.1:11434/status
 ```
 
 This is illustrative — the authoritative shape is whatever `GET /status` actually returns. `gpu.gpus` has one entry per GPU card detected on the host, not a fixed number; the example below shows two cards to illustrate that a multi-GPU host is reported in full, not because any particular host has exactly two:
@@ -298,11 +300,13 @@ Per slot (`slots.<name>`):
 The API is OpenAI-compatible, so existing clients work without modification:
 
 ```python
+import os
+
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://YOUR_LAN_IP:11434/v1",
-    api_key="not-needed",  # no auth on internal network
+    base_url="http://127.0.0.1:11434/v1",
+    api_key=os.environ.get("MANAGER_TOKEN", "unused"),  # sent as the Bearer token
 )
 
 response = client.chat.completions.create(
@@ -339,7 +343,7 @@ The file keeps its upstream name, and that stem is the model name clients use. R
 ### List available models
 
 ```bash
-curl http://YOUR_LAN_IP:11434/v1/models
+curl http://127.0.0.1:11434/v1/models
 ```
 
 `GET /v1/models` lists the onboarded profiles — the models with at least one verified (model, slot) pair — in OpenAI-compatible format, with `home_slot`, `verified_slots` and `loaded_on` (the slots whose `loaded_model` matches) alongside the standard fields. It does not scan the models directory: a profile appears only after `scripts/onboard.py` has verified it on at least one slot, and the profiles are read once at manager startup, so a new or edited profile needs a deploy and a manager restart to show up.
@@ -455,11 +459,24 @@ When a token is set:
 - The exemption is exactly the path `/health`, whatever the method: `/health/`, `/HEALTH`, `//health` and `/healthz` all need the token, and so does every other path, including 404s.
 - A refused request gets 401 with `WWW-Authenticate: Bearer`: the Anthropic error shape (`authentication_error`) on the `/v1/messages` paths, the manager's `unauthorized` shape everywhere else. A 401 writes no `manager.requests` line — the client address uvicorn records is what an operator reads.
 
+Write the line as `MANAGER_TOKEN=<token>` with no quotes. systemd would strip them, but `scripts/deploy-manager.sh` reads the file with `sed` to call `/status` after a deploy, and would send them.
+
+#### Clients
+
+Each client keeps its own copy of the token, readable only by the user it runs as:
+
+- **agent_core agents** (PAL, PARE) read `<PREFIX>_MANAGER_TOKEN` (`PAL_MANAGER_TOKEN`, `PARE_MANAGER_TOKEN`) and send it on every manager call: inference, retrieval and `/model`. An empty value means no token. For a systemd user unit, load it from a `0600` env file with a drop-in, `~/.config/systemd/user/<unit>.service.d/manager-token.conf`, containing `[Service]` and `EnvironmentFile=<path to the env file>`, so the unit file itself stays as committed.
+- **opencode** sends the provider's `apiKey` as a Bearer token. `"apiKey": "{file:<path to a file holding only the token>}"` keeps the token out of `opencode.json`.
+- **`scripts/onboard.py`** reads `MANAGER_TOKEN` from its environment; `set -a; . <env file>; set +a` before running it.
+- **`scripts/deploy-manager.sh`** reads `/etc/llama/manager-token.env` itself, so it needs root for the post-deploy `/status` check (`DEPLOY_MGR_TOKEN_ENV` points it elsewhere).
+
+To turn the token on or rotate it, give it to the clients first and restart them, then write `/etc/llama/manager-token.env` and restart the manager. Until the manager has it, a client's header is ignored, so nothing breaks in between. Generate it without putting it in shell history or a command line, e.g. with `secrets.token_urlsafe(32)` in a Python heredoc that writes the files directly. Then check that `/status` answers 401 without the header and 200 with it.
+
 ---
 
 ## API Endpoints
 
-All endpoints are on `LAN_IP:11434`.
+The manager answers on every address in `LISTEN_HOSTS` (or `HOST`), port `PORT` (default `11434`). The examples in this README use `127.0.0.1:11434`. With a token set, every path except `/health` also needs `-H "Authorization: Bearer $MANAGER_TOKEN"`.
 
 | Method | Path | Description |
 |---|---|---|
@@ -546,33 +563,33 @@ SKILLS_DB_PATH=/opt/llama/data/skills.db
 
 ```bash
 # Step 1: Search for relevant skills
-curl -s http://LAN_IP:11434/collections/skills/search \
+curl -s http://127.0.0.1:11434/collections/skills/search \
   -H "Content-Type: application/json" \
   -d '{"query": "network reconnaissance", "limit": 3}' | jq
 
 # Step 2: Get full document content
-curl -s http://LAN_IP:11434/collections/skills/docs/Security/Recon/Workflows/PassiveRecon | jq
+curl -s http://127.0.0.1:11434/collections/skills/docs/Security/Recon/Workflows/PassiveRecon | jq
 
 # List collections
-curl -s http://LAN_IP:11434/collections | jq
+curl -s http://127.0.0.1:11434/collections | jq
 ```
 
 **Trigger a reindex without restarting the server:**
 
 ```bash
 # Full scan (rescans every file in source_dir; deletes rows for files no longer on disk)
-curl -s -X POST http://LAN_IP:11434/collections/vault/reindex \
+curl -s -X POST http://127.0.0.1:11434/collections/vault/reindex \
   -H "Content-Type: application/json" -d '{}' | jq
 
 # Scoped scan (only the listed paths; skips stale-deletion). Useful right after writing
 # specific files. Paths must be absolute and under the collection's source_dir.
-curl -s -X POST http://LAN_IP:11434/collections/vault/reindex \
+curl -s -X POST http://127.0.0.1:11434/collections/vault/reindex \
   -H "Content-Type: application/json" \
   -d '{"paths": ["/path/to/source_dir/Some/Article.md"]}' | jq
 
 # Both POSTs return 202 with a job_id immediately. Poll status:
-curl -s http://LAN_IP:11434/collections/vault/reindex/status | jq
-curl -s http://LAN_IP:11434/collections/vault/reindex/<job_id> | jq
+curl -s http://127.0.0.1:11434/collections/vault/reindex/status | jq
+curl -s http://127.0.0.1:11434/collections/vault/reindex/<job_id> | jq
 ```
 
 Concurrent POSTs to the same collection return the in-flight `job_id` rather than stacking duplicate scans. Jobs are in-memory only and wiped on server restart (which already triggers a full reindex).

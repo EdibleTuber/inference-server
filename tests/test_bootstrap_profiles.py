@@ -4,6 +4,16 @@ renders exactly what the host runs today, read from the live sidecars, slot
 env files and unit ExecStart on 2026-10-30 and re-read 2026-11-01. Where a
 sidecar was silent the value is llama.cpp b11136's default.
 
+EXPECTED pins the whole rendered command line on purpose. It is a tripwire,
+not an incidental literal: a profile edit that changes what a slot runs is
+meant to fail here, so that changing the host's behaviour takes a deliberate
+edit to this file rather than passing unnoticed. Update it WITH the profile,
+and only once the new command line is the one actually intended.
+
+Changed since the 2026-11-01 reading: main gained image input on
+2026-11-22 (--mmproj plus --mmproj-device none); see that profile's
+comments for why the encoder stays off the V100.
+
 The gguf files are stubbed in tmp: these tests check the profiles, not the
 host's models dir.
 """
@@ -27,7 +37,9 @@ EXPECTED = {
         "home": "main",
         "sampling": "--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 "
                     "--presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0",
-        "flags": COMMON + " --spec-type draft-mtp --spec-draft-n-max 1",
+        "flags": COMMON + " --spec-type draft-mtp --spec-draft-n-max 1"
+                 f" --mmproj {MODELS}/Qwen3.8-27B-mmproj-F16.gguf"
+                 " --mmproj-device none",
     },
     "Qwen3.6-35B-A3B-UD-IQ4_NL_XL": {
         "home": "egpu",
@@ -100,6 +112,18 @@ def test_the_qwen38_profile_keeps_its_mtp_and_kv_cache_notes():
     comments = _comments("Qwen3.8-27B-UD-Q6_K")
     assert "MTP" in comments
     assert "KV" in comments
+
+
+def test_the_qwen38_profile_explains_its_vision_setup():
+    """The two facts that make --mmproj safe to carry here, and that a
+    future edit must re-check rather than assume."""
+    comments = _comments("Qwen3.8-27B-UD-Q6_K")
+    # The projector type the build's libmtmd has to recognise: the pairing
+    # that makes this mmproj loadable at all, not a free choice.
+    assert "qwen3vl_merger" in comments
+    # Why the encoder is on the CPU: dropping this flag puts 885 MiB back
+    # on a card that did not have room for it beside the MTP draft head.
+    assert "--mmproj-device none" in comments
 
 
 def test_the_qwen36_profile_explains_min_p_and_the_auto_fit_warning():

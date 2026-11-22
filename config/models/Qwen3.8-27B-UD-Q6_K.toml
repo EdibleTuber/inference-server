@@ -80,8 +80,35 @@ n_gpu_layers = -1
 #   Speculative decoding verifies every drafted token against the main
 #   model, so by design it changes speed, not output. Measured at
 #   0.3k-2.7k of context only.
+#
+# --mmproj, --mmproj-device none: image input. Qwen3.8-27B is natively
+#   multimodal, but this GGUF carries only the text half -- no clip.* keys
+#   and no v.*/mm.* tensors -- so llama-server reports
+#   modalities.vision=false and answers an image with "image input is not
+#   supported - hint: ... you may need to provide the mmproj". The encoder
+#   is the separate projector from the same Unsloth repo as the weights.
+#
+#   Checked for compatibility before downloading it: the projector declares
+#   clip.projector_type = 'qwen3vl_merger', which is a literal in this
+#   build's libmtmd.so (alongside clip_graph_qwen3vl), and its
+#   clip.vision.projection_dim equals this model's qwen35.embedding_length,
+#   which is what has to match for the merger to bind to the text stack.
+#
+#   --mmproj-device none keeps the encoder's 885 MiB on the CPU instead of
+#   the V100. There was not room for it on the card: measured 2026-11-22,
+#   the slot left 2332 MiB free at this ctx_size, so holding the encoder in
+#   VRAM would have meant giving up --spec-type draft-mtp (~1.2 GiB) and
+#   its measured +40% generation speed. CPU encoding is one-shot per image
+#   and suits a look-at-the-render loop rather than a streaming one.
+#   The image tokens themselves are ordinary context and cost no VRAM
+#   beyond what ctx_size already reserves; only the encoder moves.
+#
+#   Re-measure before moving the encoder onto the GPU, and re-check the
+#   projector_type literal against libmtmd after any llama.cpp upgrade.
 flags = ["--jinja", "--ctx-checkpoints", "4", "--n-predict", "32768",
-         "--spec-type", "draft-mtp", "--spec-draft-n-max", "1"]
+         "--spec-type", "draft-mtp", "--spec-draft-n-max", "1",
+         "--mmproj", "/opt/llama/models/Qwen3.8-27B-mmproj-F16.gguf",
+         "--mmproj-device", "none"]
 
 # Sampling: every sampler llama.cpp applies, all keys required.
 #
@@ -109,6 +136,6 @@ frequency_penalty = 0.0
 repeat_penalty = 1.0
 
 [slots.main.verified]
-date = "2026-11-01"
+date = "2026-11-22"
 llama_cpp_build = 11136
 llama_cpp_commit = "057494f93"
